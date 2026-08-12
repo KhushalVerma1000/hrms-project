@@ -1,0 +1,328 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Application roles — controls what a logged-in User can do.
+ * Associate and Quality Associate are intentionally NOT roles; they have
+ * no app access and never get a User record. See Section 2.1 of the spec.
+ */
+enum Role {
+  ADMIN
+  CLIENT
+  MANAGER
+  PROCESS_ASSOCIATE
+  SHIFT_INCHARGE
+}
+
+/**
+ * Staff designations — applies to Employee records only (biometric enrollment,
+ * attendance tracking). Only PROCESS_ASSOCIATE and SHIFT_INCHARGE designations
+ * additionally get a linked User record for app access.
+ * MANAGER is NOT a designation — Managers are created via User & Role
+ * Management and have no Employee record (no biometric enrollment).
+ */
+enum Designation {
+  ASSOCIATE          /// No app access. Employee record only.
+  PROCESS_ASSOCIATE  /// Has app access. Linked User record created at onboarding.
+  QUALITY_ASSOCIATE  /// No app access. Employee record only.
+  SHIFT_INCHARGE     /// Has app access. Linked User record created at onboarding.
+  OTHER              /// Catchall for non-standard designations.
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  SUSPENDED
+  OFFBOARDED
+}
+
+enum CommandStatus {
+  PENDING      /// Waiting to be dispatched to SmartOffice.
+  IN_PROGRESS  /// Worker has claimed this job and is calling SmartOffice.
+  SUCCEEDED    /// SmartOffice acknowledged success.
+  FAILED       /// Terminal — exhausted retries OR got a business-rule rejection.
+}
+
+enum OnboardingFormStatus {
+  NOT_SENT   /// Employee onboarded in-app; form link not yet shared with them.
+  PENDING    /// Form link shared; not yet submitted.
+  SUBMITTED  /// Confirmed submitted and matched via webhook/polling.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE MODELS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Atomic counter table for code assignment.
+ * Rows: "client", "warehouseType", "storeCode:{clientId}"
+ * Used by the e-code generation engine (Section 11).
+ */
+model Counter {
+  id    String @id
+  value Int    @default(0)
+}
+
+/**
+ * A vendor/staffing account you manage.
+ * Internal to this app — SmartOffice has no concept of this entity.
+ */
+model Client {
+  id        String   @id @default(cuid())
+  /// 2-digit globally-unique code, auto-assigned on creation (never user-entered).
+  code      String   @unique @db.Char(2)
+  /// e.g. "Mansa Maharani"
+  name      String
+  shortName String
+  email     String?
+  stores    Store[]
+  users     User[]
+  createdAt DateTime @default(now())
+}
+
+/**
+ * A brand / big company whose warehouse the client operates.
+ * e.g. "Amazon", "Blinkit", "Zepto".
+ * Global shared list — Admin-managed only. Maps to SmartOffice Branch/CompanySName.
+ */
+model WarehouseType {
+  id        String   @id @default(cuid())
+  /// 2-digit globally-unique code, auto-assigned on creation.
+  code      String   @unique @db.Char(2)
+  /// e.g. "Amazon" — unique across all brands.
+  name      String   @unique
+  stores    Store[]
+  createdAt DateTime @default(now())
+}
+
+/**
+ * A physical warehouse site. Belongs to one Client, operates under one WarehouseType.
+ * Maps to SmartOffice Location.
+ */
+model Store {
+  id                String   @id @default(cuid())
+  /// 2-digit code, unique within its Client (not globally). Auto-assigned.
+  code              String   @db.Char(2)
+  /// Optional external brand reference code (e.g. Amazon's "TD02"). Display-only.
+  externalStoreCode String?
+  name              String
+
+  clientId        String
+  client          Client        @relation(fields: [clientId], references: [id])
+  warehouseTypeId String
+  warehouseType   WarehouseType @relation(fields: [warehouseTypeId], references: [id])
+
+  /// Atomic counter for per-store employee serial in e-code generation.
+  nextEmployeeSerial Int @default(1)
+
+  address        String?
+  latitude       Float?
+  longitude      Float?
+  /// Geofence radius in meters — mirrors SmartOffice AddLocation.Radius.
+  geofenceRadius Int?
+
+  devices   Device[]
+  employees Employee[]
+  users     User[]
+
+  createdAt DateTime @default(now())
+
+  /// Store codes are unique within a client, not globally.
+  @@unique([clientId, code])
+}
+
+/**
+ * A biometric device (fingerprint/face scanner) at a store.
+ */
+model Device {
+  id           String    @id @default(cuid())
+  serialNumber String    @unique
+  name         String
+  storeId      String
+  store        Store     @relation(fields: [storeId], references: [id])
+  /// Used to feature-flag clearLogsFromDeviceByTime (Speed Face models only).
+  model        String?
+  isOnline     Boolean   @default(false)
+  lastPing     DateTime?
+  userCount    Int?
+  attLogsCount Int?
+  createdAt    DateTime  @default(now())
+}
+
+/**
+ * A warehouse associate/staff member tracked for biometric attendance.
+ * IMPORTANT: Managers are NOT employees in this system (no biometric enrollment,
+ * no attendance record). See Section 10 of the spec.
+ */
+model Employee {
+  id          String         @id @default(cuid())
+  /// System-generated e-code for new hires (Section 11). Legacy records use their
+  /// original SmartOffice staffCode, flagged with isLegacyCode = true.
+  staffCode   String         @unique
+  isLegacyCode Boolean       @default(false)
+  name        String
+  gender      String?
+  status      EmployeeStatus @default(ACTIVE)
+
+  storeId String
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  /// Drives whether this person gets a linked User login (PA/SI only).
+  designation Designation @default(ASSOCIATE)
+  grade       String?
+  team        String?
+
+  dateOfJoining      DateTime?
+  dateOfConfirmation DateTime?
+  dateOfBirth        DateTime?
+  dateOfRelieving    DateTime?
+  cardNumber         String?
+
+  /// Tracks progress through the multi-step onboarding wizard (resumable).
+  onboardingStep String?
+
+  /// Google Forms onboarding paperwork tracking (Section 13).
+  onboardingFormStatus         OnboardingFormStatus @default(NOT_SENT)
+  onboardingFormSentAt         DateTime?
+  onboardingFormSubmittedAt    DateTime?
+  onboardingFormLastRemindedAt DateTime?
+
+  /// Present only if designation = PROCESS_ASSOCIATE or SHIFT_INCHARGE and a login was created.
+  linkedUser User?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/**
+ * An app user (person with login credentials and role-based access).
+ * NOT to be confused with Employee — Managers, Admin, Client users may never
+ * have a corresponding Employee record.
+ */
+model User {
+  id           String  @id @default(cuid())
+  email        String  @unique
+  passwordHash String
+  name         String
+  role         Role
+
+  /// Set only if role = CLIENT. Scopes this user to a specific client.
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id])
+
+  /// Set if role = MANAGER / PROCESS_ASSOCIATE / SHIFT_INCHARGE.
+  storeId String?
+  store   Store?  @relation(fields: [storeId], references: [id])
+
+  /// Set ONLY for PROCESS_ASSOCIATE / SHIFT_INCHARGE — links their app login
+  /// to their own attendance-tracked Employee record. NULL for ADMIN/CLIENT/MANAGER.
+  employeeId String?   @unique
+  employee   Employee? @relation(fields: [employeeId], references: [id])
+
+  /// Whether user must change password on next login (new accounts).
+  mustChangePassword Boolean  @default(false)
+
+  createdAt DateTime   @default(now())
+  auditLogs AuditLog[]
+}
+
+/**
+ * Raw attendance punch data, synced from SmartOffice GetDeviceLogs.
+ * This is a local cache — SmartOffice is the source of truth for raw punches.
+ */
+model AttendanceLog {
+  id             String    @id @default(cuid())
+  employeeCode   String
+  logDate        DateTime
+  serialNumber   String
+  punchDirection String?
+  temperature    Float?
+  syncedAt       DateTime  @default(now())
+
+  @@unique([employeeCode, logDate, serialNumber])
+  @@index([employeeCode, logDate])
+  @@index([serialNumber, logDate])
+}
+
+/**
+ * Immutable audit log for all destructive and write actions.
+ * Written for every enqueued command and every destructive server action,
+ * regardless of SmartOffice response.
+ */
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  /// e.g. "EMPLOYEE_HARD_DELETE", "DEVICE_UPLOAD_USER", "COMMAND_ENQUEUED"
+  action     String
+  /// "Employee" | "Device" | "Store" | "Client" | "User" | "Command"
+  targetType String
+  targetId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+}
+
+/**
+ * Durable outbound command queue for all SmartOffice write operations.
+ * Every write to SmartOffice goes through this table — local DB is written first,
+ * then a command row is inserted, and the worker dispatches it asynchronously.
+ * See Section 12 of the spec.
+ */
+model SmartOfficeCommand {
+  id  String @id @default(cuid())
+
+  /// Deterministically derived from the action — prevents duplicate enqueue and
+  /// duplicate dispatch after worker crash. See Section 12.2.1 of the spec.
+  idempotencyKey String @unique
+
+  /// e.g. "ADD_EMPLOYEE", "UPLOAD_USER", "DELETE_USER", "ADD_LOCATION", "BLOCK_USER"
+  commandType String
+
+  /// Exact request parameters to be sent to the SmartOffice endpoint.
+  payload Json
+
+  status      CommandStatus @default(PENDING)
+  attempts    Int           @default(0)
+  /// Default 6 attempts with exponential backoff: 1m→5m→15m→1h→4h→12h.
+  maxAttempts Int           @default(6)
+
+  lastError     String?
+  lastAttemptAt DateTime?
+  /// Worker queries: WHERE status = PENDING AND nextAttemptAt <= now()
+  nextAttemptAt DateTime @default(now())
+
+  /// "Employee" | "Store" | "Device" | "Client"
+  relatedType String?
+  relatedId   String?
+
+  /// userId of the person who triggered this command.
+  createdBy  String
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([status, nextAttemptAt])
+}
+
+/**
+ * Google Form submissions that could not be matched to an Employee by staffCode.
+ * Admin can manually reconcile these.
+ */
+model UnmatchedFormSubmission {
+  id              String   @id @default(cuid())
+  rawPayload      Json
+  submittedAt     DateTime
+  staffCodeGuess  String?  /// The staffCode extracted from the submission (if any)
+  resolvedAt      DateTime?
+  resolvedByUserId String?
+  createdAt       DateTime @default(now())
+}
