@@ -44,7 +44,13 @@ export async function getStoresDataAction() {
   return { stores, clients, warehouseTypes };
 }
 
-export async function createClientAction(name: string, shortName: string, email?: string) {
+export async function createClientAction(
+  name: string,
+  shortName: string,
+  email?: string,
+  googleFormBaseUrl?: string,
+  googleFormECodeFieldId?: string,
+) {
   const session = await auth();
   if (!session?.user || session.user.role !== 'ADMIN') {
     return { ok: false, error: 'Only Admin users can create Client accounts.' };
@@ -63,6 +69,8 @@ export async function createClientAction(name: string, shortName: string, email?
           name: name.trim(),
           shortName: shortName.trim().toUpperCase(),
           email: email?.trim() || null,
+          googleFormBaseUrl: googleFormBaseUrl?.trim() || null,
+          googleFormECodeFieldId: googleFormECodeFieldId?.trim() || null,
         },
       });
     });
@@ -78,6 +86,56 @@ export async function createClientAction(name: string, shortName: string, email?
     return { ok: true, client };
   } catch (err: any) {
     return { ok: false, error: err.message || 'Failed to create client.' };
+  }
+}
+
+/**
+ * Updates a Client's Google Form onboarding link (Section 13.5). Split out
+ * from createClientAction so an existing Client can have this added/changed
+ * later without re-creating the whole record. Admin only.
+ */
+export async function updateClientGoogleFormAction(
+  clientId: string,
+  googleFormBaseUrl: string,
+  googleFormECodeFieldId: string,
+) {
+  const session = await auth();
+  if (!session?.user || session.user.role !== 'ADMIN') {
+    return { ok: false, error: 'Only Admin users can edit Client Google Form settings.' };
+  }
+
+  if (googleFormBaseUrl.trim()) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(googleFormBaseUrl.trim());
+    } catch {
+      return { ok: false, error: 'Google Form Base URL is not a valid URL.' };
+    }
+  }
+
+  try {
+    const client = await prisma.client.update({
+      where: { id: clientId },
+      data: {
+        googleFormBaseUrl: googleFormBaseUrl.trim() || null,
+        googleFormECodeFieldId: googleFormECodeFieldId.trim() || null,
+      },
+    });
+
+    await writeAuditLog({
+      userId: session.user.id,
+      action: 'CLIENT_GOOGLE_FORM_UPDATE',
+      targetType: 'Client',
+      targetId: client.id,
+      metadata: {
+        googleFormBaseUrl: client.googleFormBaseUrl,
+        googleFormECodeFieldId: client.googleFormECodeFieldId,
+      },
+    });
+
+    return { ok: true, client };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Failed to update client Google Form settings.' };
   }
 }
 
@@ -121,6 +179,7 @@ export async function createStoreAction(data: {
   externalStoreCode?: string;
   address?: string;
   geofenceRadius?: number;
+  attendanceMode?: 'BIOMETRIC' | 'MANUAL';
 }) {
   const session = await auth();
   if (!session?.user) throw new Error('Unauthorized');
@@ -145,6 +204,7 @@ export async function createStoreAction(data: {
           externalStoreCode: data.externalStoreCode?.trim() || null,
           address: data.address?.trim() || null,
           geofenceRadius: data.geofenceRadius || 200,
+          attendanceMode: data.attendanceMode || 'BIOMETRIC',
         },
       });
     });
@@ -154,11 +214,46 @@ export async function createStoreAction(data: {
       action: 'STORE_CREATE',
       targetType: 'Store',
       targetId: store.id,
-      metadata: { code: store.code, name: store.name, clientId: store.clientId },
+      metadata: { code: store.code, name: store.name, clientId: store.clientId, attendanceMode: store.attendanceMode },
     });
 
     return { ok: true, store };
   } catch (err: any) {
     return { ok: false, error: err.message || 'Failed to create store.' };
   }
+}
+
+/**
+ * Updates a Store's attendance mode after creation (e.g. a biometric device
+ * gets installed later, or breaks and the store needs to fall back to manual
+ * entry temporarily). Admin/Client only.
+ */
+export async function updateStoreAttendanceModeAction(
+  storeId: string,
+  attendanceMode: 'BIOMETRIC' | 'MANUAL',
+) {
+  const session = await auth();
+  if (!session?.user) throw new Error('Unauthorized');
+
+  const store = await prisma.store.findUnique({ where: { id: storeId }, select: { clientId: true, name: true } });
+  if (!store) return { ok: false, error: 'Store not found.' };
+
+  if (!can(session, 'store:manage', { clientId: store.clientId })) {
+    return { ok: false, error: 'Permission denied to edit this store.' };
+  }
+
+  const updated = await prisma.store.update({
+    where: { id: storeId },
+    data: { attendanceMode },
+  });
+
+  await writeAuditLog({
+    userId: session.user.id,
+    action: 'STORE_ATTENDANCE_MODE_CHANGED',
+    targetType: 'Store',
+    targetId: storeId,
+    metadata: { name: store.name, newMode: attendanceMode },
+  });
+
+  return { ok: true, store: updated };
 }

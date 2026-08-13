@@ -12,6 +12,7 @@ export default async function AppLayout({
 
   const userRole = session.user.role;
   const canViewAttendance = can(session, 'attendance:view', {});
+  const canManualAttendance = can(session, 'attendance:manualEntry', { storeId: session.user.storeId });
   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
 
   return (
@@ -37,6 +38,10 @@ export default async function AppLayout({
             
             {canViewAttendance && (
               <NavLink href="/attendance" label="Attendance Logs" icon="🕒" />
+            )}
+
+            {canManualAttendance && (
+              <NavLink href="/attendance/manual" label="Manual Attendance" icon="📝" />
             )}
 
             <NavLink href="/onboarding" label="Onboarding Wizard" icon="✨" />

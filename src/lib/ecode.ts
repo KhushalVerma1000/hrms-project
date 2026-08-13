@@ -72,10 +72,10 @@ export async function assignStoreCode(
 }
 
 /**
- * Generates a fully-assembled 10-digit Employee Code for a new hire.
+ * Generates a fully-assembled 9-digit Employee Code for a new hire.
  *
- * Format: [ClientCode:2][WarehouseTypeCode:2][StoreCode:2][Serial:4]
- * Example: 01 + 01 + 01 + 0001 = "0101010001"
+ * Format: [ClientCode:2][WarehouseTypeCode:2][StoreCode:2][Serial:3]
+ * Example: 10 + 10 + 10 + 001 = "101010001"
  *
  * This is atomic and race-condition-safe: the store's nextEmployeeSerial
  * is incremented via Prisma's atomic UPDATE ... SET x = x + 1, which
@@ -101,13 +101,13 @@ export async function generateEmployeeCode(
 
   // nextEmployeeSerial is the value AFTER increment; subtract 1 to get consumed value
   const serial = store.nextEmployeeSerial - 1;
-  if (serial > 9999) {
+  if (serial > 999) {
     throw new Error(
-      `Store '${storeId}' has exceeded 9,999 employees. ` +
+      `Store '${storeId}' has exceeded 999 employees. ` +
       'Widen the Serial segment before onboarding more employees.',
     );
   }
-  const paddedSerial = String(serial).padStart(4, '0');
+  const paddedSerial = String(serial).padStart(3, '0');
 
   return `${store.client.code}${store.warehouseType.code}${store.code}${paddedSerial}`;
 }

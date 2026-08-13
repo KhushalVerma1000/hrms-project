@@ -79,11 +79,21 @@ export const GOOGLE_FORM_ECODE_FIELD_ID: string =
 
 /**
  * Generates a pre-filled Google Form URL with the employee code pre-populated.
- * Returns an empty string if form config is not set.
+ *
+ * If a `clientOverride` is provided and has its own `googleFormBaseUrl` and
+ * `googleFormECodeFieldId`, those take precedence over the global env vars.
+ * This allows each Client to have a separate onboarding form (Section 13.5).
+ *
+ * Returns an empty string if no usable form config is found.
  */
-export function generatePrefilledFormUrl(employeeCode: string): string {
-  if (!GOOGLE_FORM_BASE_URL || !GOOGLE_FORM_ECODE_FIELD_ID) return '';
-  const url = new URL(GOOGLE_FORM_BASE_URL);
-  url.searchParams.set(GOOGLE_FORM_ECODE_FIELD_ID, employeeCode);
+export function generatePrefilledFormUrl(
+  employeeCode: string,
+  clientOverride?: { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null },
+): string {
+  const baseUrl = clientOverride?.googleFormBaseUrl || GOOGLE_FORM_BASE_URL;
+  const fieldId = clientOverride?.googleFormECodeFieldId || GOOGLE_FORM_ECODE_FIELD_ID;
+  if (!baseUrl || !fieldId) return '';
+  const url = new URL(baseUrl);
+  url.searchParams.set(fieldId, employeeCode);
   return url.toString();
 }

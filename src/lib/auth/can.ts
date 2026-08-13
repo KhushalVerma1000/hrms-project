@@ -12,6 +12,7 @@ export type Action =
   | 'employee:hardDelete'
   | 'employee:view'
   | 'attendance:view'
+  | 'attendance:manualEntry'
   | 'device:manage'
   | 'store:create'
   | 'store:manage'
@@ -102,6 +103,16 @@ export function can(
         case 'CLIENT': return inClient(ctx.clientId);
         case 'MANAGER': return inStore(ctx.storeId);
         // PA/SI: no access to attendance
+        default: return false;
+      }
+
+    // Manual attendance entry — for MANUAL-mode stores only (runtime check in action)
+    case 'attendance:manualEntry':
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return inClient(ctx.clientId);
+        case 'MANAGER':
+        case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
         default: return false;
       }
 

@@ -14,7 +14,11 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
 
   const employee = await prisma.employee.findUnique({
     where: { id: employeeId },
-    select: { staffCode: true, storeId: true },
+    select: {
+      staffCode: true,
+      storeId: true,
+      store: { select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } } },
+    },
   });
 
   if (!employee) return { ok: false };
@@ -35,7 +39,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
     },
   });
 
-  const formLink = generatePrefilledFormUrl(employee.staffCode);
+  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store.client);
   return { ok: true, formLink };
 }
 
@@ -51,7 +55,12 @@ export async function sendFormReminder(
 
   const employee = await prisma.employee.findUnique({
     where: { id: employeeId },
-    select: { staffCode: true, storeId: true, name: true },
+    select: {
+      staffCode: true,
+      storeId: true,
+      name: true,
+      store: { select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } } },
+    },
   });
 
   if (!employee) return { ok: false };
@@ -83,6 +92,6 @@ export async function sendFormReminder(
     },
   });
 
-  const formLink = generatePrefilledFormUrl(employee.staffCode);
+  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store.client);
   return { ok: true, formLink };
 }

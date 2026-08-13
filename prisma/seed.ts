@@ -8,15 +8,17 @@ async function main() {
   console.log('🌱 Starting database seed...');
 
   // ─── Counters ─────────────────────────────────────────────────────────────
+  // Client/WarehouseType/Store codes now start at 10 (not 01) so the assembled
+  // e-code never begins with a leading zero — see Client.code comment in schema.prisma.
   await prisma.counter.upsert({
     where: { id: 'client' },
     update: {},
-    create: { id: 'client', value: 0 },
+    create: { id: 'client', value: 9 }, // next increment lands on 10
   });
   await prisma.counter.upsert({
     where: { id: 'warehouseType' },
     update: {},
-    create: { id: 'warehouseType', value: 0 },
+    create: { id: 'warehouseType', value: 9 },
   });
 
   // ─── Admin User ───────────────────────────────────────────────────────────
@@ -35,9 +37,9 @@ async function main() {
 
   // ─── Warehouse Types (global master list) ─────────────────────────────────
   const warehouseTypes = [
-    { name: 'Amazon', code: '01' },
-    { name: 'Blinkit', code: '02' },
-    { name: 'Zepto', code: '03' },
+    { name: 'Amazon', code: '10' },
+    { name: 'Blinkit', code: '11' },
+    { name: 'Zepto', code: '12' },
   ];
 
   for (const wt of warehouseTypes) {
@@ -47,19 +49,19 @@ async function main() {
       create: { code: wt.code, name: wt.name },
     });
   }
-  // Sync counter to reflect seeded warehouse types
+  // Sync counter to reflect seeded warehouse types (10, 11, 12 issued → next is 13)
   await prisma.counter.update({
     where: { id: 'warehouseType' },
-    data: { value: warehouseTypes.length },
+    data: { value: 9 + warehouseTypes.length },
   });
   console.log('✅ Warehouse types seeded:', warehouseTypes.map((w) => w.name).join(', '));
 
   // ─── Demo Client: Mansa Maharani ──────────────────────────────────────────
   const client = await prisma.client.upsert({
-    where: { code: '01' },
+    where: { code: '10' },
     update: {},
     create: {
-      code: '01',
+      code: '10',
       name: 'Mansa Maharani',
       shortName: 'MM',
       email: 'ops@mansamaharani.in',
@@ -67,15 +69,15 @@ async function main() {
   });
   await prisma.counter.update({
     where: { id: 'client' },
-    data: { value: 1 },
+    data: { value: 10 },
   });
   console.log('✅ Demo client:', client.name);
 
-  // Initialise per-client store counter
+  // Initialise per-client store counter — starts at 10 as well.
   await prisma.counter.upsert({
     where: { id: `storeCode:${client.id}` },
     update: {},
-    create: { id: `storeCode:${client.id}`, value: 0 },
+    create: { id: `storeCode:${client.id}`, value: 9 },
   });
 
   // ─── Demo Store: Saket (Amazon) ───────────────────────────────────────────
@@ -83,10 +85,10 @@ async function main() {
   if (!amazon) throw new Error('Amazon warehouse type not found after seeding');
 
   const store = await prisma.store.upsert({
-    where: { clientId_code: { clientId: client.id, code: '01' } },
+    where: { clientId_code: { clientId: client.id, code: '10' } },
     update: {},
     create: {
-      code: '01',
+      code: '10',
       name: 'Saket',
       externalStoreCode: 'DEL_SAK_01',
       clientId: client.id,
@@ -100,7 +102,7 @@ async function main() {
   });
   await prisma.counter.update({
     where: { id: `storeCode:${client.id}` },
-    data: { value: 1 },
+    data: { value: 10 },
   });
   console.log('✅ Demo store:', store.name);
 

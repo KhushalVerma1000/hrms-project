@@ -37,7 +37,29 @@ enum Designation {
   PROCESS_ASSOCIATE  /// Has app access. Linked User record created at onboarding.
   QUALITY_ASSOCIATE  /// No app access. Employee record only.
   SHIFT_INCHARGE     /// Has app access. Linked User record created at onboarding.
+  HOUSEKEEPING       /// No app access. Employee record only — attendance-tracked like Associate/QA.
   OTHER              /// Catchall for non-standard designations.
+}
+
+/**
+ * Whether a Store's attendance is captured via a physical biometric device
+ * (synced from SmartOffice) or entered manually through this app's web UI
+ * by the store's Manager/Shift Incharge. Chosen at store creation, editable
+ * afterward by Admin/Client if the store's hardware situation changes.
+ */
+enum AttendanceMode {
+  BIOMETRIC  /// Default. Attendance comes from SmartOffice GetDeviceLogs sync (Section 7.2).
+  MANUAL     /// No biometric device at this store. Manager/SI record attendance directly.
+}
+
+/**
+ * Daily attendance status for a MANUAL-mode store's manual entry form.
+ */
+enum ManualAttendanceStatus {
+  PRESENT
+  ABSENT
+  HALF_DAY
+  ON_LEAVE
 }
 
 enum EmployeeStatus {
@@ -80,11 +102,20 @@ model Counter {
 model Client {
   id        String   @id @default(cuid())
   /// 2-digit globally-unique code, auto-assigned on creation (never user-entered).
+  /// Starts at "10" — never "01"-style — so the assembled e-code never begins
+  /// with a leading zero (which gets silently stripped if the code is ever
+  /// opened in Excel/Sheets or treated as a number anywhere downstream).
   code      String   @unique @db.Char(2)
   /// e.g. "Mansa Maharani"
   name      String
   shortName String
   email     String?
+
+  /// Per-client Google Form onboarding link override (Section 13.1/13.5).
+  /// If null, the app falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
+  googleFormBaseUrl      String?
+  googleFormECodeFieldId String?
+
   stores    Store[]
   users     User[]
   createdAt DateTime @default(now())
@@ -97,7 +128,10 @@ model Client {
  */
 model WarehouseType {
   id        String   @id @default(cuid())
-  /// 2-digit globally-unique code, auto-assigned on creation.
+  /// 2-digit globally-unique code, auto-assigned on creation. Starts at "10" —
+  /// see Client.code comment for why (not strictly required for THIS segment
+  /// since it's never first in the e-code, but kept consistent across all
+  /// three code types rather than special-casing just the Client segment).
   code      String   @unique @db.Char(2)
   /// e.g. "Amazon" — unique across all brands.
   name      String   @unique
@@ -111,7 +145,7 @@ model WarehouseType {
  */
 model Store {
   id                String   @id @default(cuid())
-  /// 2-digit code, unique within its Client (not globally). Auto-assigned.
+  /// 2-digit code, unique within its Client (not globally). Auto-assigned, starts at "10".
   code              String   @db.Char(2)
   /// Optional external brand reference code (e.g. Amazon's "TD02"). Display-only.
   externalStoreCode String?
@@ -124,6 +158,11 @@ model Store {
 
   /// Atomic counter for per-store employee serial in e-code generation.
   nextEmployeeSerial Int @default(1)
+
+  /// BIOMETRIC (default, synced from SmartOffice) or MANUAL (no device —
+  /// Manager/SI enter attendance via ManualAttendanceEntry below). Editable
+  /// after creation by Admin/Client if the store's hardware situation changes.
+  attendanceMode AttendanceMode @default(BIOMETRIC)
 
   address        String?
   latitude       Float?
@@ -166,8 +205,9 @@ model Device {
  */
 model Employee {
   id          String         @id @default(cuid())
-  /// System-generated e-code for new hires (Section 11). Legacy records use their
-  /// original SmartOffice staffCode, flagged with isLegacyCode = true.
+  /// System-generated e-code for new hires (Section 11): [Client:2][Brand:2][Store:2][Serial:3],
+  /// 9 digits total, e.g. "101010001". Codes never start with 0 (Client.code starts at "10").
+  /// Legacy records use their original SmartOffice staffCode, flagged with isLegacyCode = true.
   staffCode   String         @unique
   isLegacyCode Boolean       @default(false)
   name        String
@@ -199,6 +239,10 @@ model Employee {
 
   /// Present only if designation = PROCESS_ASSOCIATE or SHIFT_INCHARGE and a login was created.
   linkedUser User?
+
+  /// Manual attendance entries recorded on this employee's behalf — only
+  /// populated if this employee's Store has attendanceMode = MANUAL.
+  manualAttendanceEntries ManualAttendanceEntry[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -234,6 +278,8 @@ model User {
 
   createdAt DateTime   @default(now())
   auditLogs AuditLog[]
+  /// Manual attendance entries this user has personally recorded (Manager/SI, MANUAL-mode stores only).
+  manualAttendanceEntriesEntered ManualAttendanceEntry[]
 }
 
 /**
@@ -311,6 +357,45 @@ model SmartOfficeCommand {
   resolvedAt DateTime?
 
   @@index([status, nextAttemptAt])
+}
+
+/**
+ * Manual attendance entry for stores with attendanceMode = MANUAL (no biometric
+ * device). Recorded by Manager/Shift Incharge through a web form rather than
+ * synced from SmartOffice. One row per employee per calendar day — re-saving
+ * the same day overwrites the previous entry (upsert on [employeeId, date]).
+ *
+ * This is deliberately a SEPARATE model from AttendanceLog rather than
+ * shoehorning manual entries into the raw-punch-log schema: AttendanceLog
+ * models individual IN/OUT device events, which is the wrong shape for a
+ * "was this person present today" daily record. Keeping them separate avoids
+ * awkward nullable-serialNumber/unique-constraint hacks on AttendanceLog.
+ */
+model ManualAttendanceEntry {
+  id     String   @id @default(cuid())
+  date   DateTime @db.Date /// Calendar day only, no time component.
+  status ManualAttendanceStatus
+
+  /// Optional — Manager/SI can record actual clock times if they want to,
+  /// or just mark PRESENT/ABSENT/HALF_DAY/ON_LEAVE without times.
+  checkInTime  DateTime?
+  checkOutTime DateTime?
+  notes        String?
+
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  /// Who recorded/last-edited this entry — always Manager or Shift Incharge
+  /// (or Admin/Client), enforced by can('attendance:manualEntry') at the
+  /// action layer plus a runtime check that the Store is actually MANUAL mode.
+  enteredByUserId String
+  enteredByUser   User   @relation(fields: [enteredByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([employeeId, date])
+  @@index([employeeId, date])
 }
 
 /**

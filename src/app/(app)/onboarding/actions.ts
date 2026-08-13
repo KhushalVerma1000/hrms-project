@@ -8,7 +8,7 @@ import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import bcrypt from 'bcryptjs';
 import { Designation, EmployeeStatus } from '@prisma/client';
-import { GOOGLE_FORM_BASE_URL, GOOGLE_FORM_ECODE_FIELD_ID } from '@/lib/config';
+import { generatePrefilledFormUrl } from '@/lib/config';
 
 export interface OnboardingSubmitInput {
   name: string;
@@ -75,7 +75,7 @@ export async function getStoreECodePreviewAction(storeId: string) {
 
   if (!store) throw new Error('Store not found');
 
-  const serialPadded = String(store.nextEmployeeSerial).padStart(4, '0');
+  const serialPadded = String(store.nextEmployeeSerial).padStart(3, '0');
   const previewCode = `${store.client.code}${store.warehouseType.code}${store.code}${serialPadded}`;
 
   return { previewCode, clientName: store.client.name, storeName: store.name, warehouseType: store.warehouseType.name };
@@ -219,12 +219,13 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
       metadata: { staffCode: result.staffCode, designation: input.designation, storeId: input.storeId },
     });
 
-    // Build pre-filled Google Form link
-    let googleFormUrl = GOOGLE_FORM_BASE_URL;
-    if (GOOGLE_FORM_ECODE_FIELD_ID && GOOGLE_FORM_BASE_URL) {
-      const sep = GOOGLE_FORM_BASE_URL.includes('?') ? '&' : '?';
-      googleFormUrl = `${GOOGLE_FORM_BASE_URL}${sep}${GOOGLE_FORM_ECODE_FIELD_ID}=${encodeURIComponent(result.staffCode)}`;
-    }
+    // Build pre-filled Google Form link — uses the Client's own override if set,
+    // otherwise falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
+    const store = await prisma.store.findUnique({
+      where: { id: input.storeId },
+      select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } },
+    });
+    const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store?.client);
 
     return {
       ok: true,
