@@ -6,9 +6,22 @@ import { can } from '@/lib/auth/can';
 import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import { smartOfficeClient } from '@/lib/smartoffice/client';
+import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
 
-export async function getDevicesAction() {
+/**
+ * Diagnostic: checks SmartOffice reachability + API key validity separately,
+ * so a failure tells you WHICH of the two is broken rather than a generic
+ * "something went wrong." Admin only — surfaces raw connection details.
+ */
+export async function testSmartOfficeConnectionAction() {
   const session = await auth();
+  if (!session?.user || session.user.role !== 'ADMIN') {
+    return { ok: false, message: 'Only Admin users can run this diagnostic.' } as const;
+  }
+  return testSmartOfficeConnection();
+}
+
+export async function getDevicesAction() {  const session = await auth();
   if (!session?.user) throw new Error('Unauthorized');
 
   const user = session.user;

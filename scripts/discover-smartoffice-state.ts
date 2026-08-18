@@ -103,7 +103,7 @@ async function main() {
   // ── Step 1: GetDeviceCommands (no SerialNumbers filter = all devices) ──────
   console.log('📡 Fetching device commands history...');
   try {
-    const commandsResult = await smartGet('/api/v2/WebAPI/GetDeviceCommands', { FromDate: from, ToDate: to });
+    const commandsResult = await smartGet('/api/WebAPI/GetDeviceCommands', { FromDate: from, ToDate: to });
     const records = commandsResult?.records || [];
     for (const rec of records) {
       const sn = rec.SerialNumber;

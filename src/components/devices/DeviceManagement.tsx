@@ -6,6 +6,7 @@ import {
   addDeviceAction,
   deleteDeviceAction,
   clearDeviceLogsAction,
+  testSmartOfficeConnectionAction,
 } from '@/app/(app)/devices/actions';
 import { getStoresForOnboardingAction } from '@/app/(app)/onboarding/actions';
 import { Button } from '@/components/ui/button';
@@ -23,13 +24,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Smartphone, Plus, Trash2, Eraser, RefreshCw, Loader2, Signal, SignalZero } from 'lucide-react';
+import { Smartphone, Plus, Trash2, Eraser, RefreshCw, Loader2, Signal, SignalZero, Wifi, WifiOff } from 'lucide-react';
 import { toast } from 'sonner';
 
 export function DeviceManagement({ userRole }: { userRole: string }) {
   const [devices, setDevices] = useState<any[]>([]);
   const [stores, setStores] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Connection test state
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionResult, setConnectionResult] = useState<any>(null);
 
   // Add Modal State
   const [showAddModal, setShowAddModal] = useState(false);
@@ -63,6 +68,25 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
   useEffect(() => {
     fetchData();
   }, []);
+
+  const handleTestConnection = async () => {
+    setTestingConnection(true);
+    setConnectionResult(null);
+    try {
+      const res = await testSmartOfficeConnectionAction();
+      setConnectionResult(res);
+      if (res.ok) {
+        toast.success('SmartOffice connection OK');
+      } else {
+        toast.error('SmartOffice connection issue — see details below');
+      }
+    } catch (err: any) {
+      setConnectionResult({ ok: false, message: err.message });
+      toast.error('Connection test failed to run');
+    } finally {
+      setTestingConnection(false);
+    }
+  };
 
   const handleAddDevice = async () => {
     setAdding(true);
@@ -129,6 +153,16 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {userRole === 'ADMIN' && (
+            <Button variant="outline" onClick={handleTestConnection} disabled={testingConnection}>
+              {testingConnection ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <Wifi className="w-4 h-4 mr-2" />
+              )}
+              Test SmartOffice Connection
+            </Button>
+          )}
           <Button variant="outline" onClick={fetchData} disabled={loading}>
             <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} /> Refresh
           </Button>
@@ -137,6 +171,40 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
           </Button>
         </div>
       </div>
+
+      {connectionResult && (
+        <Card className={connectionResult.ok ? 'border-green-200 bg-green-50/50' : 'border-red-200 bg-red-50/50'}>
+          <CardContent className="p-4 flex items-start gap-3">
+            {connectionResult.ok ? (
+              <Wifi className="w-5 h-5 text-green-600 mt-0.5 shrink-0" />
+            ) : (
+              <WifiOff className="w-5 h-5 text-red-600 mt-0.5 shrink-0" />
+            )}
+            <div className="text-sm space-y-1">
+              <p className={connectionResult.ok ? 'text-green-800 font-medium' : 'text-red-800 font-medium'}>
+                {connectionResult.message}
+              </p>
+              {!connectionResult.ok && (
+                <div className="text-xs text-gray-600 space-y-0.5 mt-1">
+                  <p>Base URL configured: {connectionResult.baseUrlConfigured ? 'Yes' : 'No — check SMARTOFFICE_BASE_URL'}</p>
+                  <p>API key configured: {connectionResult.apiKeyConfigured ? 'Yes' : 'No — check SMARTOFFICE_API_KEY'}</p>
+                  {connectionResult.baseUrlConfigured && connectionResult.apiKeyConfigured && (
+                    <>
+                      <p>Server reachable: {connectionResult.reachable ? 'Yes' : 'No — network/firewall/DNS issue'}</p>
+                      {connectionResult.reachable && (
+                        <p>API key valid: {connectionResult.apiKeyValid ? 'Yes' : 'No — key was rejected by SmartOffice'}</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+              {connectionResult.latencyMs !== null && (
+                <p className="text-xs text-gray-500">Response time: {connectionResult.latencyMs}ms</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card className="shadow-sm">
         <CardContent className="p-0 overflow-x-auto">

@@ -1,8 +1,52 @@
 /**
  * ONE-OFF IMPORT SCRIPT — legacy SmartOffice employee data → local Postgres.
  *
- * BEFORE RUNNING: export CSV and prepare a client-mapping.json as described in the
- * project's docs. Run with --dry-run to preview changes.
+ * WHY THIS EXISTS (see chat / spec Section: "How to Import Your Existing Data"):
+ * SmartOffice's API has no "list all employees" endpoint — AddEmployee/DeleteEmployee
+ * only operate on one record at a time. The only way to get your full existing
+ * employee list is the grid export from SmartOffice's own web UI (what you shared
+ * as RadGridExport.xls). This script imports THAT export — it does not call
+ * SmartOffice at all, and it does NOT enqueue any ADD_EMPLOYEE/UPLOAD_USER commands,
+ * since these people already exist and are already enrolled on the physical devices.
+ * This is a local-only mirror import.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * BEFORE RUNNING:
+ *
+ * 1. Export your SmartOffice employee grid to CSV (Excel: File → Save As → CSV,
+ *    or Google Sheets: File → Download → CSV). Expected columns (case-insensitive,
+ *    matches what you showed earlier):
+ *      Employee Code, Employee Name, Branch, Department, Category, Location
+ *
+ * 2. Build a Location → Client mapping file. This is the ONE step that cannot be
+ *    automated — SmartOffice has no concept of your "Client" (vendor account)
+ *    entity, so nothing in the export tells us which of your Clients (e.g.
+ *    "Mansa Maharani") owns a given Location. Create client-mapping.json:
+ *
+ *      {
+ *        "Malviya nagar": "Mansa Maharani",
+ *        "Punjabi Bagh": "Mansa Maharani",
+ *        "Saket": "Mansa Maharani"
+ *      }
+ *
+ *    Location names must match the "Location" column values in your CSV exactly
+ *    (case-insensitive matching is applied, but spelling must match).
+ *
+ * 3. Run:
+ *      npx ts-node --compiler-options '{"module":"CommonJS"}' prisma/import-legacy-employees.ts \
+ *        --csv=./legacy-employees.csv \
+ *        --default-client="Mansa Maharani"
+ *
+ *    --default-client applies to every Location NOT explicitly listed in
+ *    --mapping (see below) — since your whole current export is one vendor
+ *    account, you can skip --mapping entirely and just pass --default-client.
+ *    Only use --mapping if some Locations belong to a DIFFERENT Client than
+ *    the default (e.g. you're consolidating exports from multiple vendors):
+ *      --mapping=./client-mapping.json  (optional; same format as before,
+ *        only needs entries for Locations that DON'T use the default)
+ *
+ *    Add --dry-run to preview what would happen without writing anything.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import { PrismaClient, Designation } from '@prisma/client';
@@ -25,6 +69,7 @@ function parseArgs() {
   return {
     csvPath: get('csv'),
     mappingPath: get('mapping'),
+    defaultClient: get('default-client'),
     dryRun: args.includes('--dry-run'),
   };
 }
@@ -84,24 +129,38 @@ function col(row: Record<string, string>, ...names: string[]): string {
 async function main() {
   const { csvPath, mappingPath, defaultClient, dryRun } = parseArgs();
 
-  if (!csvPath || !mappingPath) {
+  if (!csvPath) {
     console.error(
-      'Usage: ts-node prisma/import-legacy-employees.ts --csv=./file.csv --mapping=./client-mapping.json [--dry-run]',
+      'Usage: ts-node prisma/import-legacy-employees.ts --csv=./file.csv ' +
+      '(--default-client="Mansa Maharani" | --mapping=./client-mapping.json) [--dry-run]',
+    );
+    process.exit(1);
+  }
+
+  if (!defaultClient && !mappingPath) {
+    console.error(
+      'You must supply either --default-client="Some Client Name" (applies to every ' +
+      'Location) or --mapping=./client-mapping.json (per-Location overrides), or both ' +
+      '(mapping wins for any Location it lists; default-client covers everything else).',
     );
     process.exit(1);
   }
 
   const csvText = fs.readFileSync(path.resolve(csvPath), 'utf8');
-  const clientMapping: Record<string, string> = JSON.parse(
-    fs.readFileSync(path.resolve(mappingPath), 'utf8'),
-  );
-  // Normalize mapping keys to lowercase for case-insensitive lookup
-  const normalizedMapping = new Map(
-    Object.entries(clientMapping).map(([k, v]) => [k.toLowerCase(), v]),
-  );
+  const normalizedMapping = new Map<string, string>();
+  if (mappingPath) {
+    const clientMapping: Record<string, string> = JSON.parse(
+      fs.readFileSync(path.resolve(mappingPath), 'utf8'),
+    );
+    for (const [k, v] of Object.entries(clientMapping)) {
+      normalizedMapping.set(k.toLowerCase(), v);
+    }
+  }
 
   const rows = parseCsv(csvText);
   console.log(`📄 Parsed ${rows.length} rows from ${csvPath}`);
+  if (defaultClient) console.log(`   Default Client for unmapped Locations: "${defaultClient}"`);
+  if (mappingPath) console.log(`   Per-Location overrides loaded from: ${mappingPath}`);
 
   const stats = {
     imported: 0,

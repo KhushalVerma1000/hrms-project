@@ -1,0 +1,805 @@
+diff --git a/prisma/import-legacy-employees.ts b/prisma/import-legacy-employees.ts
+new file mode 100644
+index 0000000..9eaab4c
+--- /dev/null
++++ b/prisma/import-legacy-employees.ts
+@@ -0,0 +1,341 @@
++/**
++ * ONE-OFF IMPORT SCRIPT — legacy SmartOffice employee data → local Postgres.
++ *
++ * WHY THIS EXISTS (see chat / spec Section: "How to Import Your Existing Data"):
++ * SmartOffice's API has no "list all employees" endpoint — AddEmployee/DeleteEmployee
++ * only operate on one record at a time. The only way to get your full existing
++ * employee list is the grid export from SmartOffice's own web UI (what you shared
++ * as RadGridExport.xls). This script imports THAT export — it does not call
++ * SmartOffice at all, and it does NOT enqueue any ADD_EMPLOYEE/UPLOAD_USER commands,
++ * since these people already exist and are already enrolled on the physical devices.
++ * This is a local-only mirror import.
++ *
++ * ─────────────────────────────────────────────────────────────────────────────
++ * BEFORE RUNNING:
++ *
++ * 1. Export your SmartOffice employee grid to CSV (Excel: File → Save As → CSV,
++ *    or Google Sheets: File → Download → CSV). Expected columns (case-insensitive,
++ *    matches what you showed earlier):
++ *      Employee Code, Employee Name, Branch, Department, Category, Location
++ *
++ * 2. Build a Location → Client mapping file. This is the ONE step that cannot be
++ *    automated — SmartOffice has no concept of your "Client" (vendor account)
++ *    entity, so nothing in the export tells us which of your Clients (e.g.
++ *    "Mansa Maharani") owns a given Location. Create client-mapping.json:
++ *
++ *      {
++ *        "Malviya nagar": "Mansa Maharani",
++ *        "Punjabi Bagh": "Mansa Maharani",
++ *        "Saket": "Mansa Maharani"
++ *      }
++ *
++ *    Location names must match the "Location" column values in your CSV exactly
++ *    (case-insensitive matching is applied, but spelling must match).
++ *
++ * 3. Run:
++ *      npx ts-node --compiler-options '{"module":"CommonJS"}' prisma/import-legacy-employees.ts \
++ *        --csv=./legacy-employees.csv \
++ *        --default-client="Mansa Maharani"
++ *
++ *    --default-client applies to every Location NOT explicitly listed in
++ *    --mapping (see below) — since your whole current export is one vendor
++ *    account, you can skip --mapping entirely and just pass --default-client.
++ *    Only use --mapping if some Locations belong to a DIFFERENT Client than
++ *    the default (e.g. you're consolidating exports from multiple vendors):
++ *      --mapping=./client-mapping.json  (optional; same format as before,
++ *        only needs entries for Locations that DON'T use the default)
++ *
++ *    Add --dry-run to preview what would happen without writing anything.
++ * ─────────────────────────────────────────────────────────────────────────────
++ */
++
++import { PrismaClient, Designation } from '@prisma/client';
++import * as fs from 'fs';
++import * as path from 'path';
++import { assignWarehouseTypeCode, assignStoreCode } from '../src/lib/ecode';
++
++const prisma = new PrismaClient();
++
++// ─────────────────────────────────────────────────────────────────────────────
++// CLI args
++// ─────────────────────────────────────────────────────────────────────────────
++
++function parseArgs() {
++  const args = process.argv.slice(2);
++  const get = (flag: string) => {
++    const arg = args.find((a) => a.startsWith(`--${flag}=`));
++    return arg ? arg.split('=').slice(1).join('=') : undefined;
++  };
++  return {
++    csvPath: get('csv'),
++    mappingPath: get('mapping'),
++    defaultClient: get('default-client'),
++    dryRun: args.includes('--dry-run'),
++  };
++}
++
++// ─────────────────────────────────────────────────────────────────────────────
++// Minimal CSV parser (handles quoted fields with commas; no external deps)
++// ─────────────────────────────────────────────────────────────────────────────
++
++function parseCsv(text: string): Record<string, string>[] {
++  const lines = text.replace(/\r\n/g, '\n').split('\n').filter((l) => l.trim().length > 0);
++  if (lines.length === 0) return [];
++
++  function parseLine(line: string): string[] {
++    const fields: string[] = [];
++    let cur = '';
++    let inQuotes = false;
++    for (let i = 0; i < line.length; i++) {
++      const ch = line[i];
++      if (inQuotes) {
++        if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
++        else if (ch === '"') { inQuotes = false; }
++        else { cur += ch; }
++      } else {
++        if (ch === '"') inQuotes = true;
++        else if (ch === ',') { fields.push(cur); cur = ''; }
++        else cur += ch;
++      }
++    }
++    fields.push(cur);
++    return fields.map((f) => f.trim());
++  }
++
++  const headers = parseLine(lines[0]!).map((h) => h.trim());
++  const rows: Record<string, string>[] = [];
++  for (let i = 1; i < lines.length; i++) {
++    const values = parseLine(lines[i]!);
++    const row: Record<string, string> = {};
++    headers.forEach((h, idx) => { row[h] = values[idx] ?? ''; });
++    rows.push(row);
++  }
++  return rows;
++}
++
++/** Case-insensitive column lookup, since export headers can vary slightly. */
++function col(row: Record<string, string>, ...names: string[]): string {
++  const lowerNames = names.map((n) => n.toLowerCase());
++  for (const key of Object.keys(row)) {
++    if (lowerNames.includes(key.toLowerCase())) return row[key]?.trim() ?? '';
++  }
++  return '';
++}
++
++// ─────────────────────────────────────────────────────────────────────────────
++// Main import logic
++// ─────────────────────────────────────────────────────────────────────────────
++
++async function main() {
++  const { csvPath, mappingPath, defaultClient, dryRun } = parseArgs();
++
++  if (!csvPath) {
++    console.error(
++      'Usage: ts-node prisma/import-legacy-employees.ts --csv=./file.csv ' +
++      '(--default-client="Mansa Maharani" | --mapping=./client-mapping.json) [--dry-run]',
++    );
++    process.exit(1);
++  }
++
++  if (!defaultClient && !mappingPath) {
++    console.error(
++      'You must supply either --default-client="Some Client Name" (applies to every ' +
++      'Location) or --mapping=./client-mapping.json (per-Location overrides), or both ' +
++      '(mapping wins for any Location it lists; default-client covers everything else).',
++    );
++    process.exit(1);
++  }
++
++  const csvText = fs.readFileSync(path.resolve(csvPath), 'utf8');
++  const normalizedMapping = new Map<string, string>();
++  if (mappingPath) {
++    const clientMapping: Record<string, string> = JSON.parse(
++      fs.readFileSync(path.resolve(mappingPath), 'utf8'),
++    );
++    for (const [k, v] of Object.entries(clientMapping)) {
++      normalizedMapping.set(k.toLowerCase(), v);
++    }
++  }
++
++  const rows = parseCsv(csvText);
++  console.log(`📄 Parsed ${rows.length} rows from ${csvPath}`);
++  if (defaultClient) console.log(`   Default Client for unmapped Locations: "${defaultClient}"`);
++  if (mappingPath) console.log(`   Per-Location overrides loaded from: ${mappingPath}`);
++
++  const stats = {
++    imported: 0,
++    skippedExisting: 0,
++    skippedNoLocation: 0,
++    skippedUnmappedLocation: new Set<string>(),
++    skippedUnmappedClient: new Set<string>(),
++    warehouseTypesCreated: [] as string[],
++    storesCreated: [] as string[],
++  };
++
++  // Caches to avoid repeat DB lookups within this run
++  const warehouseTypeCache = new Map<string, string>(); // name(lower) -> id
++  const storeCache = new Map<string, string>(); // `${clientId}:${locationName lower}` -> storeId
++  const clientCache = new Map<string, string>(); // name(lower) -> id
++
++  for (const row of rows) {
++    const staffCode = col(row, 'Employee Code', 'EmployeeCode', 'Staff Code');
++    const name = col(row, 'Employee Name', 'EmployeeName', 'Name');
++    const branch = col(row, 'Branch', 'CompanySName');
++    const location = col(row, 'Location');
++    const category = col(row, 'Category', 'Designation');
++
++    if (!staffCode || !name) {
++      console.warn(`⚠️  Skipping row with missing Employee Code or Name: ${JSON.stringify(row)}`);
++      continue;
++    }
++
++    if (!location) {
++      stats.skippedNoLocation++;
++      console.warn(`⚠️  Skipping ${staffCode} (${name}) — no Location value.`);
++      continue;
++    }
++
++    // Resolve Client from mapping, falling back to --default-client
++    const clientName = normalizedMapping.get(location.toLowerCase()) || defaultClient;
++    if (!clientName) {
++      stats.skippedUnmappedLocation.add(location);
++      continue; // reported in summary at the end
++    }
++
++    let clientId = clientCache.get(clientName.toLowerCase());
++    if (!clientId) {
++      let client = await prisma.client.findFirst({
++        where: { name: { equals: clientName, mode: 'insensitive' } },
++      });
++      if (!client) {
++        if (dryRun) {
++          console.log(`[DRY RUN] Would create Client "${clientName}"`);
++          clientId = `dryrun-client-${clientName}`;
++        } else {
++          client = await prisma.$transaction(async (tx) => {
++            const code = await assignClientCode(tx);
++            return tx.client.create({
++              data: { code, name: clientName, shortName: clientName.slice(0, 10).toUpperCase() },
++            });
++          });
++          console.log(`✅ Created Client "${clientName}" (code ${client.code})`);
++        }
++      }
++      clientId = client?.id ?? clientId!;
++      clientCache.set(clientName.toLowerCase(), clientId);
++    }
++
++    // Resolve or create WarehouseType from Branch
++    const branchName = branch || 'Unknown';
++    let warehouseTypeId = warehouseTypeCache.get(branchName.toLowerCase());
++    if (!warehouseTypeId) {
++      let wt = await prisma.warehouseType.findFirst({
++        where: { name: { equals: branchName, mode: 'insensitive' } },
++      });
++      if (!wt) {
++        if (dryRun) {
++          console.log(`[DRY RUN] Would create WarehouseType "${branchName}"`);
++          warehouseTypeId = `dryrun-wt-${branchName}`;
++        } else {
++          wt = await prisma.$transaction(async (tx) => {
++            const code = await assignWarehouseTypeCode(tx);
++            return tx.warehouseType.create({ data: { code, name: branchName } });
++          });
++          stats.warehouseTypesCreated.push(branchName);
++          console.log(`✅ Created WarehouseType "${branchName}" (code ${wt.code})`);
++        }
++      }
++      warehouseTypeId = wt?.id ?? warehouseTypeId!;
++      warehouseTypeCache.set(branchName.toLowerCase(), warehouseTypeId);
++    }
++
++    // Resolve or create Store from Location (+ Client + WarehouseType)
++    const storeCacheKey = `${clientId}:${location.toLowerCase()}`;
++    let storeId = storeCache.get(storeCacheKey);
++    if (!storeId) {
++      let store = await prisma.store.findFirst({
++        where: { clientId, name: { equals: location, mode: 'insensitive' } },
++      });
++      if (!store) {
++        if (dryRun) {
++          console.log(`[DRY RUN] Would create Store "${location}" under client "${clientName}"`);
++          storeId = `dryrun-store-${location}`;
++        } else {
++          store = await prisma.$transaction(async (tx) => {
++            const code = await assignStoreCode(tx, clientId!);
++            return tx.store.create({
++              data: { code, name: location, clientId: clientId!, warehouseTypeId: warehouseTypeId! },
++            });
++          });
++          stats.storesCreated.push(`${location} (${clientName})`);
++          console.log(`✅ Created Store "${location}" under "${clientName}" (code ${store.code})`);
++        }
++      }
++      storeId = store?.id ?? storeId!;
++      storeCache.set(storeCacheKey, storeId);
++    }
++
++    // Check for existing employee with this staffCode — never overwrite
++    const existing = await prisma.employee.findUnique({ where: { staffCode } });
++    if (existing) {
++      stats.skippedExisting++;
++      continue;
++    }
++
++    // Best-effort designation mapping — defaults to ASSOCIATE if Category
++    // doesn't match a known designation. Reclassify manually afterward if needed.
++    const designation = mapCategoryToDesignation(category);
++
++    if (dryRun) {
++      console.log(`[DRY RUN] Would import ${staffCode} — ${name} (${designation}) @ ${location}`);
++    } else {
++      await prisma.employee.create({
++        data: {
++          staffCode,
++          name,
++          storeId: storeId!,
++          designation,
++          isLegacyCode: true,
++          status: 'ACTIVE',
++        },
++      });
++    }
++    stats.imported++;
++  }
++
++  // ─── Summary ────────────────────────────────────────────────────────────
++  console.log('\n📊 Import Summary');
++  console.log(`   Imported:                 ${stats.imported}${dryRun ? ' (dry run — nothing written)' : ''}`);
++  console.log(`   Skipped (already exists): ${stats.skippedExisting}`);
++  console.log(`   Skipped (no Location):    ${stats.skippedNoLocation}`);
++  console.log(`   WarehouseTypes created:    ${stats.warehouseTypesCreated.join(', ') || 'none'}`);
++  console.log(`   Stores created:            ${stats.storesCreated.join(', ') || 'none'}`);
++
++  if (stats.skippedUnmappedLocation.size > 0) {
++    console.log(`\n❌ Unmapped Locations (add these to client-mapping.json and re-run):`);
++    for (const loc of stats.skippedUnmappedLocation) console.log(`   - "${loc}"`);
++  }
++  if (stats.skippedUnmappedClient.size > 0) {
++    console.log(`\n❌ Client names in mapping that don't match any existing Client record:`);
++    for (const c of stats.skippedUnmappedClient) console.log(`   - "${c}" — create this Client in the app first`);
++  }
++}
++
++/** Maps the export's "Category" column to a Designation, if recognizable. */
++function mapCategoryToDesignation(category: string): Designation {
++  const c = category.toLowerCase();
++  if (c.includes('shift') && c.includes('incharge')) return Designation.SHIFT_INCHARGE;
++  if (c.includes('process')) return Designation.PROCESS_ASSOCIATE;
++  if (c.includes('quality')) return Designation.QUALITY_ASSOCIATE;
++  if (c.includes('associate')) return Designation.ASSOCIATE;
++  return Designation.ASSOCIATE; // safe default — reclassify manually in the app if wrong
++}
++
++main()
++  .catch((e) => {
++    console.error('Import failed:', e);
++    process.exit(1);
++  })
++  .finally(async () => {
++    await prisma.$disconnect();
++  });
+diff --git a/scripts/discover-smartoffice-state.ts b/scripts/discover-smartoffice-state.ts
+new file mode 100644
+index 0000000..1970df4
+--- /dev/null
++++ b/scripts/discover-smartoffice-state.ts
+@@ -0,0 +1,204 @@
++/**
++ * SMARTOFFICE LIVE-STATE DISCOVERY SCRIPT
++ *
++ * ─────────────────────────────────────────────────────────────────────────────
++ * READ THIS FIRST — an honest limitation, not a workaround for one:
++ *
++ * SmartOffice's REST API (per its own documentation) has NO "list all
++ * devices" or "list all employees" endpoint. It only exposes Add/Delete for
++ * those, plus a few endpoints that operate on an ALREADY-KNOWN serial number
++ * (FetchLiveUsersFromBiometric, SetUserExpiration, etc.).
++ *
++ * This script does the best possible job within that real constraint:
++ *
++ *   1. Calls GetDeviceCommands over a wide date range (no SerialNumbers filter)
++ *      to discover every device SerialNumber/DeviceCode that has EVER had a
++ *      command issued against it.
++ *   2. Calls GetDeviceLogs over the same range to catch any device that has
++ *      punch history but somehow never had a command logged — belt and
++ *      suspenders, unions both sets of discovered serial numbers.
++ *   3. For each discovered SerialNumber, calls FetchLiveUsersFromBiometric to
++ *      get that device's CURRENT live enrolled user list (EmployeeCode +
++ *      fingerprint count + privilege level) — this is the closest thing to
++ *      "current state" the API actually offers.
++ *
++ * WHAT THIS CANNOT GIVE YOU: employee names, branches, locations, or
++ * designations — FetchLiveUsersFromBiometric only returns EmployeeCode. For
++ * that, you still need a fresh grid export from SmartOffice's own web UI
++ * (the same RadGridExport.xls-style export used by import-legacy-employees.ts).
++ * This script's job is to tell you WHICH devices/employees currently exist
++ * and are live on the hardware, so you can cross-check that against your
++ * export and catch anything the export missed or that's since changed.
++ *
++ * Also: this cannot tell you which Store/Location a discovered device
++ * physically sits at — DeviceCode is just a label SmartOffice assigns, not
++ * guaranteed to encode location. Use the report's DeviceCode/device name to
++ * manually assign each discovered device to the right Store via the app's
++ * existing "Register Device" UI once you've reviewed this output.
++ * ─────────────────────────────────────────────────────────────────────────────
++ *
++ * USAGE:
++ *   Requires SMARTOFFICE_BASE_URL and SMARTOFFICE_API_KEY in the environment.
++ *   Standalone script — doesn't touch Postgres/Prisma at all, read-only against SmartOffice.
++ *
++ *   npx dotenv -e .env.local -- npx ts-node --compiler-options '{"module":"CommonJS"}' \
++ *     scripts/discover-smartoffice-state.ts --from=2023-01-01 --to=2026-08-13
++ *
++ *   (install dotenv-cli once if you don't have it: npm install --save-dev dotenv-cli)
++ *   Output is written to ./smartoffice-discovery-report.json
++ */
++
++import * as fs from 'fs';
++
++const BASE_URL = process.env.SMARTOFFICE_BASE_URL;
++const API_KEY = process.env.SMARTOFFICE_API_KEY;
++
++if (!BASE_URL || !API_KEY) {
++  console.error('❌ SMARTOFFICE_BASE_URL and/or SMARTOFFICE_API_KEY not set in environment.');
++  console.error('   Run this with your .env loaded, e.g.: npx dotenv -e .env.local -- npx ts-node ...');
++  process.exit(1);
++}
++
++function parseArgs() {
++  const args = process.argv.slice(2);
++  const get = (flag: string) => {
++    const arg = args.find((a) => a.startsWith(`--${flag}=`));
++    return arg ? arg.split('=').slice(1).join('=') : undefined;
++  };
++  return {
++    from: get('from') || '2023-01-01',
++    to: get('to') || new Date().toISOString().split('T')[0],
++  };
++}
++
++async function smartGet(path: string, params: Record<string, string>): Promise<any> {
++  const url = new URL(path, BASE_URL);
++  url.searchParams.set('APIKey', API_KEY!);
++  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
++
++  const res = await fetch(url.toString(), { signal: AbortSignal.timeout(20_000) });
++  const text = await res.text();
++  try {
++    return JSON.parse(text);
++  } catch {
++    // Some SmartOffice endpoints return a bare quoted string, not JSON — normalize
++    return text.replace(/^"|"$/g, '');
++  }
++}
++
++interface DiscoveredDevice {
++  serialNumber: string;
++  deviceCode?: string;
++  discoveredVia: string[];
++  liveUsers?: { employeeCode: string; fpCount: string; privilege: string }[];
++  liveUserFetchError?: string;
++}
++
++async function main() {
++  const { from, to } = parseArgs();
++  console.log(`🔍 Discovering SmartOffice state from ${from} to ${to}...\n`);
++
++  const devices = new Map<string, DiscoveredDevice>();
++
++  // ── Step 1: GetDeviceCommands (no SerialNumbers filter = all devices) ──────
++  console.log('📡 Fetching device commands history...');
++  try {
++    const commandsResult = await smartGet('/api/WebAPI/GetDeviceCommands', { FromDate: from, ToDate: to });
++    const records = commandsResult?.records || [];
++    for (const rec of records) {
++      const sn = rec.SerialNumber;
++      if (!sn) continue;
++      if (!devices.has(sn)) {
++        devices.set(sn, { serialNumber: sn, deviceCode: rec.DeviceCode, discoveredVia: [] });
++      }
++      const dev = devices.get(sn)!;
++      if (!dev.discoveredVia.includes('GetDeviceCommands')) dev.discoveredVia.push('GetDeviceCommands');
++      if (!dev.deviceCode && rec.DeviceCode) dev.deviceCode = rec.DeviceCode;
++    }
++    console.log(`   Found ${devices.size} distinct device(s) via command history.`);
++  } catch (err: any) {
++    console.warn(`   ⚠️  GetDeviceCommands failed: ${err.message}`);
++  }
++
++  // ── Step 2: GetDeviceLogs (catch devices with punches but no commands) ─────
++  console.log('📡 Fetching attendance log history (for device discovery only)...');
++  try {
++    const logsResult = await smartGet('/api/v2/WebAPI/GetDeviceLogs', { FromDate: from, ToDate: to });
++    const records = Array.isArray(logsResult) ? logsResult : [];
++    let newFromLogs = 0;
++    for (const rec of records) {
++      const sn = rec.SerialNumber;
++      if (!sn) continue;
++      if (!devices.has(sn)) {
++        devices.set(sn, { serialNumber: sn, discoveredVia: [] });
++        newFromLogs++;
++      }
++      const dev = devices.get(sn)!;
++      if (!dev.discoveredVia.includes('GetDeviceLogs')) dev.discoveredVia.push('GetDeviceLogs');
++    }
++    console.log(`   Found ${newFromLogs} additional device(s) via punch logs (not in command history).`);
++  } catch (err: any) {
++    console.warn(`   ⚠️  GetDeviceLogs failed: ${err.message}`);
++  }
++
++  if (devices.size === 0) {
++    console.error('\n❌ No devices discovered at all. This likely means:');
++    console.error('   - The date range is wrong (try widening --from further back)');
++    console.error('   - The API key/base URL are misconfigured (run the in-app "Test SmartOffice Connection" first)');
++    console.error('   - There genuinely is no command/punch history in SmartOffice yet');
++    process.exit(1);
++  }
++
++  // ── Step 3: FetchLiveUsersFromBiometric per discovered device ──────────────
++  console.log(`\n📡 Fetching live user list for ${devices.size} discovered device(s)...`);
++  const allEmployeeCodesSeen = new Set<string>();
++
++  for (const device of devices.values()) {
++    try {
++      const liveResult = await smartGet('/api/v2/WebAPI/FetchLiveUsersFromBiometric', {
++        SerialNumber: device.serialNumber,
++      });
++      const users = Array.isArray(liveResult) ? liveResult : [];
++      device.liveUsers = users.map((u: any) => ({
++        employeeCode: u.EmployeeCode,
++        fpCount: u.FPCount,
++        privilege: u.Privilege,
++      }));
++      device.liveUsers.forEach((u) => allEmployeeCodesSeen.add(u.employeeCode));
++      console.log(`   ${device.serialNumber} (${device.deviceCode || 'unnamed'}): ${device.liveUsers.length} live user(s)`);
++    } catch (err: any) {
++      device.liveUserFetchError = err.message;
++      console.warn(`   ⚠️  ${device.serialNumber}: failed to fetch live users — ${err.message}`);
++    }
++    // Small delay between calls — be a polite citizen to a server that might be modest hardware
++    await new Promise((r) => setTimeout(r, 300));
++  }
++
++  // ── Report ───────────────────────────────────────────────────────────────
++  const report = {
++    generatedAt: new Date().toISOString(),
++    dateRangeQueried: { from, to },
++    deviceCount: devices.size,
++    totalLiveEmployeeCodesSeen: allEmployeeCodesSeen.size,
++    devices: Array.from(devices.values()),
++    allEmployeeCodesSeen: Array.from(allEmployeeCodesSeen).sort(),
++  };
++
++  const outPath = './smartoffice-discovery-report.json';
++  fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
++
++  console.log(`\n✅ Discovery complete.`);
++  console.log(`   Devices found:           ${report.deviceCount}`);
++  console.log(`   Distinct live employees:  ${report.totalLiveEmployeeCodesSeen}`);
++  console.log(`   Full report written to:   ${outPath}`);
++  console.log(`\nNext steps:`);
++  console.log(`   1. Open ${outPath} and review the device list — match each DeviceCode/SerialNumber to the Store it's physically at.`);
++  console.log(`   2. Register each device via the app's Devices page (Admin), assigning it to the correct Store.`);
++  console.log(`   3. Cross-check allEmployeeCodesSeen against your CSV export (RadGridExport-style) — any code`);
++  console.log(`      that appears here but NOT in your CSV export needs manual investigation before import.`);
++}
++
++main().catch((err) => {
++  console.error('Discovery failed:', err);
++  process.exit(1);
++});
+diff --git a/src/app/(app)/devices/actions.ts b/src/app/(app)/devices/actions.ts
+index a389342..aeb5a9b 100644
+--- a/src/app/(app)/devices/actions.ts
++++ b/src/app/(app)/devices/actions.ts
+@@ -6,9 +6,22 @@ import { can } from '@/lib/auth/can';
+ import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
+ import { writeAuditLog } from '@/lib/smartoffice/audit';
+ import { smartOfficeClient } from '@/lib/smartoffice/client';
+-
+-export async function getDevicesAction() {
++import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
++
++/**
++ * Diagnostic: checks SmartOffice reachability + API key validity separately,
++ * so a failure tells you WHICH of the two is broken rather than a generic
++ * "something went wrong." Admin only — surfaces raw connection details.
++ */
++export async function testSmartOfficeConnectionAction() {
+   const session = await auth();
++  if (!session?.user || session.user.role !== 'ADMIN') {
++    return { ok: false, message: 'Only Admin users can run this diagnostic.' } as const;
++  }
++  return testSmartOfficeConnection();
++}
++
++export async function getDevicesAction() {  const session = await auth();
+   if (!session?.user) throw new Error('Unauthorized');
+ 
+   const user = session.user;
+diff --git a/src/components/devices/DeviceManagement.tsx b/src/components/devices/DeviceManagement.tsx
+index 15b7337..d060d90 100644
+--- a/src/components/devices/DeviceManagement.tsx
++++ b/src/components/devices/DeviceManagement.tsx
+@@ -6,6 +6,7 @@ import {
+   addDeviceAction,
+   deleteDeviceAction,
+   clearDeviceLogsAction,
++  testSmartOfficeConnectionAction,
+ } from '@/app/(app)/devices/actions';
+ import { getStoresForOnboardingAction } from '@/app/(app)/onboarding/actions';
+ import { Button } from '@/components/ui/button';
+@@ -23,7 +24,7 @@ import {
+   DialogHeader,
+   DialogTitle,
+ } from '@/components/ui/dialog';
+-import { Smartphone, Plus, Trash2, Eraser, RefreshCw, Loader2, Signal, SignalZero } from 'lucide-react';
++import { Smartphone, Plus, Trash2, Eraser, RefreshCw, Loader2, Signal, SignalZero, Wifi, WifiOff } from 'lucide-react';
+ import { toast } from 'sonner';
+ 
+ export function DeviceManagement({ userRole }: { userRole: string }) {
+@@ -31,6 +32,10 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+   const [stores, setStores] = useState<any[]>([]);
+   const [loading, setLoading] = useState(true);
+ 
++  // Connection test state
++  const [testingConnection, setTestingConnection] = useState(false);
++  const [connectionResult, setConnectionResult] = useState<any>(null);
++
+   // Add Modal State
+   const [showAddModal, setShowAddModal] = useState(false);
+   const [serialNumber, setSerialNumber] = useState('');
+@@ -64,6 +69,25 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+     fetchData();
+   }, []);
+ 
++  const handleTestConnection = async () => {
++    setTestingConnection(true);
++    setConnectionResult(null);
++    try {
++      const res = await testSmartOfficeConnectionAction();
++      setConnectionResult(res);
++      if (res.ok) {
++        toast.success('SmartOffice connection OK');
++      } else {
++        toast.error('SmartOffice connection issue — see details below');
++      }
++    } catch (err: any) {
++      setConnectionResult({ ok: false, message: err.message });
++      toast.error('Connection test failed to run');
++    } finally {
++      setTestingConnection(false);
++    }
++  };
++
+   const handleAddDevice = async () => {
+     setAdding(true);
+     try {
+@@ -129,6 +153,16 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+           </p>
+         </div>
+         <div className="flex items-center gap-2">
++          {userRole === 'ADMIN' && (
++            <Button variant="outline" onClick={handleTestConnection} disabled={testingConnection}>
++              {testingConnection ? (
++                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
++              ) : (
++                <Wifi className="w-4 h-4 mr-2" />
++              )}
++              Test SmartOffice Connection
++            </Button>
++          )}
+           <Button variant="outline" onClick={fetchData} disabled={loading}>
+             <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} /> Refresh
+           </Button>
+@@ -138,6 +172,40 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+         </div>
+       </div>
+ 
++      {connectionResult && (
++        <Card className={connectionResult.ok ? 'border-green-200 bg-green-50/50' : 'border-red-200 bg-red-50/50'}>
++          <CardContent className="p-4 flex items-start gap-3">
++            {connectionResult.ok ? (
++              <Wifi className="w-5 h-5 text-green-600 mt-0.5 shrink-0" />
++            ) : (
++              <WifiOff className="w-5 h-5 text-red-600 mt-0.5 shrink-0" />
++            )}
++            <div className="text-sm space-y-1">
++              <p className={connectionResult.ok ? 'text-green-800 font-medium' : 'text-red-800 font-medium'}>
++                {connectionResult.message}
++              </p>
++              {!connectionResult.ok && (
++                <div className="text-xs text-gray-600 space-y-0.5 mt-1">
++                  <p>Base URL configured: {connectionResult.baseUrlConfigured ? 'Yes' : 'No — check SMARTOFFICE_BASE_URL'}</p>
++                  <p>API key configured: {connectionResult.apiKeyConfigured ? 'Yes' : 'No — check SMARTOFFICE_API_KEY'}</p>
++                  {connectionResult.baseUrlConfigured && connectionResult.apiKeyConfigured && (
++                    <>
++                      <p>Server reachable: {connectionResult.reachable ? 'Yes' : 'No — network/firewall/DNS issue'}</p>
++                      {connectionResult.reachable && (
++                        <p>API key valid: {connectionResult.apiKeyValid ? 'Yes' : 'No — key was rejected by SmartOffice'}</p>
++                      )}
++                    </>
++                  )}
++                </div>
++              )}
++              {connectionResult.latencyMs !== null && (
++                <p className="text-xs text-gray-500">Response time: {connectionResult.latencyMs}ms</p>
++              )}
++            </div>
++          </CardContent>
++        </Card>
++      )}
++
+       <Card className="shadow-sm">
+         <CardContent className="p-0 overflow-x-auto">
+           <Table>
+diff --git a/src/lib/smartoffice/test-connection.ts b/src/lib/smartoffice/test-connection.ts
+new file mode 100644
+index 0000000..790865b
+--- /dev/null
++++ b/src/lib/smartoffice/test-connection.ts
+@@ -0,0 +1,97 @@
++/**
++ * SmartOffice connection diagnostic.
++ *
++ * Answers three separate questions that "is it working?" actually bundles together:
++ *   1. Is SMARTOFFICE_BASE_URL reachable at all? (network/DNS/firewall)
++ *   2. Is SMARTOFFICE_API_KEY valid? (auth)
++ *   3. Is the response shape what we expect? (API version/contract sanity)
++ *
++ * Uses GetDeviceCommands as the probe — it's a GET, mutates nothing, and
++ * SmartOffice's own docs show it returns a clean, typed error for a bad key
++ * ("API key is not correct") vs a clean success shape, which is exactly the
++ * signal we need to tell these three failure modes apart.
++ */
++
++import { getDeviceCommands, formatSmartOfficeDate } from './client';
++import { SMARTOFFICE_BASE_URL, SMARTOFFICE_API_KEY } from '@/lib/config';
++
++export interface ConnectionTestResult {
++  ok: boolean;
++  reachable: boolean;
++  apiKeyValid: boolean;
++  latencyMs: number | null;
++  baseUrlConfigured: boolean;
++  apiKeyConfigured: boolean;
++  message: string;
++  raw?: unknown;
++}
++
++export async function testSmartOfficeConnection(): Promise<ConnectionTestResult> {
++  const baseUrlConfigured = !!SMARTOFFICE_BASE_URL;
++  const apiKeyConfigured = !!SMARTOFFICE_API_KEY;
++
++  if (!baseUrlConfigured || !apiKeyConfigured) {
++    return {
++      ok: false,
++      reachable: false,
++      apiKeyValid: false,
++      latencyMs: null,
++      baseUrlConfigured,
++      apiKeyConfigured,
++      message: !baseUrlConfigured
++        ? 'SMARTOFFICE_BASE_URL is not set in the environment.'
++        : 'SMARTOFFICE_API_KEY is not set in the environment.',
++    };
++  }
++
++  const today = formatSmartOfficeDate(new Date());
++  const start = Date.now();
++
++  try {
++    const result = await getDeviceCommands({ FromDate: today, ToDate: today });
++    const latencyMs = Date.now() - start;
++
++    // normalizeResponse (in client.ts) already collapses SmartOffice's
++    // inconsistent shapes into { ok, message, data } — a bad key surfaces
++    // as ok:false with SmartOffice's own "API key is not correct" message.
++    if (!result.ok) {
++      const isAuthError = /api key/i.test(result.message || '');
++      return {
++        ok: false,
++        reachable: true, // we got A response, just not a successful one
++        apiKeyValid: !isAuthError,
++        latencyMs,
++        baseUrlConfigured,
++        apiKeyConfigured,
++        message: isAuthError
++          ? `Reached SmartOffice, but the API key was rejected: "${result.message}"`
++          : `Reached SmartOffice, but got an error: "${result.message}"`,
++        raw: result,
++      };
++    }
++
++    return {
++      ok: true,
++      reachable: true,
++      apiKeyValid: true,
++      latencyMs,
++      baseUrlConfigured,
++      apiKeyConfigured,
++      message: `Connected successfully in ${latencyMs}ms. Found ${result.data?.length ?? 0} device command(s) issued today.`,
++      raw: result,
++    };
++  } catch (err: any) {
++    const latencyMs = Date.now() - start;
++    // Network-level failure (DNS, connection refused, timeout) — thrown before
++    // we ever got an HTTP response to normalize, so this is a reachability problem.
++    return {
++      ok: false,
++      reachable: false,
++      apiKeyValid: false,
++      latencyMs,
++      baseUrlConfigured,
++      apiKeyConfigured,
++      message: `Could not reach ${SMARTOFFICE_BASE_URL}: ${err.message}. Check the base URL, network access, and that SmartOffice's service is actually running.`,
++    };
++  }
++}
