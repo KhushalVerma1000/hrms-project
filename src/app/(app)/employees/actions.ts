@@ -126,9 +126,40 @@ export async function softDeleteEmployeeAction(employeeId: string) {
     return { ok: false, error: 'Permission denied to deactivate this employee.' };
   }
 
-  const updated = await prisma.employee.update({
-    where: { id: employeeId },
-    data: { status: EmployeeStatus.OFFBOARDED },
+  // Soft-delete previously only flipped the local status — the employee stayed
+  // fully live and able to punch on the physical device. Block them on every
+  // device at their store so the app-side status and the device's actual state
+  // agree. (Only a subset of device models support this command; commands for
+  // unsupported models will fail terminally and surface on the Sync Issues
+  // screen rather than silently succeeding.)
+  const storeDevices = await prisma.device.findMany({
+    where: { storeId: employee.storeId },
+    select: { id: true, serialNumber: true },
+  });
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const emp = await tx.employee.update({
+      where: { id: employeeId },
+      data: { status: EmployeeStatus.OFFBOARDED },
+    });
+
+    for (const device of storeDevices) {
+      const blockKey = deriveIdempotencyKey('BLOCK_USER', {
+        targetId: `${employee.id}:${device.id}`,
+        payload: { BlockUser: 0 },
+      });
+      await enqueueCommand({
+        commandType: 'BLOCK_USER',
+        payload: { EmployeeCode: employee.staffCode, SerialNumber: device.serialNumber, BlockUser: 0 },
+        idempotencyKey: blockKey,
+        relatedType: 'Employee',
+        relatedId: employee.id,
+        createdBy: session.user.id,
+        tx,
+      });
+    }
+
+    return emp;
   });
 
   await writeAuditLog({
@@ -136,7 +167,68 @@ export async function softDeleteEmployeeAction(employeeId: string) {
     action: 'EMPLOYEE_SOFT_DELETE',
     targetType: 'Employee',
     targetId: employeeId,
-    metadata: { staffCode: employee.staffCode },
+    metadata: { staffCode: employee.staffCode, devicesBlocked: storeDevices.length },
+  });
+
+  return { ok: true, employee: updated };
+}
+
+/**
+ * Reactivates a previously soft-deleted (OFFBOARDED) employee: restores
+ * ACTIVE status locally and unblocks them on every device at their store.
+ * Uses the same permission scope as softDeleteEmployeeAction.
+ */
+export async function reactivateEmployeeAction(employeeId: string) {
+  const session = await auth();
+  if (!session?.user) throw new Error('Unauthorized');
+
+  const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
+  if (!employee) return { ok: false, error: 'Employee not found' };
+
+  if (!can(session, 'employee:softDelete', { storeId: employee.storeId })) {
+    return { ok: false, error: 'Permission denied to reactivate this employee.' };
+  }
+
+  if (employee.status === EmployeeStatus.ACTIVE) {
+    return { ok: false, error: 'Employee is already active.' };
+  }
+
+  const storeDevices = await prisma.device.findMany({
+    where: { storeId: employee.storeId },
+    select: { id: true, serialNumber: true },
+  });
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const emp = await tx.employee.update({
+      where: { id: employeeId },
+      data: { status: EmployeeStatus.ACTIVE },
+    });
+
+    for (const device of storeDevices) {
+      const unblockKey = deriveIdempotencyKey('UNBLOCK_USER', {
+        targetId: `${employee.id}:${device.id}`,
+        payload: { BlockUser: 1 },
+      });
+      await enqueueCommand({
+        commandType: 'UNBLOCK_USER',
+        payload: { EmployeeCode: employee.staffCode, SerialNumber: device.serialNumber, BlockUser: 1 },
+        idempotencyKey: unblockKey,
+        relatedType: 'Employee',
+        relatedId: employee.id,
+        createdBy: session.user.id,
+        tx,
+      });
+    }
+
+    return emp;
+  });
+
+  await writeAuditLog({
+    userId: session.user.id,
+    action: 'EMPLOYEE_REACTIVATE',
+    targetType: 'Employee',
+    targetId: employeeId,
+    metadata: { staffCode: employee.staffCode, devicesUnblocked: storeDevices.length },
   });
 
   return { ok: true, employee: updated };
@@ -188,13 +280,35 @@ export async function hardDeleteEmployeeAction(employeeId: string) {
 
   // 3. Execute delete transaction & enqueue SmartOffice commands
   try {
+    const storeDevices = await prisma.device.findMany({
+      where: { storeId: employee.storeId },
+      select: { serialNumber: true },
+    });
+    // DeleteUser accepts a comma-separated SerialNumber list to remove the
+    // user from every device at this store in one command.
+    const serialNumberList = storeDevices.map((d) => d.serialNumber).join(',');
+
     await prisma.$transaction(async (tx) => {
-      // Enqueue DELETE_USER / DELETE_EMPLOYEE command first
-      const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
+      // Enqueue DELETE_USER (un-enrolls from the physical device(s))...
+      if (serialNumberList) {
+        const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
+        await enqueueCommand({
+          commandType: 'DELETE_USER',
+          payload: { EmployeeCode: employee.staffCode, SerialNumber: serialNumberList },
+          idempotencyKey: delUserKey,
+          relatedType: 'Employee',
+          relatedId: employee.id,
+          createdBy: user.id,
+          tx,
+        });
+      }
+
+      // ...and DELETE_EMPLOYEE (removes the employee record from SmartOffice itself).
+      const delEmpKey = deriveIdempotencyKey('DELETE_EMPLOYEE', { employeeId: employee.id });
       await enqueueCommand({
-        commandType: 'DELETE_USER',
+        commandType: 'DELETE_EMPLOYEE',
         payload: { EmployeeCode: employee.staffCode },
-        idempotencyKey: delUserKey,
+        idempotencyKey: delEmpKey,
         relatedType: 'Employee',
         relatedId: employee.id,
         createdBy: user.id,

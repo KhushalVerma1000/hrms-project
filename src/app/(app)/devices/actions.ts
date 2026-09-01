@@ -5,7 +5,6 @@ import { prisma } from '@/lib/prisma';
 import { can } from '@/lib/auth/can';
 import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
-import { smartOfficeClient } from '@/lib/smartoffice/client';
 import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
 
 /**
@@ -21,7 +20,8 @@ export async function testSmartOfficeConnectionAction() {
   return testSmartOfficeConnection();
 }
 
-export async function getDevicesAction() {  const session = await auth();
+export async function getDevicesAction() {
+  const session = await auth();
   if (!session?.user) throw new Error('Unauthorized');
 
   const user = session.user;
@@ -78,13 +78,16 @@ export async function addDeviceAction(data: {
         },
       });
 
+      // AddBiometric only accepts DeviceName + SerialNumber per SmartOffice's
+      // docs — there's no Location field on this endpoint. The device gets
+      // associated with a location on SmartOffice's side implicitly, via
+      // whichever Location the physical unit is configured to report to.
       const addBioKey = deriveIdempotencyKey('ADD_BIOMETRIC', { targetId: dev.id, payload: { SerialNumber: dev.serialNumber } });
       await enqueueCommand({
         commandType: 'ADD_BIOMETRIC',
         payload: {
           SerialNumber: dev.serialNumber,
           DeviceName: dev.name,
-          LocationName: store.name,
         },
         idempotencyKey: addBioKey,
         relatedType: 'Device',
@@ -110,6 +113,16 @@ export async function addDeviceAction(data: {
   }
 }
 
+/**
+ * Deletes a device. Goes through the SmartOfficeCommand queue like every other
+ * write (previously this called SmartOffice directly and inline, which meant
+ * a SmartOffice outage failed the request synchronously instead of retrying
+ * in the background like ADD_BIOMETRIC does).
+ *
+ * SmartOffice rejects deletion if punch logs still exist for the device —
+ * that's a terminal business-rule rejection (see isTerminalError), so it will
+ * show up on the Sync Issues screen rather than retrying forever.
+ */
 export async function deleteDeviceAction(deviceId: string) {
   const session = await auth();
   if (!session?.user) throw new Error('Unauthorized');
@@ -125,14 +138,23 @@ export async function deleteDeviceAction(deviceId: string) {
   }
 
   try {
-    // Attempt SmartOffice direct call to verify if logs exist on device
-    const smRes = await smartOfficeClient.deleteBiometricDevice({ SerialNumber: device.serialNumber });
-    if (!smRes.ok) {
-      // Pass through SmartOffice's exact error message verbatim to the UI (Section 8)
-      return { ok: false, error: smRes.message || 'Device Logs exists for this device, You can not delete' };
-    }
+    await prisma.$transaction(async (tx) => {
+      const delBioKey = deriveIdempotencyKey('DELETE_BIOMETRIC', {
+        targetId: device.id,
+        payload: { SerialNumber: device.serialNumber },
+      });
+      await enqueueCommand({
+        commandType: 'DELETE_BIOMETRIC',
+        payload: { SerialNumber: device.serialNumber },
+        idempotencyKey: delBioKey,
+        relatedType: 'Device',
+        relatedId: device.id,
+        createdBy: session.user.id,
+        tx,
+      });
 
-    await prisma.device.delete({ where: { id: deviceId } });
+      await tx.device.delete({ where: { id: deviceId } });
+    });
 
     await writeAuditLog({
       userId: session.user.id,
@@ -148,6 +170,10 @@ export async function deleteDeviceAction(deviceId: string) {
   }
 }
 
+/**
+ * Clears all attendance logs from a device. Goes through the command queue
+ * (see deleteDeviceAction comment for why this matters).
+ */
 export async function clearDeviceLogsAction(deviceId: string) {
   const session = await auth();
   if (!session?.user || session.user.role !== 'ADMIN') {
@@ -158,10 +184,18 @@ export async function clearDeviceLogsAction(deviceId: string) {
   if (!device) return { ok: false, error: 'Device not found.' };
 
   try {
-    const smRes = await smartOfficeClient.clearAllLogsFromDevice({ SerialNumber: device.serialNumber });
-    if (!smRes.ok) {
-      return { ok: false, error: smRes.message || 'Failed to clear device logs.' };
-    }
+    const clearKey = deriveIdempotencyKey('CLEAR_LOGS', {
+      targetId: device.id,
+      payload: { SerialNumber: device.serialNumber, requestedAt: new Date().toISOString() },
+    });
+    await enqueueCommand({
+      commandType: 'CLEAR_LOGS',
+      payload: { SerialNumber: device.serialNumber },
+      idempotencyKey: clearKey,
+      relatedType: 'Device',
+      relatedId: device.id,
+      createdBy: session.user.id,
+    });
 
     await writeAuditLog({
       userId: session.user.id,
@@ -171,8 +205,8 @@ export async function clearDeviceLogsAction(deviceId: string) {
       metadata: { serialNumber: device.serialNumber },
     });
 
-    return { ok: true, message: 'All logs cleared successfully from device.' };
+    return { ok: true, message: 'Clear-logs command queued — it will run shortly.' };
   } catch (err: any) {
-    return { ok: false, error: err.message || 'Error clearing logs.' };
+    return { ok: false, error: err.message || 'Error queuing clear-logs command.' };
   }
 }

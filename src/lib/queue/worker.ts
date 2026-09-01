@@ -108,6 +108,9 @@ export async function dispatchCommand(cmd: SmartOfficeCommand): Promise<void> {
         result = await so.addTeam(payload as Parameters<typeof so.addTeam>[0]);
         break;
       case 'BLOCK_USER':
+      case 'UNBLOCK_USER':
+        // Same SmartOffice endpoint handles both — the payload's BlockUser
+        // field (0 = block, 1 = unblock) determines behavior.
         result = await so.blockUserInBiometric(payload as Parameters<typeof so.blockUserInBiometric>[0]);
         break;
       case 'SET_USER_EXPIRATION':

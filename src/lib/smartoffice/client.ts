@@ -191,7 +191,9 @@ export async function setUserExpiration(
 export async function getDeviceCommands(
   params: Omit<GetDeviceCommandsParams, 'APIKey'>,
 ): Promise<SmartOfficeResult<DeviceCommandRecord[]>> {
-  return smartGet('/api/v2/WebAPI/GetDeviceCommands', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  // NOTE: no "v2" in this path — confirmed against SmartOfficeAPIDocumentation.pdf.
+  // Every other endpoint in this file uses /api/v2/WebAPI/..., this one doesn't.
+  return smartGet('/api/WebAPI/GetDeviceCommands', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 /**
@@ -209,10 +211,16 @@ export async function photoUploadInBiometric(
   );
 }
 
+/**
+ * Blocks OR unblocks a user, depending on params.BlockUser (0 = block, 1 = unblock).
+ * Only a small number of device models support this command — the caller is
+ * responsible for feature-flagging by Device.model before enqueueing.
+ */
 export async function blockUserInBiometric(
   params: Omit<BlockUserParams, 'APIKey'>,
 ): Promise<SmartOfficeResult> {
-  return smartGet('/api/v2/WebAPI/BlockUserinBiometric', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  // NOTE: no "v2" in this path — confirmed against SmartOfficeAPIDocumentation.pdf.
+  return smartGet('/api/WebAPI/BlockUserinBiometric', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 export async function clearAllLogsFromDevice(
@@ -239,7 +247,9 @@ export async function triggerUserOnlineEnrollment(
 export async function addEmployee(
   params: Omit<AddEmployeeParams, 'APIKey'>,
 ): Promise<SmartOfficeResult> {
-  return smartPost('/api/v2/WebAPI/AddEmployee', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  // Doc specifies GET despite documenting a "Request JSON Object" — matches
+  // the pattern used by every other Add* endpoint in this file.
+  return smartGet('/api/v2/WebAPI/AddEmployee', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 export async function deleteEmployee(
@@ -269,19 +279,19 @@ export async function addLocation(
 export async function addDesignation(
   params: Omit<AddDesignationParams, 'APIKey'>,
 ): Promise<SmartOfficeResult> {
-  return smartPost('/api/v2/WebAPI/AddDesignation', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  return smartGet('/api/v2/WebAPI/AddDesignation', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 export async function addGrade(
   params: Omit<AddGradeParams, 'APIKey'>,
 ): Promise<SmartOfficeResult> {
-  return smartPost('/api/v2/WebAPI/AddGrade', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  return smartGet('/api/v2/WebAPI/AddGrade', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 export async function addTeam(
   params: Omit<AddTeamParams, 'APIKey'>,
 ): Promise<SmartOfficeResult> {
-  return smartPost('/api/v2/WebAPI/AddTeam', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  return smartGet('/api/v2/WebAPI/AddTeam', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 export const smartOfficeClient = {

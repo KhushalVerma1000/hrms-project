@@ -10,6 +10,7 @@ import { prisma } from '@/lib/prisma';
 import { getDeviceLogs, formatSmartOfficeDate } from '@/lib/smartoffice/client';
 import { SMARTOFFICE_TIMEZONE, ATTENDANCE_SYNC_DEFAULT_LOOKBACK_DAYS } from '@/lib/config';
 import type { DeviceLogRecord } from '@/lib/smartoffice/types';
+import { fromZonedTime } from 'date-fns-tz';
 
 export interface AttendanceSyncResult {
   devicesProcessed: number;
@@ -18,8 +19,17 @@ export interface AttendanceSyncResult {
 }
 
 /**
- * Parses a SmartOffice date string into a UTC Date, accounting for the
- * configured timezone (SMARTOFFICE_TIMEZONE, default: Asia/Kolkata / IST).
+ * Parses a SmartOffice date string (naive, no timezone info — e.g.
+ * "2019-09-16 13:45:29") into a correct UTC Date, treating it as wall-clock
+ * time in the configured timezone (SMARTOFFICE_TIMEZONE, default:
+ * Asia/Kolkata / IST).
+ *
+ * Uses date-fns-tz's `fromZonedTime`, which does this conversion correctly
+ * regardless of what timezone the server process itself is running in.
+ * (The previous implementation round-tripped through `toLocaleString` +
+ * `new Date(...)`, which re-parses a formatted string using the *server's*
+ * local timezone rather than the configured SmartOffice one — silently wrong
+ * on any server not already running in SMARTOFFICE_TIMEZONE.)
  *
  * ⚠️ Verification note: Before relying on this in production, punch a device at
  * a known wall-clock time, pull via GetDeviceLogs, and compare. If the timestamp
@@ -32,16 +42,13 @@ function parseSmartOfficeDate(dateStr: string): Date {
     const normalized = dateStr.replace('T', ' ').trim();
     const withTime = normalized.includes(':') ? normalized : `${normalized} 00:00:00`;
 
-    // Parse as if in the configured timezone using Intl
-    const tzDate = new Date(
-      new Date(withTime + ' GMT').toLocaleString('en-US', { timeZone: SMARTOFFICE_TIMEZONE })
-    );
+    const utcDate = fromZonedTime(withTime, SMARTOFFICE_TIMEZONE);
 
-    if (isNaN(tzDate.getTime())) {
+    if (isNaN(utcDate.getTime())) {
       console.warn(`[Sync] Could not parse date: ${dateStr}, using current time`);
       return new Date();
     }
-    return tzDate;
+    return utcDate;
   } catch {
     return new Date(dateStr); // fallback
   }

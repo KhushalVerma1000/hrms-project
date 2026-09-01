@@ -93,14 +93,20 @@ export function normalizeResponse<T = unknown>(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Request param types
+//
+// IMPORTANT: field names below are taken verbatim from
+// SmartOfficeAPIDocumentation.pdf (v1.0.4), NOT guessed/renamed to match this
+// app's internal naming. SmartOffice's own field names are frequently
+// inconsistent across endpoints (e.g. "CompanySName" vs "CompanyShortName"
+// nowhere in the doc, "StaffName" instead of "EmployeeName" for AddEmployee
+// but "EmployeeName" elsewhere) — resist the urge to "clean these up" to be
+// consistent with each other; they must match the live API exactly.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface AddBiometricParams {
   APIKey: string;
   SerialNumber: string;
   DeviceName: string;
-  LocationId: string;
-  DeviceModel?: string;
 }
 
 export interface DeleteBiometricParams {
@@ -119,14 +125,21 @@ export interface UploadUserParams {
   APIKey: string;
   EmployeeCode: string;
   EmployeeName: string;
+  /** Comma-separate multiple serial numbers to upload to more than one device at once. */
   SerialNumber: string;
   CardNumber?: string;
-  ExpiryDate?: string; // yyyy-MM-dd
+  /** Dual verification mode (face+card). */
+  VerifyMode?: string;
+  IsFaceUpload?: boolean;
+  IsFPUpload?: boolean;
+  IsCardUpload?: boolean;
+  IsBioPasswordUpload?: boolean;
 }
 
 export interface DeleteUserParams {
   APIKey: string;
   EmployeeCode: string;
+  /** Comma-separate multiple serial numbers to delete from more than one device at once. */
   SerialNumber: string;
 }
 
@@ -137,29 +150,35 @@ export interface FetchLiveUsersParams {
 
 export interface SetUserExpirationParams {
   APIKey: string;
-  EmployeeCode: string;
+  /** Biometric serial number. Pass "0" to apply to all biometric devices. */
   SerialNumber: string;
-  ExpiryDate: string; // yyyy-MM-dd
+  EmployeeCode: string;
+  /** yyyy-MM-dd */
+  ExpirationDate: string;
 }
 
 export interface GetDeviceCommandsParams {
   APIKey: string;
   FromDate: string;
   ToDate: string;
-  SerialNumber?: string;
+  /** Comma-separated list, e.g. "C2688C21CB2D172711,ADZV213760072". Plural per the API. */
+  SerialNumbers?: string;
 }
 
 export interface PhotoUploadParams {
   APIKey: string;
-  EmployeeCode: string;
   SerialNumber: string;
-  PhotoBase64: string;
+  EmployeeName: string;
+  EmployeeCode: string;
+  Base64String: string;
 }
 
 export interface BlockUserParams {
   APIKey: string;
   EmployeeCode: string;
   SerialNumber: string;
+  /** 0 = block the user, 1 = unblock the user. */
+  BlockUser: 0 | 1;
 }
 
 export interface ClearLogsParams {
@@ -167,79 +186,99 @@ export interface ClearLogsParams {
   SerialNumber: string;
 }
 
+/** Speed Face models only. */
 export interface ClearLogsByTimeParams {
   APIKey: string;
   SerialNumber: string;
-  FromDate: string;
-  ToDate: string;
+  /** e.g. "2022-05-09 09:00" */
+  StartTime: string;
+  /** e.g. "2022-05-09 07:00" */
+  EndTime: string;
 }
 
 export interface TriggerEnrollmentParams {
   APIKey: string;
-  EmployeeCode: string;
   SerialNumber: string;
-  MobileNumber?: string;
+  EmployeeCode: string;
+  EmployeeName: string;
+  backup_number?: string;
 }
 
 export interface AddEmployeeParams {
   APIKey: string;
   StaffCode: string;
-  EmployeeName: string;
-  CompanyId: string;       // Maps to WarehouseType in this app
-  LocationId: string;      // Maps to Store
-  DepartmentId?: string;
-  DesignationId?: string;
-  GradeId?: string;
-  TeamId?: string;
+  StaffName: string;
   Gender?: string;
-  DateOfBirth?: string;    // yyyy-MM-dd
-  DateOfJoining?: string;  // yyyy-MM-dd
-  CardNumber?: string;
+  /** e.g. "Working" */
+  Status?: string;
+  /** Company short name — maps to WarehouseType.name in this app. */
+  CompanySName: string;
+  /** Department short name. */
+  DepartmentSName?: string;
+  /** Location name — maps to Store.name in this app. */
+  Location: string;
+  Designation?: string;
+  Grade?: string;
+  Team?: string;
+  /** Date of Joining, yyyy-MM-dd */
+  DOJ?: string;
+  /** Date of Confirmation, yyyy-MM-dd */
+  DOC?: string;
+  /** Date of Birth, yyyy-MM-dd */
+  DOB?: string;
+  /** Date of Relieving, yyyy-MM-dd */
+  DOR?: string;
 }
 
 export interface DeleteEmployeeParams {
   APIKey: string;
-  StaffCode: string;
+  EmployeeCode: string;
 }
 
 export interface AddCompanyParams {
   APIKey: string;
-  CompanyName: string;
-  CompanyShortName: string;
+  BranchFullName: string;
+  BranchShortName: string;
+  BranchAddress?: string;
+  BrancheMail?: string;
+  BranchWebsite?: string;
 }
 
 export interface AddDepartmentParams {
   APIKey: string;
-  DepartmentName: string;
-  CompanyId: string;
+  DepartmentFName: string;
+  DepartmentSName: string;
+  DepartmenteMail?: string;
+  Description?: string;
 }
 
 export interface AddLocationParams {
   APIKey: string;
   LocationName: string;
-  CompanyId: string;
-  Address?: string;
-  Latitude?: string;
-  Longitude?: string;
+  LocationCode: string;
+  eMail?: string;
+  LocationLattitude?: string;
+  LocationLongitude?: string;
   Radius?: string;
+  LocationFullAddress?: string;
 }
 
 export interface AddDesignationParams {
   APIKey: string;
-  DesignationName: string;
-  CompanyId: string;
+  DesignationsName: string;
+  DesignationCode: string;
 }
 
 export interface AddGradeParams {
   APIKey: string;
+  GradeCode: string;
   GradeName: string;
-  CompanyId: string;
 }
 
 export interface AddTeamParams {
   APIKey: string;
+  TeamCode: string;
   TeamName: string;
-  CompanyId: string;
 }
 
 /** Device log record as returned by GetDeviceLogs */
@@ -249,17 +288,16 @@ export interface DeviceLogRecord {
   SerialNumber: string;
   PunchDirection?: string;
   Temperature?: number;
-  CreationDate?: string;
+  TemperatureState?: string;
 }
 
 /** Device command record as returned by GetDeviceCommands */
 export interface DeviceCommandRecord {
-  CommandId: string;
-  CommandType: string;
+  Title: string;
+  DeviceCode: string;
+  SerialNumber: string;
+  CreationDate: string;
+  ExecutionDate?: string;
   Status: string;
-  EmployeeCode?: string;
-  SerialNumber?: string;
-  CreatedAt?: string;
-  ExecutedAt?: string;
-  ErrorMessage?: string;
+  Response?: string;
 }

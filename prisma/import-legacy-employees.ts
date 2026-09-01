@@ -52,7 +52,7 @@
 import { PrismaClient, Designation } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
-import { assignWarehouseTypeCode, assignStoreCode } from '../src/lib/ecode';
+import { assignClientCode, assignWarehouseTypeCode, assignStoreCode } from '../src/lib/ecode';
 
 const prisma = new PrismaClient();
 

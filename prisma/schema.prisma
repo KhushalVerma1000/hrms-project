@@ -194,7 +194,9 @@ model Device {
   isOnline     Boolean   @default(false)
   lastPing     DateTime?
   userCount    Int?
-  attLogsCount Int?
+  /// Defaults to 0 (not null) — Prisma's `{ increment }` on a NULL column
+  /// silently stays NULL in Postgres, so this must start at 0 to ever count.
+  attLogsCount Int       @default(0)
   createdAt    DateTime  @default(now())
 }
 

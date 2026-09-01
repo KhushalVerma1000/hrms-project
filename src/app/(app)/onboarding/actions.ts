@@ -115,6 +115,14 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
       // 1. Generate atomic E-Code
       const staffCode = await generateEmployeeCode(tx, input.storeId);
 
+      // Store + WarehouseType are required for the ADD_EMPLOYEE payload below —
+      // SmartOffice identifies the branch/location by name (CompanySName/Location),
+      // not by our internal storeId.
+      const storeForEmployee = await tx.store.findUniqueOrThrow({
+        where: { id: input.storeId },
+        include: { warehouseType: true },
+      });
+
       // 2. Create Employee
       const employee = await tx.employee.create({
         data: {
@@ -155,16 +163,26 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
       }
 
       // 4. Enqueue ADD_EMPLOYEE command
+      // Field names below must match SmartOffice's AddEmployee contract exactly
+      // (see SmartOfficeAPIDocumentation.pdf) — they intentionally do NOT mirror
+      // our internal Prisma field names.
       const addEmpKey = deriveIdempotencyKey('ADD_EMPLOYEE', { employeeId: employee.id });
       const addEmpCmd = await enqueueCommand({
         commandType: 'ADD_EMPLOYEE',
         payload: {
-          EmployeeCode: staffCode,
-          EmployeeName: employee.name,
-          Gender: employee.gender || '',
-          DOB: input.dateOfBirth || '',
+          StaffCode: staffCode,
+          StaffName: employee.name,
+          Gender: employee.gender || undefined,
+          Status: 'Working',
+          CompanySName: storeForEmployee.warehouseType.name,
+          Location: storeForEmployee.name,
           Designation: employee.designation,
-          CardNumber: employee.cardNumber || '',
+          Grade: employee.grade || undefined,
+          Team: employee.team || undefined,
+          DOJ: employee.dateOfJoining
+            ? employee.dateOfJoining.toISOString().split('T')[0]
+            : new Date().toISOString().split('T')[0],
+          DOB: input.dateOfBirth || undefined,
         },
         idempotencyKey: addEmpKey,
         relatedType: 'Employee',
@@ -192,10 +210,17 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
           tx,
         });
       } else {
+        // NOTE: TriggerUserOnlineEnrollment requires SerialNumber per SmartOffice's
+        // docs, but REMOTE_LINK mode doesn't collect a target device up front
+        // (the whole point is the employee enrolls remotely without staff
+        // picking a device). If SmartOffice rejects a blank SerialNumber in
+        // practice, this needs a product decision — e.g. defaulting to the
+        // store's primary device, or collecting one at form-submission time.
         const triggerKey = deriveIdempotencyKey('TRIGGER_ENROLLMENT', { employeeId: employee.id, enrollmentRound: 1 });
         uploadCmd = await enqueueCommand({
           commandType: 'TRIGGER_ENROLLMENT',
           payload: {
+            SerialNumber: input.deviceSerialNumber || '',
             EmployeeCode: staffCode,
             EmployeeName: employee.name,
           },

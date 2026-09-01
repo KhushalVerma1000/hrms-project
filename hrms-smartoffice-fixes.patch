@@ -1,0 +1,1588 @@
+diff --git a/hrms-import-and-diagnostics.patch b/hrms-import-and-diagnostics.patch
+deleted file mode 100644
+index 7e9f33c..0000000
+--- a/hrms-import-and-diagnostics.patch
++++ /dev/null
+@@ -1,805 +0,0 @@
+-diff --git a/prisma/import-legacy-employees.ts b/prisma/import-legacy-employees.ts
+-new file mode 100644
+-index 0000000..9eaab4c
+---- /dev/null
+-+++ b/prisma/import-legacy-employees.ts
+-@@ -0,0 +1,341 @@
+-+/**
+-+ * ONE-OFF IMPORT SCRIPT — legacy SmartOffice employee data → local Postgres.
+-+ *
+-+ * WHY THIS EXISTS (see chat / spec Section: "How to Import Your Existing Data"):
+-+ * SmartOffice's API has no "list all employees" endpoint — AddEmployee/DeleteEmployee
+-+ * only operate on one record at a time. The only way to get your full existing
+-+ * employee list is the grid export from SmartOffice's own web UI (what you shared
+-+ * as RadGridExport.xls). This script imports THAT export — it does not call
+-+ * SmartOffice at all, and it does NOT enqueue any ADD_EMPLOYEE/UPLOAD_USER commands,
+-+ * since these people already exist and are already enrolled on the physical devices.
+-+ * This is a local-only mirror import.
+-+ *
+-+ * ─────────────────────────────────────────────────────────────────────────────
+-+ * BEFORE RUNNING:
+-+ *
+-+ * 1. Export your SmartOffice employee grid to CSV (Excel: File → Save As → CSV,
+-+ *    or Google Sheets: File → Download → CSV). Expected columns (case-insensitive,
+-+ *    matches what you showed earlier):
+-+ *      Employee Code, Employee Name, Branch, Department, Category, Location
+-+ *
+-+ * 2. Build a Location → Client mapping file. This is the ONE step that cannot be
+-+ *    automated — SmartOffice has no concept of your "Client" (vendor account)
+-+ *    entity, so nothing in the export tells us which of your Clients (e.g.
+-+ *    "Mansa Maharani") owns a given Location. Create client-mapping.json:
+-+ *
+-+ *      {
+-+ *        "Malviya nagar": "Mansa Maharani",
+-+ *        "Punjabi Bagh": "Mansa Maharani",
+-+ *        "Saket": "Mansa Maharani"
+-+ *      }
+-+ *
+-+ *    Location names must match the "Location" column values in your CSV exactly
+-+ *    (case-insensitive matching is applied, but spelling must match).
+-+ *
+-+ * 3. Run:
+-+ *      npx ts-node --compiler-options '{"module":"CommonJS"}' prisma/import-legacy-employees.ts \
+-+ *        --csv=./legacy-employees.csv \
+-+ *        --default-client="Mansa Maharani"
+-+ *
+-+ *    --default-client applies to every Location NOT explicitly listed in
+-+ *    --mapping (see below) — since your whole current export is one vendor
+-+ *    account, you can skip --mapping entirely and just pass --default-client.
+-+ *    Only use --mapping if some Locations belong to a DIFFERENT Client than
+-+ *    the default (e.g. you're consolidating exports from multiple vendors):
+-+ *      --mapping=./client-mapping.json  (optional; same format as before,
+-+ *        only needs entries for Locations that DON'T use the default)
+-+ *
+-+ *    Add --dry-run to preview what would happen without writing anything.
+-+ * ─────────────────────────────────────────────────────────────────────────────
+-+ */
+-+
+-+import { PrismaClient, Designation } from '@prisma/client';
+-+import * as fs from 'fs';
+-+import * as path from 'path';
+-+import { assignWarehouseTypeCode, assignStoreCode } from '../src/lib/ecode';
+-+
+-+const prisma = new PrismaClient();
+-+
+-+// ─────────────────────────────────────────────────────────────────────────────
+-+// CLI args
+-+// ─────────────────────────────────────────────────────────────────────────────
+-+
+-+function parseArgs() {
+-+  const args = process.argv.slice(2);
+-+  const get = (flag: string) => {
+-+    const arg = args.find((a) => a.startsWith(`--${flag}=`));
+-+    return arg ? arg.split('=').slice(1).join('=') : undefined;
+-+  };
+-+  return {
+-+    csvPath: get('csv'),
+-+    mappingPath: get('mapping'),
+-+    defaultClient: get('default-client'),
+-+    dryRun: args.includes('--dry-run'),
+-+  };
+-+}
+-+
+-+// ─────────────────────────────────────────────────────────────────────────────
+-+// Minimal CSV parser (handles quoted fields with commas; no external deps)
+-+// ─────────────────────────────────────────────────────────────────────────────
+-+
+-+function parseCsv(text: string): Record<string, string>[] {
+-+  const lines = text.replace(/\r\n/g, '\n').split('\n').filter((l) => l.trim().length > 0);
+-+  if (lines.length === 0) return [];
+-+
+-+  function parseLine(line: string): string[] {
+-+    const fields: string[] = [];
+-+    let cur = '';
+-+    let inQuotes = false;
+-+    for (let i = 0; i < line.length; i++) {
+-+      const ch = line[i];
+-+      if (inQuotes) {
+-+        if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+-+        else if (ch === '"') { inQuotes = false; }
+-+        else { cur += ch; }
+-+      } else {
+-+        if (ch === '"') inQuotes = true;
+-+        else if (ch === ',') { fields.push(cur); cur = ''; }
+-+        else cur += ch;
+-+      }
+-+    }
+-+    fields.push(cur);
+-+    return fields.map((f) => f.trim());
+-+  }
+-+
+-+  const headers = parseLine(lines[0]!).map((h) => h.trim());
+-+  const rows: Record<string, string>[] = [];
+-+  for (let i = 1; i < lines.length; i++) {
+-+    const values = parseLine(lines[i]!);
+-+    const row: Record<string, string> = {};
+-+    headers.forEach((h, idx) => { row[h] = values[idx] ?? ''; });
+-+    rows.push(row);
+-+  }
+-+  return rows;
+-+}
+-+
+-+/** Case-insensitive column lookup, since export headers can vary slightly. */
+-+function col(row: Record<string, string>, ...names: string[]): string {
+-+  const lowerNames = names.map((n) => n.toLowerCase());
+-+  for (const key of Object.keys(row)) {
+-+    if (lowerNames.includes(key.toLowerCase())) return row[key]?.trim() ?? '';
+-+  }
+-+  return '';
+-+}
+-+
+-+// ─────────────────────────────────────────────────────────────────────────────
+-+// Main import logic
+-+// ─────────────────────────────────────────────────────────────────────────────
+-+
+-+async function main() {
+-+  const { csvPath, mappingPath, defaultClient, dryRun } = parseArgs();
+-+
+-+  if (!csvPath) {
+-+    console.error(
+-+      'Usage: ts-node prisma/import-legacy-employees.ts --csv=./file.csv ' +
+-+      '(--default-client="Mansa Maharani" | --mapping=./client-mapping.json) [--dry-run]',
+-+    );
+-+    process.exit(1);
+-+  }
+-+
+-+  if (!defaultClient && !mappingPath) {
+-+    console.error(
+-+      'You must supply either --default-client="Some Client Name" (applies to every ' +
+-+      'Location) or --mapping=./client-mapping.json (per-Location overrides), or both ' +
+-+      '(mapping wins for any Location it lists; default-client covers everything else).',
+-+    );
+-+    process.exit(1);
+-+  }
+-+
+-+  const csvText = fs.readFileSync(path.resolve(csvPath), 'utf8');
+-+  const normalizedMapping = new Map<string, string>();
+-+  if (mappingPath) {
+-+    const clientMapping: Record<string, string> = JSON.parse(
+-+      fs.readFileSync(path.resolve(mappingPath), 'utf8'),
+-+    );
+-+    for (const [k, v] of Object.entries(clientMapping)) {
+-+      normalizedMapping.set(k.toLowerCase(), v);
+-+    }
+-+  }
+-+
+-+  const rows = parseCsv(csvText);
+-+  console.log(`📄 Parsed ${rows.length} rows from ${csvPath}`);
+-+  if (defaultClient) console.log(`   Default Client for unmapped Locations: "${defaultClient}"`);
+-+  if (mappingPath) console.log(`   Per-Location overrides loaded from: ${mappingPath}`);
+-+
+-+  const stats = {
+-+    imported: 0,
+-+    skippedExisting: 0,
+-+    skippedNoLocation: 0,
+-+    skippedUnmappedLocation: new Set<string>(),
+-+    skippedUnmappedClient: new Set<string>(),
+-+    warehouseTypesCreated: [] as string[],
+-+    storesCreated: [] as string[],
+-+  };
+-+
+-+  // Caches to avoid repeat DB lookups within this run
+-+  const warehouseTypeCache = new Map<string, string>(); // name(lower) -> id
+-+  const storeCache = new Map<string, string>(); // `${clientId}:${locationName lower}` -> storeId
+-+  const clientCache = new Map<string, string>(); // name(lower) -> id
+-+
+-+  for (const row of rows) {
+-+    const staffCode = col(row, 'Employee Code', 'EmployeeCode', 'Staff Code');
+-+    const name = col(row, 'Employee Name', 'EmployeeName', 'Name');
+-+    const branch = col(row, 'Branch', 'CompanySName');
+-+    const location = col(row, 'Location');
+-+    const category = col(row, 'Category', 'Designation');
+-+
+-+    if (!staffCode || !name) {
+-+      console.warn(`⚠️  Skipping row with missing Employee Code or Name: ${JSON.stringify(row)}`);
+-+      continue;
+-+    }
+-+
+-+    if (!location) {
+-+      stats.skippedNoLocation++;
+-+      console.warn(`⚠️  Skipping ${staffCode} (${name}) — no Location value.`);
+-+      continue;
+-+    }
+-+
+-+    // Resolve Client from mapping, falling back to --default-client
+-+    const clientName = normalizedMapping.get(location.toLowerCase()) || defaultClient;
+-+    if (!clientName) {
+-+      stats.skippedUnmappedLocation.add(location);
+-+      continue; // reported in summary at the end
+-+    }
+-+
+-+    let clientId = clientCache.get(clientName.toLowerCase());
+-+    if (!clientId) {
+-+      let client = await prisma.client.findFirst({
+-+        where: { name: { equals: clientName, mode: 'insensitive' } },
+-+      });
+-+      if (!client) {
+-+        if (dryRun) {
+-+          console.log(`[DRY RUN] Would create Client "${clientName}"`);
+-+          clientId = `dryrun-client-${clientName}`;
+-+        } else {
+-+          client = await prisma.$transaction(async (tx) => {
+-+            const code = await assignClientCode(tx);
+-+            return tx.client.create({
+-+              data: { code, name: clientName, shortName: clientName.slice(0, 10).toUpperCase() },
+-+            });
+-+          });
+-+          console.log(`✅ Created Client "${clientName}" (code ${client.code})`);
+-+        }
+-+      }
+-+      clientId = client?.id ?? clientId!;
+-+      clientCache.set(clientName.toLowerCase(), clientId);
+-+    }
+-+
+-+    // Resolve or create WarehouseType from Branch
+-+    const branchName = branch || 'Unknown';
+-+    let warehouseTypeId = warehouseTypeCache.get(branchName.toLowerCase());
+-+    if (!warehouseTypeId) {
+-+      let wt = await prisma.warehouseType.findFirst({
+-+        where: { name: { equals: branchName, mode: 'insensitive' } },
+-+      });
+-+      if (!wt) {
+-+        if (dryRun) {
+-+          console.log(`[DRY RUN] Would create WarehouseType "${branchName}"`);
+-+          warehouseTypeId = `dryrun-wt-${branchName}`;
+-+        } else {
+-+          wt = await prisma.$transaction(async (tx) => {
+-+            const code = await assignWarehouseTypeCode(tx);
+-+            return tx.warehouseType.create({ data: { code, name: branchName } });
+-+          });
+-+          stats.warehouseTypesCreated.push(branchName);
+-+          console.log(`✅ Created WarehouseType "${branchName}" (code ${wt.code})`);
+-+        }
+-+      }
+-+      warehouseTypeId = wt?.id ?? warehouseTypeId!;
+-+      warehouseTypeCache.set(branchName.toLowerCase(), warehouseTypeId);
+-+    }
+-+
+-+    // Resolve or create Store from Location (+ Client + WarehouseType)
+-+    const storeCacheKey = `${clientId}:${location.toLowerCase()}`;
+-+    let storeId = storeCache.get(storeCacheKey);
+-+    if (!storeId) {
+-+      let store = await prisma.store.findFirst({
+-+        where: { clientId, name: { equals: location, mode: 'insensitive' } },
+-+      });
+-+      if (!store) {
+-+        if (dryRun) {
+-+          console.log(`[DRY RUN] Would create Store "${location}" under client "${clientName}"`);
+-+          storeId = `dryrun-store-${location}`;
+-+        } else {
+-+          store = await prisma.$transaction(async (tx) => {
+-+            const code = await assignStoreCode(tx, clientId!);
+-+            return tx.store.create({
+-+              data: { code, name: location, clientId: clientId!, warehouseTypeId: warehouseTypeId! },
+-+            });
+-+          });
+-+          stats.storesCreated.push(`${location} (${clientName})`);
+-+          console.log(`✅ Created Store "${location}" under "${clientName}" (code ${store.code})`);
+-+        }
+-+      }
+-+      storeId = store?.id ?? storeId!;
+-+      storeCache.set(storeCacheKey, storeId);
+-+    }
+-+
+-+    // Check for existing employee with this staffCode — never overwrite
+-+    const existing = await prisma.employee.findUnique({ where: { staffCode } });
+-+    if (existing) {
+-+      stats.skippedExisting++;
+-+      continue;
+-+    }
+-+
+-+    // Best-effort designation mapping — defaults to ASSOCIATE if Category
+-+    // doesn't match a known designation. Reclassify manually afterward if needed.
+-+    const designation = mapCategoryToDesignation(category);
+-+
+-+    if (dryRun) {
+-+      console.log(`[DRY RUN] Would import ${staffCode} — ${name} (${designation}) @ ${location}`);
+-+    } else {
+-+      await prisma.employee.create({
+-+        data: {
+-+          staffCode,
+-+          name,
+-+          storeId: storeId!,
+-+          designation,
+-+          isLegacyCode: true,
+-+          status: 'ACTIVE',
+-+        },
+-+      });
+-+    }
+-+    stats.imported++;
+-+  }
+-+
+-+  // ─── Summary ────────────────────────────────────────────────────────────
+-+  console.log('\n📊 Import Summary');
+-+  console.log(`   Imported:                 ${stats.imported}${dryRun ? ' (dry run — nothing written)' : ''}`);
+-+  console.log(`   Skipped (already exists): ${stats.skippedExisting}`);
+-+  console.log(`   Skipped (no Location):    ${stats.skippedNoLocation}`);
+-+  console.log(`   WarehouseTypes created:    ${stats.warehouseTypesCreated.join(', ') || 'none'}`);
+-+  console.log(`   Stores created:            ${stats.storesCreated.join(', ') || 'none'}`);
+-+
+-+  if (stats.skippedUnmappedLocation.size > 0) {
+-+    console.log(`\n❌ Unmapped Locations (add these to client-mapping.json and re-run):`);
+-+    for (const loc of stats.skippedUnmappedLocation) console.log(`   - "${loc}"`);
+-+  }
+-+  if (stats.skippedUnmappedClient.size > 0) {
+-+    console.log(`\n❌ Client names in mapping that don't match any existing Client record:`);
+-+    for (const c of stats.skippedUnmappedClient) console.log(`   - "${c}" — create this Client in the app first`);
+-+  }
+-+}
+-+
+-+/** Maps the export's "Category" column to a Designation, if recognizable. */
+-+function mapCategoryToDesignation(category: string): Designation {
+-+  const c = category.toLowerCase();
+-+  if (c.includes('shift') && c.includes('incharge')) return Designation.SHIFT_INCHARGE;
+-+  if (c.includes('process')) return Designation.PROCESS_ASSOCIATE;
+-+  if (c.includes('quality')) return Designation.QUALITY_ASSOCIATE;
+-+  if (c.includes('associate')) return Designation.ASSOCIATE;
+-+  return Designation.ASSOCIATE; // safe default — reclassify manually in the app if wrong
+-+}
+-+
+-+main()
+-+  .catch((e) => {
+-+    console.error('Import failed:', e);
+-+    process.exit(1);
+-+  })
+-+  .finally(async () => {
+-+    await prisma.$disconnect();
+-+  });
+-diff --git a/scripts/discover-smartoffice-state.ts b/scripts/discover-smartoffice-state.ts
+-new file mode 100644
+-index 0000000..1970df4
+---- /dev/null
+-+++ b/scripts/discover-smartoffice-state.ts
+-@@ -0,0 +1,204 @@
+-+/**
+-+ * SMARTOFFICE LIVE-STATE DISCOVERY SCRIPT
+-+ *
+-+ * ─────────────────────────────────────────────────────────────────────────────
+-+ * READ THIS FIRST — an honest limitation, not a workaround for one:
+-+ *
+-+ * SmartOffice's REST API (per its own documentation) has NO "list all
+-+ * devices" or "list all employees" endpoint. It only exposes Add/Delete for
+-+ * those, plus a few endpoints that operate on an ALREADY-KNOWN serial number
+-+ * (FetchLiveUsersFromBiometric, SetUserExpiration, etc.).
+-+ *
+-+ * This script does the best possible job within that real constraint:
+-+ *
+-+ *   1. Calls GetDeviceCommands over a wide date range (no SerialNumbers filter)
+-+ *      to discover every device SerialNumber/DeviceCode that has EVER had a
+-+ *      command issued against it.
+-+ *   2. Calls GetDeviceLogs over the same range to catch any device that has
+-+ *      punch history but somehow never had a command logged — belt and
+-+ *      suspenders, unions both sets of discovered serial numbers.
+-+ *   3. For each discovered SerialNumber, calls FetchLiveUsersFromBiometric to
+-+ *      get that device's CURRENT live enrolled user list (EmployeeCode +
+-+ *      fingerprint count + privilege level) — this is the closest thing to
+-+ *      "current state" the API actually offers.
+-+ *
+-+ * WHAT THIS CANNOT GIVE YOU: employee names, branches, locations, or
+-+ * designations — FetchLiveUsersFromBiometric only returns EmployeeCode. For
+-+ * that, you still need a fresh grid export from SmartOffice's own web UI
+-+ * (the same RadGridExport.xls-style export used by import-legacy-employees.ts).
+-+ * This script's job is to tell you WHICH devices/employees currently exist
+-+ * and are live on the hardware, so you can cross-check that against your
+-+ * export and catch anything the export missed or that's since changed.
+-+ *
+-+ * Also: this cannot tell you which Store/Location a discovered device
+-+ * physically sits at — DeviceCode is just a label SmartOffice assigns, not
+-+ * guaranteed to encode location. Use the report's DeviceCode/device name to
+-+ * manually assign each discovered device to the right Store via the app's
+-+ * existing "Register Device" UI once you've reviewed this output.
+-+ * ─────────────────────────────────────────────────────────────────────────────
+-+ *
+-+ * USAGE:
+-+ *   Requires SMARTOFFICE_BASE_URL and SMARTOFFICE_API_KEY in the environment.
+-+ *   Standalone script — doesn't touch Postgres/Prisma at all, read-only against SmartOffice.
+-+ *
+-+ *   npx dotenv -e .env.local -- npx ts-node --compiler-options '{"module":"CommonJS"}' \
+-+ *     scripts/discover-smartoffice-state.ts --from=2023-01-01 --to=2026-08-13
+-+ *
+-+ *   (install dotenv-cli once if you don't have it: npm install --save-dev dotenv-cli)
+-+ *   Output is written to ./smartoffice-discovery-report.json
+-+ */
+-+
+-+import * as fs from 'fs';
+-+
+-+const BASE_URL = process.env.SMARTOFFICE_BASE_URL;
+-+const API_KEY = process.env.SMARTOFFICE_API_KEY;
+-+
+-+if (!BASE_URL || !API_KEY) {
+-+  console.error('❌ SMARTOFFICE_BASE_URL and/or SMARTOFFICE_API_KEY not set in environment.');
+-+  console.error('   Run this with your .env loaded, e.g.: npx dotenv -e .env.local -- npx ts-node ...');
+-+  process.exit(1);
+-+}
+-+
+-+function parseArgs() {
+-+  const args = process.argv.slice(2);
+-+  const get = (flag: string) => {
+-+    const arg = args.find((a) => a.startsWith(`--${flag}=`));
+-+    return arg ? arg.split('=').slice(1).join('=') : undefined;
+-+  };
+-+  return {
+-+    from: get('from') || '2023-01-01',
+-+    to: get('to') || new Date().toISOString().split('T')[0],
+-+  };
+-+}
+-+
+-+async function smartGet(path: string, params: Record<string, string>): Promise<any> {
+-+  const url = new URL(path, BASE_URL);
+-+  url.searchParams.set('APIKey', API_KEY!);
+-+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+-+
+-+  const res = await fetch(url.toString(), { signal: AbortSignal.timeout(20_000) });
+-+  const text = await res.text();
+-+  try {
+-+    return JSON.parse(text);
+-+  } catch {
+-+    // Some SmartOffice endpoints return a bare quoted string, not JSON — normalize
+-+    return text.replace(/^"|"$/g, '');
+-+  }
+-+}
+-+
+-+interface DiscoveredDevice {
+-+  serialNumber: string;
+-+  deviceCode?: string;
+-+  discoveredVia: string[];
+-+  liveUsers?: { employeeCode: string; fpCount: string; privilege: string }[];
+-+  liveUserFetchError?: string;
+-+}
+-+
+-+async function main() {
+-+  const { from, to } = parseArgs();
+-+  console.log(`🔍 Discovering SmartOffice state from ${from} to ${to}...\n`);
+-+
+-+  const devices = new Map<string, DiscoveredDevice>();
+-+
+-+  // ── Step 1: GetDeviceCommands (no SerialNumbers filter = all devices) ──────
+-+  console.log('📡 Fetching device commands history...');
+-+  try {
+-+    const commandsResult = await smartGet('/api/WebAPI/GetDeviceCommands', { FromDate: from, ToDate: to });
+-+    const records = commandsResult?.records || [];
+-+    for (const rec of records) {
+-+      const sn = rec.SerialNumber;
+-+      if (!sn) continue;
+-+      if (!devices.has(sn)) {
+-+        devices.set(sn, { serialNumber: sn, deviceCode: rec.DeviceCode, discoveredVia: [] });
+-+      }
+-+      const dev = devices.get(sn)!;
+-+      if (!dev.discoveredVia.includes('GetDeviceCommands')) dev.discoveredVia.push('GetDeviceCommands');
+-+      if (!dev.deviceCode && rec.DeviceCode) dev.deviceCode = rec.DeviceCode;
+-+    }
+-+    console.log(`   Found ${devices.size} distinct device(s) via command history.`);
+-+  } catch (err: any) {
+-+    console.warn(`   ⚠️  GetDeviceCommands failed: ${err.message}`);
+-+  }
+-+
+-+  // ── Step 2: GetDeviceLogs (catch devices with punches but no commands) ─────
+-+  console.log('📡 Fetching attendance log history (for device discovery only)...');
+-+  try {
+-+    const logsResult = await smartGet('/api/v2/WebAPI/GetDeviceLogs', { FromDate: from, ToDate: to });
+-+    const records = Array.isArray(logsResult) ? logsResult : [];
+-+    let newFromLogs = 0;
+-+    for (const rec of records) {
+-+      const sn = rec.SerialNumber;
+-+      if (!sn) continue;
+-+      if (!devices.has(sn)) {
+-+        devices.set(sn, { serialNumber: sn, discoveredVia: [] });
+-+        newFromLogs++;
+-+      }
+-+      const dev = devices.get(sn)!;
+-+      if (!dev.discoveredVia.includes('GetDeviceLogs')) dev.discoveredVia.push('GetDeviceLogs');
+-+    }
+-+    console.log(`   Found ${newFromLogs} additional device(s) via punch logs (not in command history).`);
+-+  } catch (err: any) {
+-+    console.warn(`   ⚠️  GetDeviceLogs failed: ${err.message}`);
+-+  }
+-+
+-+  if (devices.size === 0) {
+-+    console.error('\n❌ No devices discovered at all. This likely means:');
+-+    console.error('   - The date range is wrong (try widening --from further back)');
+-+    console.error('   - The API key/base URL are misconfigured (run the in-app "Test SmartOffice Connection" first)');
+-+    console.error('   - There genuinely is no command/punch history in SmartOffice yet');
+-+    process.exit(1);
+-+  }
+-+
+-+  // ── Step 3: FetchLiveUsersFromBiometric per discovered device ──────────────
+-+  console.log(`\n📡 Fetching live user list for ${devices.size} discovered device(s)...`);
+-+  const allEmployeeCodesSeen = new Set<string>();
+-+
+-+  for (const device of devices.values()) {
+-+    try {
+-+      const liveResult = await smartGet('/api/v2/WebAPI/FetchLiveUsersFromBiometric', {
+-+        SerialNumber: device.serialNumber,
+-+      });
+-+      const users = Array.isArray(liveResult) ? liveResult : [];
+-+      device.liveUsers = users.map((u: any) => ({
+-+        employeeCode: u.EmployeeCode,
+-+        fpCount: u.FPCount,
+-+        privilege: u.Privilege,
+-+      }));
+-+      device.liveUsers.forEach((u) => allEmployeeCodesSeen.add(u.employeeCode));
+-+      console.log(`   ${device.serialNumber} (${device.deviceCode || 'unnamed'}): ${device.liveUsers.length} live user(s)`);
+-+    } catch (err: any) {
+-+      device.liveUserFetchError = err.message;
+-+      console.warn(`   ⚠️  ${device.serialNumber}: failed to fetch live users — ${err.message}`);
+-+    }
+-+    // Small delay between calls — be a polite citizen to a server that might be modest hardware
+-+    await new Promise((r) => setTimeout(r, 300));
+-+  }
+-+
+-+  // ── Report ───────────────────────────────────────────────────────────────
+-+  const report = {
+-+    generatedAt: new Date().toISOString(),
+-+    dateRangeQueried: { from, to },
+-+    deviceCount: devices.size,
+-+    totalLiveEmployeeCodesSeen: allEmployeeCodesSeen.size,
+-+    devices: Array.from(devices.values()),
+-+    allEmployeeCodesSeen: Array.from(allEmployeeCodesSeen).sort(),
+-+  };
+-+
+-+  const outPath = './smartoffice-discovery-report.json';
+-+  fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
+-+
+-+  console.log(`\n✅ Discovery complete.`);
+-+  console.log(`   Devices found:           ${report.deviceCount}`);
+-+  console.log(`   Distinct live employees:  ${report.totalLiveEmployeeCodesSeen}`);
+-+  console.log(`   Full report written to:   ${outPath}`);
+-+  console.log(`\nNext steps:`);
+-+  console.log(`   1. Open ${outPath} and review the device list — match each DeviceCode/SerialNumber to the Store it's physically at.`);
+-+  console.log(`   2. Register each device via the app's Devices page (Admin), assigning it to the correct Store.`);
+-+  console.log(`   3. Cross-check allEmployeeCodesSeen against your CSV export (RadGridExport-style) — any code`);
+-+  console.log(`      that appears here but NOT in your CSV export needs manual investigation before import.`);
+-+}
+-+
+-+main().catch((err) => {
+-+  console.error('Discovery failed:', err);
+-+  process.exit(1);
+-+});
+-diff --git a/src/app/(app)/devices/actions.ts b/src/app/(app)/devices/actions.ts
+-index a389342..aeb5a9b 100644
+---- a/src/app/(app)/devices/actions.ts
+-+++ b/src/app/(app)/devices/actions.ts
+-@@ -6,9 +6,22 @@ import { can } from '@/lib/auth/can';
+- import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
+- import { writeAuditLog } from '@/lib/smartoffice/audit';
+- import { smartOfficeClient } from '@/lib/smartoffice/client';
+--
+--export async function getDevicesAction() {
+-+import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
+-+
+-+/**
+-+ * Diagnostic: checks SmartOffice reachability + API key validity separately,
+-+ * so a failure tells you WHICH of the two is broken rather than a generic
+-+ * "something went wrong." Admin only — surfaces raw connection details.
+-+ */
+-+export async function testSmartOfficeConnectionAction() {
+-   const session = await auth();
+-+  if (!session?.user || session.user.role !== 'ADMIN') {
+-+    return { ok: false, message: 'Only Admin users can run this diagnostic.' } as const;
+-+  }
+-+  return testSmartOfficeConnection();
+-+}
+-+
+-+export async function getDevicesAction() {  const session = await auth();
+-   if (!session?.user) throw new Error('Unauthorized');
+- 
+-   const user = session.user;
+-diff --git a/src/components/devices/DeviceManagement.tsx b/src/components/devices/DeviceManagement.tsx
+-index 15b7337..d060d90 100644
+---- a/src/components/devices/DeviceManagement.tsx
+-+++ b/src/components/devices/DeviceManagement.tsx
+-@@ -6,6 +6,7 @@ import {
+-   addDeviceAction,
+-   deleteDeviceAction,
+-   clearDeviceLogsAction,
+-+  testSmartOfficeConnectionAction,
+- } from '@/app/(app)/devices/actions';
+- import { getStoresForOnboardingAction } from '@/app/(app)/onboarding/actions';
+- import { Button } from '@/components/ui/button';
+-@@ -23,7 +24,7 @@ import {
+-   DialogHeader,
+-   DialogTitle,
+- } from '@/components/ui/dialog';
+--import { Smartphone, Plus, Trash2, Eraser, RefreshCw, Loader2, Signal, SignalZero } from 'lucide-react';
+-+import { Smartphone, Plus, Trash2, Eraser, RefreshCw, Loader2, Signal, SignalZero, Wifi, WifiOff } from 'lucide-react';
+- import { toast } from 'sonner';
+- 
+- export function DeviceManagement({ userRole }: { userRole: string }) {
+-@@ -31,6 +32,10 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+-   const [stores, setStores] = useState<any[]>([]);
+-   const [loading, setLoading] = useState(true);
+- 
+-+  // Connection test state
+-+  const [testingConnection, setTestingConnection] = useState(false);
+-+  const [connectionResult, setConnectionResult] = useState<any>(null);
+-+
+-   // Add Modal State
+-   const [showAddModal, setShowAddModal] = useState(false);
+-   const [serialNumber, setSerialNumber] = useState('');
+-@@ -64,6 +69,25 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+-     fetchData();
+-   }, []);
+- 
+-+  const handleTestConnection = async () => {
+-+    setTestingConnection(true);
+-+    setConnectionResult(null);
+-+    try {
+-+      const res = await testSmartOfficeConnectionAction();
+-+      setConnectionResult(res);
+-+      if (res.ok) {
+-+        toast.success('SmartOffice connection OK');
+-+      } else {
+-+        toast.error('SmartOffice connection issue — see details below');
+-+      }
+-+    } catch (err: any) {
+-+      setConnectionResult({ ok: false, message: err.message });
+-+      toast.error('Connection test failed to run');
+-+    } finally {
+-+      setTestingConnection(false);
+-+    }
+-+  };
+-+
+-   const handleAddDevice = async () => {
+-     setAdding(true);
+-     try {
+-@@ -129,6 +153,16 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+-           </p>
+-         </div>
+-         <div className="flex items-center gap-2">
+-+          {userRole === 'ADMIN' && (
+-+            <Button variant="outline" onClick={handleTestConnection} disabled={testingConnection}>
+-+              {testingConnection ? (
+-+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+-+              ) : (
+-+                <Wifi className="w-4 h-4 mr-2" />
+-+              )}
+-+              Test SmartOffice Connection
+-+            </Button>
+-+          )}
+-           <Button variant="outline" onClick={fetchData} disabled={loading}>
+-             <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} /> Refresh
+-           </Button>
+-@@ -138,6 +172,40 @@ export function DeviceManagement({ userRole }: { userRole: string }) {
+-         </div>
+-       </div>
+- 
+-+      {connectionResult && (
+-+        <Card className={connectionResult.ok ? 'border-green-200 bg-green-50/50' : 'border-red-200 bg-red-50/50'}>
+-+          <CardContent className="p-4 flex items-start gap-3">
+-+            {connectionResult.ok ? (
+-+              <Wifi className="w-5 h-5 text-green-600 mt-0.5 shrink-0" />
+-+            ) : (
+-+              <WifiOff className="w-5 h-5 text-red-600 mt-0.5 shrink-0" />
+-+            )}
+-+            <div className="text-sm space-y-1">
+-+              <p className={connectionResult.ok ? 'text-green-800 font-medium' : 'text-red-800 font-medium'}>
+-+                {connectionResult.message}
+-+              </p>
+-+              {!connectionResult.ok && (
+-+                <div className="text-xs text-gray-600 space-y-0.5 mt-1">
+-+                  <p>Base URL configured: {connectionResult.baseUrlConfigured ? 'Yes' : 'No — check SMARTOFFICE_BASE_URL'}</p>
+-+                  <p>API key configured: {connectionResult.apiKeyConfigured ? 'Yes' : 'No — check SMARTOFFICE_API_KEY'}</p>
+-+                  {connectionResult.baseUrlConfigured && connectionResult.apiKeyConfigured && (
+-+                    <>
+-+                      <p>Server reachable: {connectionResult.reachable ? 'Yes' : 'No — network/firewall/DNS issue'}</p>
+-+                      {connectionResult.reachable && (
+-+                        <p>API key valid: {connectionResult.apiKeyValid ? 'Yes' : 'No — key was rejected by SmartOffice'}</p>
+-+                      )}
+-+                    </>
+-+                  )}
+-+                </div>
+-+              )}
+-+              {connectionResult.latencyMs !== null && (
+-+                <p className="text-xs text-gray-500">Response time: {connectionResult.latencyMs}ms</p>
+-+              )}
+-+            </div>
+-+          </CardContent>
+-+        </Card>
+-+      )}
+-+
+-       <Card className="shadow-sm">
+-         <CardContent className="p-0 overflow-x-auto">
+-           <Table>
+-diff --git a/src/lib/smartoffice/test-connection.ts b/src/lib/smartoffice/test-connection.ts
+-new file mode 100644
+-index 0000000..790865b
+---- /dev/null
+-+++ b/src/lib/smartoffice/test-connection.ts
+-@@ -0,0 +1,97 @@
+-+/**
+-+ * SmartOffice connection diagnostic.
+-+ *
+-+ * Answers three separate questions that "is it working?" actually bundles together:
+-+ *   1. Is SMARTOFFICE_BASE_URL reachable at all? (network/DNS/firewall)
+-+ *   2. Is SMARTOFFICE_API_KEY valid? (auth)
+-+ *   3. Is the response shape what we expect? (API version/contract sanity)
+-+ *
+-+ * Uses GetDeviceCommands as the probe — it's a GET, mutates nothing, and
+-+ * SmartOffice's own docs show it returns a clean, typed error for a bad key
+-+ * ("API key is not correct") vs a clean success shape, which is exactly the
+-+ * signal we need to tell these three failure modes apart.
+-+ */
+-+
+-+import { getDeviceCommands, formatSmartOfficeDate } from './client';
+-+import { SMARTOFFICE_BASE_URL, SMARTOFFICE_API_KEY } from '@/lib/config';
+-+
+-+export interface ConnectionTestResult {
+-+  ok: boolean;
+-+  reachable: boolean;
+-+  apiKeyValid: boolean;
+-+  latencyMs: number | null;
+-+  baseUrlConfigured: boolean;
+-+  apiKeyConfigured: boolean;
+-+  message: string;
+-+  raw?: unknown;
+-+}
+-+
+-+export async function testSmartOfficeConnection(): Promise<ConnectionTestResult> {
+-+  const baseUrlConfigured = !!SMARTOFFICE_BASE_URL;
+-+  const apiKeyConfigured = !!SMARTOFFICE_API_KEY;
+-+
+-+  if (!baseUrlConfigured || !apiKeyConfigured) {
+-+    return {
+-+      ok: false,
+-+      reachable: false,
+-+      apiKeyValid: false,
+-+      latencyMs: null,
+-+      baseUrlConfigured,
+-+      apiKeyConfigured,
+-+      message: !baseUrlConfigured
+-+        ? 'SMARTOFFICE_BASE_URL is not set in the environment.'
+-+        : 'SMARTOFFICE_API_KEY is not set in the environment.',
+-+    };
+-+  }
+-+
+-+  const today = formatSmartOfficeDate(new Date());
+-+  const start = Date.now();
+-+
+-+  try {
+-+    const result = await getDeviceCommands({ FromDate: today, ToDate: today });
+-+    const latencyMs = Date.now() - start;
+-+
+-+    // normalizeResponse (in client.ts) already collapses SmartOffice's
+-+    // inconsistent shapes into { ok, message, data } — a bad key surfaces
+-+    // as ok:false with SmartOffice's own "API key is not correct" message.
+-+    if (!result.ok) {
+-+      const isAuthError = /api key/i.test(result.message || '');
+-+      return {
+-+        ok: false,
+-+        reachable: true, // we got A response, just not a successful one
+-+        apiKeyValid: !isAuthError,
+-+        latencyMs,
+-+        baseUrlConfigured,
+-+        apiKeyConfigured,
+-+        message: isAuthError
+-+          ? `Reached SmartOffice, but the API key was rejected: "${result.message}"`
+-+          : `Reached SmartOffice, but got an error: "${result.message}"`,
+-+        raw: result,
+-+      };
+-+    }
+-+
+-+    return {
+-+      ok: true,
+-+      reachable: true,
+-+      apiKeyValid: true,
+-+      latencyMs,
+-+      baseUrlConfigured,
+-+      apiKeyConfigured,
+-+      message: `Connected successfully in ${latencyMs}ms. Found ${result.data?.length ?? 0} device command(s) issued today.`,
+-+      raw: result,
+-+    };
+-+  } catch (err: any) {
+-+    const latencyMs = Date.now() - start;
+-+    // Network-level failure (DNS, connection refused, timeout) — thrown before
+-+    // we ever got an HTTP response to normalize, so this is a reachability problem.
+-+    return {
+-+      ok: false,
+-+      reachable: false,
+-+      apiKeyValid: false,
+-+      latencyMs,
+-+      baseUrlConfigured,
+-+      apiKeyConfigured,
+-+      message: `Could not reach ${SMARTOFFICE_BASE_URL}: ${err.message}. Check the base URL, network access, and that SmartOffice's service is actually running.`,
+-+    };
+-+  }
+-+}
+diff --git a/prisma/import-legacy-employees.ts b/prisma/import-legacy-employees.ts
+index 9eaab4c..b3d7ab7 100644
+--- a/prisma/import-legacy-employees.ts
++++ b/prisma/import-legacy-employees.ts
+@@ -52,7 +52,7 @@
+ import { PrismaClient, Designation } from '@prisma/client';
+ import * as fs from 'fs';
+ import * as path from 'path';
+-import { assignWarehouseTypeCode, assignStoreCode } from '../src/lib/ecode';
++import { assignClientCode, assignWarehouseTypeCode, assignStoreCode } from '../src/lib/ecode';
+ 
+ const prisma = new PrismaClient();
+ 
+diff --git a/prisma/migrations/20260818070000_device_att_logs_count_default/migration.sql b/prisma/migrations/20260818070000_device_att_logs_count_default/migration.sql
+new file mode 100644
+index 0000000..310e287
+--- /dev/null
++++ b/prisma/migrations/20260818070000_device_att_logs_count_default/migration.sql
+@@ -0,0 +1,7 @@
++-- Backfill existing NULLs, then make attLogsCount NOT NULL with a default of 0.
++-- Without this, Device.attLogsCount could never increment past NULL: Postgres
++-- evaluates `NULL + n` as NULL, so the running device-log counter silently
++-- stayed empty forever (see src/lib/sync/attendance.ts).
++UPDATE "Device" SET "attLogsCount" = 0 WHERE "attLogsCount" IS NULL;
++ALTER TABLE "Device" ALTER COLUMN "attLogsCount" SET DEFAULT 0;
++ALTER TABLE "Device" ALTER COLUMN "attLogsCount" SET NOT NULL;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 1f9cd1b..4fc7007 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -194,7 +194,9 @@ model Device {
+   isOnline     Boolean   @default(false)
+   lastPing     DateTime?
+   userCount    Int?
+-  attLogsCount Int?
++  /// Defaults to 0 (not null) — Prisma's `{ increment }` on a NULL column
++  /// silently stays NULL in Postgres, so this must start at 0 to ever count.
++  attLogsCount Int       @default(0)
+   createdAt    DateTime  @default(now())
+ }
+ 
+diff --git a/src/app/(app)/devices/actions.ts b/src/app/(app)/devices/actions.ts
+index aeb5a9b..e8cd1af 100644
+--- a/src/app/(app)/devices/actions.ts
++++ b/src/app/(app)/devices/actions.ts
+@@ -5,7 +5,6 @@ import { prisma } from '@/lib/prisma';
+ import { can } from '@/lib/auth/can';
+ import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
+ import { writeAuditLog } from '@/lib/smartoffice/audit';
+-import { smartOfficeClient } from '@/lib/smartoffice/client';
+ import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
+ 
+ /**
+@@ -21,7 +20,8 @@ export async function testSmartOfficeConnectionAction() {
+   return testSmartOfficeConnection();
+ }
+ 
+-export async function getDevicesAction() {  const session = await auth();
++export async function getDevicesAction() {
++  const session = await auth();
+   if (!session?.user) throw new Error('Unauthorized');
+ 
+   const user = session.user;
+@@ -78,13 +78,16 @@ export async function addDeviceAction(data: {
+         },
+       });
+ 
++      // AddBiometric only accepts DeviceName + SerialNumber per SmartOffice's
++      // docs — there's no Location field on this endpoint. The device gets
++      // associated with a location on SmartOffice's side implicitly, via
++      // whichever Location the physical unit is configured to report to.
+       const addBioKey = deriveIdempotencyKey('ADD_BIOMETRIC', { targetId: dev.id, payload: { SerialNumber: dev.serialNumber } });
+       await enqueueCommand({
+         commandType: 'ADD_BIOMETRIC',
+         payload: {
+           SerialNumber: dev.serialNumber,
+           DeviceName: dev.name,
+-          LocationName: store.name,
+         },
+         idempotencyKey: addBioKey,
+         relatedType: 'Device',
+@@ -110,6 +113,16 @@ export async function addDeviceAction(data: {
+   }
+ }
+ 
++/**
++ * Deletes a device. Goes through the SmartOfficeCommand queue like every other
++ * write (previously this called SmartOffice directly and inline, which meant
++ * a SmartOffice outage failed the request synchronously instead of retrying
++ * in the background like ADD_BIOMETRIC does).
++ *
++ * SmartOffice rejects deletion if punch logs still exist for the device —
++ * that's a terminal business-rule rejection (see isTerminalError), so it will
++ * show up on the Sync Issues screen rather than retrying forever.
++ */
+ export async function deleteDeviceAction(deviceId: string) {
+   const session = await auth();
+   if (!session?.user) throw new Error('Unauthorized');
+@@ -125,14 +138,23 @@ export async function deleteDeviceAction(deviceId: string) {
+   }
+ 
+   try {
+-    // Attempt SmartOffice direct call to verify if logs exist on device
+-    const smRes = await smartOfficeClient.deleteBiometricDevice({ SerialNumber: device.serialNumber });
+-    if (!smRes.ok) {
+-      // Pass through SmartOffice's exact error message verbatim to the UI (Section 8)
+-      return { ok: false, error: smRes.message || 'Device Logs exists for this device, You can not delete' };
+-    }
++    await prisma.$transaction(async (tx) => {
++      const delBioKey = deriveIdempotencyKey('DELETE_BIOMETRIC', {
++        targetId: device.id,
++        payload: { SerialNumber: device.serialNumber },
++      });
++      await enqueueCommand({
++        commandType: 'DELETE_BIOMETRIC',
++        payload: { SerialNumber: device.serialNumber },
++        idempotencyKey: delBioKey,
++        relatedType: 'Device',
++        relatedId: device.id,
++        createdBy: session.user.id,
++        tx,
++      });
+ 
+-    await prisma.device.delete({ where: { id: deviceId } });
++      await tx.device.delete({ where: { id: deviceId } });
++    });
+ 
+     await writeAuditLog({
+       userId: session.user.id,
+@@ -148,6 +170,10 @@ export async function deleteDeviceAction(deviceId: string) {
+   }
+ }
+ 
++/**
++ * Clears all attendance logs from a device. Goes through the command queue
++ * (see deleteDeviceAction comment for why this matters).
++ */
+ export async function clearDeviceLogsAction(deviceId: string) {
+   const session = await auth();
+   if (!session?.user || session.user.role !== 'ADMIN') {
+@@ -158,10 +184,18 @@ export async function clearDeviceLogsAction(deviceId: string) {
+   if (!device) return { ok: false, error: 'Device not found.' };
+ 
+   try {
+-    const smRes = await smartOfficeClient.clearAllLogsFromDevice({ SerialNumber: device.serialNumber });
+-    if (!smRes.ok) {
+-      return { ok: false, error: smRes.message || 'Failed to clear device logs.' };
+-    }
++    const clearKey = deriveIdempotencyKey('CLEAR_LOGS', {
++      targetId: device.id,
++      payload: { SerialNumber: device.serialNumber, requestedAt: new Date().toISOString() },
++    });
++    await enqueueCommand({
++      commandType: 'CLEAR_LOGS',
++      payload: { SerialNumber: device.serialNumber },
++      idempotencyKey: clearKey,
++      relatedType: 'Device',
++      relatedId: device.id,
++      createdBy: session.user.id,
++    });
+ 
+     await writeAuditLog({
+       userId: session.user.id,
+@@ -171,8 +205,8 @@ export async function clearDeviceLogsAction(deviceId: string) {
+       metadata: { serialNumber: device.serialNumber },
+     });
+ 
+-    return { ok: true, message: 'All logs cleared successfully from device.' };
++    return { ok: true, message: 'Clear-logs command queued — it will run shortly.' };
+   } catch (err: any) {
+-    return { ok: false, error: err.message || 'Error clearing logs.' };
++    return { ok: false, error: err.message || 'Error queuing clear-logs command.' };
+   }
+ }
+diff --git a/src/app/(app)/employees/actions.ts b/src/app/(app)/employees/actions.ts
+index 9f5a805..60c8062 100644
+--- a/src/app/(app)/employees/actions.ts
++++ b/src/app/(app)/employees/actions.ts
+@@ -126,9 +126,40 @@ export async function softDeleteEmployeeAction(employeeId: string) {
+     return { ok: false, error: 'Permission denied to deactivate this employee.' };
+   }
+ 
+-  const updated = await prisma.employee.update({
+-    where: { id: employeeId },
+-    data: { status: EmployeeStatus.OFFBOARDED },
++  // Soft-delete previously only flipped the local status — the employee stayed
++  // fully live and able to punch on the physical device. Block them on every
++  // device at their store so the app-side status and the device's actual state
++  // agree. (Only a subset of device models support this command; commands for
++  // unsupported models will fail terminally and surface on the Sync Issues
++  // screen rather than silently succeeding.)
++  const storeDevices = await prisma.device.findMany({
++    where: { storeId: employee.storeId },
++    select: { id: true, serialNumber: true },
++  });
++
++  const updated = await prisma.$transaction(async (tx) => {
++    const emp = await tx.employee.update({
++      where: { id: employeeId },
++      data: { status: EmployeeStatus.OFFBOARDED },
++    });
++
++    for (const device of storeDevices) {
++      const blockKey = deriveIdempotencyKey('BLOCK_USER', {
++        targetId: `${employee.id}:${device.id}`,
++        payload: { BlockUser: 0 },
++      });
++      await enqueueCommand({
++        commandType: 'BLOCK_USER',
++        payload: { EmployeeCode: employee.staffCode, SerialNumber: device.serialNumber, BlockUser: 0 },
++        idempotencyKey: blockKey,
++        relatedType: 'Employee',
++        relatedId: employee.id,
++        createdBy: session.user.id,
++        tx,
++      });
++    }
++
++    return emp;
+   });
+ 
+   await writeAuditLog({
+@@ -136,7 +167,68 @@ export async function softDeleteEmployeeAction(employeeId: string) {
+     action: 'EMPLOYEE_SOFT_DELETE',
+     targetType: 'Employee',
+     targetId: employeeId,
+-    metadata: { staffCode: employee.staffCode },
++    metadata: { staffCode: employee.staffCode, devicesBlocked: storeDevices.length },
++  });
++
++  return { ok: true, employee: updated };
++}
++
++/**
++ * Reactivates a previously soft-deleted (OFFBOARDED) employee: restores
++ * ACTIVE status locally and unblocks them on every device at their store.
++ * Uses the same permission scope as softDeleteEmployeeAction.
++ */
++export async function reactivateEmployeeAction(employeeId: string) {
++  const session = await auth();
++  if (!session?.user) throw new Error('Unauthorized');
++
++  const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
++  if (!employee) return { ok: false, error: 'Employee not found' };
++
++  if (!can(session, 'employee:softDelete', { storeId: employee.storeId })) {
++    return { ok: false, error: 'Permission denied to reactivate this employee.' };
++  }
++
++  if (employee.status === EmployeeStatus.ACTIVE) {
++    return { ok: false, error: 'Employee is already active.' };
++  }
++
++  const storeDevices = await prisma.device.findMany({
++    where: { storeId: employee.storeId },
++    select: { id: true, serialNumber: true },
++  });
++
++  const updated = await prisma.$transaction(async (tx) => {
++    const emp = await tx.employee.update({
++      where: { id: employeeId },
++      data: { status: EmployeeStatus.ACTIVE },
++    });
++
++    for (const device of storeDevices) {
++      const unblockKey = deriveIdempotencyKey('UNBLOCK_USER', {
++        targetId: `${employee.id}:${device.id}`,
++        payload: { BlockUser: 1 },
++      });
++      await enqueueCommand({
++        commandType: 'UNBLOCK_USER',
++        payload: { EmployeeCode: employee.staffCode, SerialNumber: device.serialNumber, BlockUser: 1 },
++        idempotencyKey: unblockKey,
++        relatedType: 'Employee',
++        relatedId: employee.id,
++        createdBy: session.user.id,
++        tx,
++      });
++    }
++
++    return emp;
++  });
++
++  await writeAuditLog({
++    userId: session.user.id,
++    action: 'EMPLOYEE_REACTIVATE',
++    targetType: 'Employee',
++    targetId: employeeId,
++    metadata: { staffCode: employee.staffCode, devicesUnblocked: storeDevices.length },
+   });
+ 
+   return { ok: true, employee: updated };
+@@ -188,13 +280,35 @@ export async function hardDeleteEmployeeAction(employeeId: string) {
+ 
+   // 3. Execute delete transaction & enqueue SmartOffice commands
+   try {
++    const storeDevices = await prisma.device.findMany({
++      where: { storeId: employee.storeId },
++      select: { serialNumber: true },
++    });
++    // DeleteUser accepts a comma-separated SerialNumber list to remove the
++    // user from every device at this store in one command.
++    const serialNumberList = storeDevices.map((d) => d.serialNumber).join(',');
++
+     await prisma.$transaction(async (tx) => {
+-      // Enqueue DELETE_USER / DELETE_EMPLOYEE command first
+-      const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
++      // Enqueue DELETE_USER (un-enrolls from the physical device(s))...
++      if (serialNumberList) {
++        const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
++        await enqueueCommand({
++          commandType: 'DELETE_USER',
++          payload: { EmployeeCode: employee.staffCode, SerialNumber: serialNumberList },
++          idempotencyKey: delUserKey,
++          relatedType: 'Employee',
++          relatedId: employee.id,
++          createdBy: user.id,
++          tx,
++        });
++      }
++
++      // ...and DELETE_EMPLOYEE (removes the employee record from SmartOffice itself).
++      const delEmpKey = deriveIdempotencyKey('DELETE_EMPLOYEE', { employeeId: employee.id });
+       await enqueueCommand({
+-        commandType: 'DELETE_USER',
++        commandType: 'DELETE_EMPLOYEE',
+         payload: { EmployeeCode: employee.staffCode },
+-        idempotencyKey: delUserKey,
++        idempotencyKey: delEmpKey,
+         relatedType: 'Employee',
+         relatedId: employee.id,
+         createdBy: user.id,
+diff --git a/src/app/(app)/onboarding/actions.ts b/src/app/(app)/onboarding/actions.ts
+index a705b57..ba74b1b 100644
+--- a/src/app/(app)/onboarding/actions.ts
++++ b/src/app/(app)/onboarding/actions.ts
+@@ -115,6 +115,14 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+       // 1. Generate atomic E-Code
+       const staffCode = await generateEmployeeCode(tx, input.storeId);
+ 
++      // Store + WarehouseType are required for the ADD_EMPLOYEE payload below —
++      // SmartOffice identifies the branch/location by name (CompanySName/Location),
++      // not by our internal storeId.
++      const storeForEmployee = await tx.store.findUniqueOrThrow({
++        where: { id: input.storeId },
++        include: { warehouseType: true },
++      });
++
+       // 2. Create Employee
+       const employee = await tx.employee.create({
+         data: {
+@@ -155,16 +163,26 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+       }
+ 
+       // 4. Enqueue ADD_EMPLOYEE command
++      // Field names below must match SmartOffice's AddEmployee contract exactly
++      // (see SmartOfficeAPIDocumentation.pdf) — they intentionally do NOT mirror
++      // our internal Prisma field names.
+       const addEmpKey = deriveIdempotencyKey('ADD_EMPLOYEE', { employeeId: employee.id });
+       const addEmpCmd = await enqueueCommand({
+         commandType: 'ADD_EMPLOYEE',
+         payload: {
+-          EmployeeCode: staffCode,
+-          EmployeeName: employee.name,
+-          Gender: employee.gender || '',
+-          DOB: input.dateOfBirth || '',
++          StaffCode: staffCode,
++          StaffName: employee.name,
++          Gender: employee.gender || undefined,
++          Status: 'Working',
++          CompanySName: storeForEmployee.warehouseType.name,
++          Location: storeForEmployee.name,
+           Designation: employee.designation,
+-          CardNumber: employee.cardNumber || '',
++          Grade: employee.grade || undefined,
++          Team: employee.team || undefined,
++          DOJ: employee.dateOfJoining
++            ? employee.dateOfJoining.toISOString().split('T')[0]
++            : new Date().toISOString().split('T')[0],
++          DOB: input.dateOfBirth || undefined,
+         },
+         idempotencyKey: addEmpKey,
+         relatedType: 'Employee',
+@@ -192,10 +210,17 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+           tx,
+         });
+       } else {
++        // NOTE: TriggerUserOnlineEnrollment requires SerialNumber per SmartOffice's
++        // docs, but REMOTE_LINK mode doesn't collect a target device up front
++        // (the whole point is the employee enrolls remotely without staff
++        // picking a device). If SmartOffice rejects a blank SerialNumber in
++        // practice, this needs a product decision — e.g. defaulting to the
++        // store's primary device, or collecting one at form-submission time.
+         const triggerKey = deriveIdempotencyKey('TRIGGER_ENROLLMENT', { employeeId: employee.id, enrollmentRound: 1 });
+         uploadCmd = await enqueueCommand({
+           commandType: 'TRIGGER_ENROLLMENT',
+           payload: {
++            SerialNumber: input.deviceSerialNumber || '',
+             EmployeeCode: staffCode,
+             EmployeeName: employee.name,
+           },
+diff --git a/src/lib/queue/worker.ts b/src/lib/queue/worker.ts
+index 29ff020..2e437d2 100644
+--- a/src/lib/queue/worker.ts
++++ b/src/lib/queue/worker.ts
+@@ -108,6 +108,9 @@ export async function dispatchCommand(cmd: SmartOfficeCommand): Promise<void> {
+         result = await so.addTeam(payload as Parameters<typeof so.addTeam>[0]);
+         break;
+       case 'BLOCK_USER':
++      case 'UNBLOCK_USER':
++        // Same SmartOffice endpoint handles both — the payload's BlockUser
++        // field (0 = block, 1 = unblock) determines behavior.
+         result = await so.blockUserInBiometric(payload as Parameters<typeof so.blockUserInBiometric>[0]);
+         break;
+       case 'SET_USER_EXPIRATION':
+diff --git a/src/lib/smartoffice/client.ts b/src/lib/smartoffice/client.ts
+index 432fb16..a5f069c 100644
+--- a/src/lib/smartoffice/client.ts
++++ b/src/lib/smartoffice/client.ts
+@@ -191,7 +191,9 @@ export async function setUserExpiration(
+ export async function getDeviceCommands(
+   params: Omit<GetDeviceCommandsParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult<DeviceCommandRecord[]>> {
+-  return smartGet('/api/v2/WebAPI/GetDeviceCommands', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  // NOTE: no "v2" in this path — confirmed against SmartOfficeAPIDocumentation.pdf.
++  // Every other endpoint in this file uses /api/v2/WebAPI/..., this one doesn't.
++  return smartGet('/api/WebAPI/GetDeviceCommands', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ /**
+@@ -209,10 +211,16 @@ export async function photoUploadInBiometric(
+   );
+ }
+ 
++/**
++ * Blocks OR unblocks a user, depending on params.BlockUser (0 = block, 1 = unblock).
++ * Only a small number of device models support this command — the caller is
++ * responsible for feature-flagging by Device.model before enqueueing.
++ */
+ export async function blockUserInBiometric(
+   params: Omit<BlockUserParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult> {
+-  return smartGet('/api/v2/WebAPI/BlockUserinBiometric', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  // NOTE: no "v2" in this path — confirmed against SmartOfficeAPIDocumentation.pdf.
++  return smartGet('/api/WebAPI/BlockUserinBiometric', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ export async function clearAllLogsFromDevice(
+@@ -239,7 +247,9 @@ export async function triggerUserOnlineEnrollment(
+ export async function addEmployee(
+   params: Omit<AddEmployeeParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult> {
+-  return smartPost('/api/v2/WebAPI/AddEmployee', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  // Doc specifies GET despite documenting a "Request JSON Object" — matches
++  // the pattern used by every other Add* endpoint in this file.
++  return smartGet('/api/v2/WebAPI/AddEmployee', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ export async function deleteEmployee(
+@@ -269,19 +279,19 @@ export async function addLocation(
+ export async function addDesignation(
+   params: Omit<AddDesignationParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult> {
+-  return smartPost('/api/v2/WebAPI/AddDesignation', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  return smartGet('/api/v2/WebAPI/AddDesignation', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ export async function addGrade(
+   params: Omit<AddGradeParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult> {
+-  return smartPost('/api/v2/WebAPI/AddGrade', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  return smartGet('/api/v2/WebAPI/AddGrade', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ export async function addTeam(
+   params: Omit<AddTeamParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult> {
+-  return smartPost('/api/v2/WebAPI/AddTeam', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  return smartGet('/api/v2/WebAPI/AddTeam', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ export const smartOfficeClient = {
+diff --git a/src/lib/smartoffice/types.ts b/src/lib/smartoffice/types.ts
+index 04a6d67..843282d 100644
+--- a/src/lib/smartoffice/types.ts
++++ b/src/lib/smartoffice/types.ts
+@@ -93,14 +93,20 @@ export function normalizeResponse<T = unknown>(
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+ // Request param types
++//
++// IMPORTANT: field names below are taken verbatim from
++// SmartOfficeAPIDocumentation.pdf (v1.0.4), NOT guessed/renamed to match this
++// app's internal naming. SmartOffice's own field names are frequently
++// inconsistent across endpoints (e.g. "CompanySName" vs "CompanyShortName"
++// nowhere in the doc, "StaffName" instead of "EmployeeName" for AddEmployee
++// but "EmployeeName" elsewhere) — resist the urge to "clean these up" to be
++// consistent with each other; they must match the live API exactly.
+ // ─────────────────────────────────────────────────────────────────────────────
+ 
+ export interface AddBiometricParams {
+   APIKey: string;
+   SerialNumber: string;
+   DeviceName: string;
+-  LocationId: string;
+-  DeviceModel?: string;
+ }
+ 
+ export interface DeleteBiometricParams {
+@@ -119,14 +125,21 @@ export interface UploadUserParams {
+   APIKey: string;
+   EmployeeCode: string;
+   EmployeeName: string;
++  /** Comma-separate multiple serial numbers to upload to more than one device at once. */
+   SerialNumber: string;
+   CardNumber?: string;
+-  ExpiryDate?: string; // yyyy-MM-dd
++  /** Dual verification mode (face+card). */
++  VerifyMode?: string;
++  IsFaceUpload?: boolean;
++  IsFPUpload?: boolean;
++  IsCardUpload?: boolean;
++  IsBioPasswordUpload?: boolean;
+ }
+ 
+ export interface DeleteUserParams {
+   APIKey: string;
+   EmployeeCode: string;
++  /** Comma-separate multiple serial numbers to delete from more than one device at once. */
+   SerialNumber: string;
+ }
+ 
+@@ -137,29 +150,35 @@ export interface FetchLiveUsersParams {
+ 
+ export interface SetUserExpirationParams {
+   APIKey: string;
+-  EmployeeCode: string;
++  /** Biometric serial number. Pass "0" to apply to all biometric devices. */
+   SerialNumber: string;
+-  ExpiryDate: string; // yyyy-MM-dd
++  EmployeeCode: string;
++  /** yyyy-MM-dd */
++  ExpirationDate: string;
+ }
+ 
+ export interface GetDeviceCommandsParams {
+   APIKey: string;
+   FromDate: string;
+   ToDate: string;
+-  SerialNumber?: string;
++  /** Comma-separated list, e.g. "C2688C21CB2D172711,ADZV213760072". Plural per the API. */
++  SerialNumbers?: string;
+ }
+ 
+ export interface PhotoUploadParams {
+   APIKey: string;
+-  EmployeeCode: string;
+   SerialNumber: string;
+-  PhotoBase64: string;
++  EmployeeName: string;
++  EmployeeCode: string;
++  Base64String: string;
+ }
+ 
+ export interface BlockUserParams {
+   APIKey: string;
+   EmployeeCode: string;
+   SerialNumber: string;
++  /** 0 = block the user, 1 = unblock the user. */
++  BlockUser: 0 | 1;
+ }
+ 
+ export interface ClearLogsParams {
+@@ -167,79 +186,99 @@ export interface ClearLogsParams {
+   SerialNumber: string;
+ }
+ 
++/** Speed Face models only. */
+ export interface ClearLogsByTimeParams {
+   APIKey: string;
+   SerialNumber: string;
+-  FromDate: string;
+-  ToDate: string;
++  /** e.g. "2022-05-09 09:00" */
++  StartTime: string;
++  /** e.g. "2022-05-09 07:00" */
++  EndTime: string;
+ }
+ 
+ export interface TriggerEnrollmentParams {
+   APIKey: string;
+-  EmployeeCode: string;
+   SerialNumber: string;
+-  MobileNumber?: string;
++  EmployeeCode: string;
++  EmployeeName: string;
++  backup_number?: string;
+ }
+ 
+ export interface AddEmployeeParams {
+   APIKey: string;
+   StaffCode: string;
+-  EmployeeName: string;
+-  CompanyId: string;       // Maps to WarehouseType in this app
+-  LocationId: string;      // Maps to Store
+-  DepartmentId?: string;
+-  DesignationId?: string;
+-  GradeId?: string;
+-  TeamId?: string;
++  StaffName: string;
+   Gender?: string;
+-  DateOfBirth?: string;    // yyyy-MM-dd
+-  DateOfJoining?: string;  // yyyy-MM-dd
+-  CardNumber?: string;
++  /** e.g. "Working" */
++  Status?: string;
++  /** Company short name — maps to WarehouseType.name in this app. */
++  CompanySName: string;
++  /** Department short name. */
++  DepartmentSName?: string;
++  /** Location name — maps to Store.name in this app. */
++  Location: string;
++  Designation?: string;
++  Grade?: string;
++  Team?: string;
++  /** Date of Joining, yyyy-MM-dd */
++  DOJ?: string;
++  /** Date of Confirmation, yyyy-MM-dd */
++  DOC?: string;
++  /** Date of Birth, yyyy-MM-dd */
++  DOB?: string;
++  /** Date of Relieving, yyyy-MM-dd */
++  DOR?: string;
+ }
+ 
+ export interface DeleteEmployeeParams {
+   APIKey: string;
+-  StaffCode: string;
++  EmployeeCode: string;
+ }
+ 
+ export interface AddCompanyParams {
+   APIKey: string;
+-  CompanyName: string;
+-  CompanyShortName: string;
++  BranchFullName: string;
++  BranchShortName: string;
++  BranchAddress?: string;
++  BrancheMail?: string;
++  BranchWebsite?: string;
+ }
+ 
+ export interface AddDepartmentParams {
+   APIKey: string;
+-  DepartmentName: string;
+-  CompanyId: string;
++  DepartmentFName: string;
++  DepartmentSName: string;
++  DepartmenteMail?: string;
++  Description?: string;
+ }
+ 
+ export interface AddLocationParams {
+   APIKey: string;
+   LocationName: string;
+-  CompanyId: string;
+-  Address?: string;
+-  Latitude?: string;
+-  Longitude?: string;
++  LocationCode: string;
++  eMail?: string;
++  LocationLattitude?: string;
++  LocationLongitude?: string;
+   Radius?: string;
++  LocationFullAddress?: string;
+ }
+ 
+ export interface AddDesignationParams {
+   APIKey: string;
+-  DesignationName: string;
+-  CompanyId: string;
++  DesignationsName: string;
++  DesignationCode: string;
+ }
+ 
+ export interface AddGradeParams {
+   APIKey: string;
++  GradeCode: string;
+   GradeName: string;
+-  CompanyId: string;
+ }
+ 
+ export interface AddTeamParams {
+   APIKey: string;
++  TeamCode: string;
+   TeamName: string;
+-  CompanyId: string;
+ }
+ 
+ /** Device log record as returned by GetDeviceLogs */
+@@ -249,17 +288,16 @@ export interface DeviceLogRecord {
+   SerialNumber: string;
+   PunchDirection?: string;
+   Temperature?: number;
+-  CreationDate?: string;
++  TemperatureState?: string;
+ }
+ 
+ /** Device command record as returned by GetDeviceCommands */
+ export interface DeviceCommandRecord {
+-  CommandId: string;
+-  CommandType: string;
++  Title: string;
++  DeviceCode: string;
++  SerialNumber: string;
++  CreationDate: string;
++  ExecutionDate?: string;
+   Status: string;
+-  EmployeeCode?: string;
+-  SerialNumber?: string;
+-  CreatedAt?: string;
+-  ExecutedAt?: string;
+-  ErrorMessage?: string;
++  Response?: string;
+ }
+diff --git a/src/lib/sync/attendance.ts b/src/lib/sync/attendance.ts
+index ac060fc..c934649 100644
+--- a/src/lib/sync/attendance.ts
++++ b/src/lib/sync/attendance.ts
+@@ -10,6 +10,7 @@ import { prisma } from '@/lib/prisma';
+ import { getDeviceLogs, formatSmartOfficeDate } from '@/lib/smartoffice/client';
+ import { SMARTOFFICE_TIMEZONE, ATTENDANCE_SYNC_DEFAULT_LOOKBACK_DAYS } from '@/lib/config';
+ import type { DeviceLogRecord } from '@/lib/smartoffice/types';
++import { fromZonedTime } from 'date-fns-tz';
+ 
+ export interface AttendanceSyncResult {
+   devicesProcessed: number;
+@@ -18,8 +19,17 @@ export interface AttendanceSyncResult {
+ }
+ 
+ /**
+- * Parses a SmartOffice date string into a UTC Date, accounting for the
+- * configured timezone (SMARTOFFICE_TIMEZONE, default: Asia/Kolkata / IST).
++ * Parses a SmartOffice date string (naive, no timezone info — e.g.
++ * "2019-09-16 13:45:29") into a correct UTC Date, treating it as wall-clock
++ * time in the configured timezone (SMARTOFFICE_TIMEZONE, default:
++ * Asia/Kolkata / IST).
++ *
++ * Uses date-fns-tz's `fromZonedTime`, which does this conversion correctly
++ * regardless of what timezone the server process itself is running in.
++ * (The previous implementation round-tripped through `toLocaleString` +
++ * `new Date(...)`, which re-parses a formatted string using the *server's*
++ * local timezone rather than the configured SmartOffice one — silently wrong
++ * on any server not already running in SMARTOFFICE_TIMEZONE.)
+  *
+  * ⚠️ Verification note: Before relying on this in production, punch a device at
+  * a known wall-clock time, pull via GetDeviceLogs, and compare. If the timestamp
+@@ -32,16 +42,13 @@ function parseSmartOfficeDate(dateStr: string): Date {
+     const normalized = dateStr.replace('T', ' ').trim();
+     const withTime = normalized.includes(':') ? normalized : `${normalized} 00:00:00`;
+ 
+-    // Parse as if in the configured timezone using Intl
+-    const tzDate = new Date(
+-      new Date(withTime + ' GMT').toLocaleString('en-US', { timeZone: SMARTOFFICE_TIMEZONE })
+-    );
++    const utcDate = fromZonedTime(withTime, SMARTOFFICE_TIMEZONE);
+ 
+-    if (isNaN(tzDate.getTime())) {
++    if (isNaN(utcDate.getTime())) {
+       console.warn(`[Sync] Could not parse date: ${dateStr}, using current time`);
+       return new Date();
+     }
+-    return tzDate;
++    return utcDate;
+   } catch {
+     return new Date(dateStr); // fallback
+   }
