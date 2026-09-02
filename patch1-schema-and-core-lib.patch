@@ -1,0 +1,1027 @@
+diff --git a/prisma/migrations/20260901120000_attendance_csv_upload_deadlines_and_ot/migration.sql b/prisma/migrations/20260901120000_attendance_csv_upload_deadlines_and_ot/migration.sql
+new file mode 100644
+index 0000000..e159d3e
+--- /dev/null
++++ b/prisma/migrations/20260901120000_attendance_csv_upload_deadlines_and_ot/migration.sql
+@@ -0,0 +1,164 @@
++-- AlterEnum
++-- Postgres only allows one ADD VALUE per ALTER TYPE statement.
++ALTER TYPE "ManualAttendanceStatus" ADD VALUE 'WEEK_OFF';
++ALTER TYPE "ManualAttendanceStatus" ADD VALUE 'HOLIDAY';
++
++-- CreateEnum
++CREATE TYPE "AttendanceEntrySource" AS ENUM ('MANUAL_DAILY_EDIT', 'MANUAL_CSV');
++
++-- CreateEnum
++CREATE TYPE "DeadlineScope" AS ENUM ('CLIENT', 'STORE');
++
++-- CreateEnum
++CREATE TYPE "PeriodStatus" AS ENUM ('OPEN', 'CLOSED', 'MISSED', 'LATE_REQUESTED', 'LATE_GRANTED', 'LATE_DENIED', 'CLOSED_LATE');
++
++-- CreateEnum
++CREATE TYPE "LateRequestStatus" AS ENUM ('PENDING', 'APPROVED', 'DENIED');
++
++-- CreateEnum
++CREATE TYPE "BatchStatus" AS ENUM ('VALIDATING', 'VALIDATED_PENDING_COMMIT', 'COMMITTED', 'FAILED');
++
++-- CreateEnum
++CREATE TYPE "OvertimeSource" AS ENUM ('DAILY_SUM', 'MANUAL_TOTAL');
++
++-- CreateTable
++CREATE TABLE "AttendanceDeadlinePolicy" (
++    "id" TEXT NOT NULL,
++    "scope" "DeadlineScope" NOT NULL,
++    "clientId" TEXT,
++    "storeId" TEXT,
++    "deadlineDay" INTEGER NOT NULL,
++    "createdByUserId" TEXT NOT NULL,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "AttendanceDeadlinePolicy_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE "AttendancePeriod" (
++    "id" TEXT NOT NULL,
++    "storeId" TEXT NOT NULL,
++    "periodYear" INTEGER NOT NULL,
++    "periodMonth" INTEGER NOT NULL,
++    "deadlineAt" TIMESTAMP(3) NOT NULL,
++    "status" "PeriodStatus" NOT NULL DEFAULT 'OPEN',
++    "submittedAt" TIMESTAMP(3),
++    "closedAt" TIMESTAMP(3),
++    "isLate" BOOLEAN NOT NULL DEFAULT false,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "AttendancePeriod_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE "LateUploadRequest" (
++    "id" TEXT NOT NULL,
++    "periodId" TEXT NOT NULL,
++    "requestedByUserId" TEXT NOT NULL,
++    "requestedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "reason" TEXT,
++    "status" "LateRequestStatus" NOT NULL DEFAULT 'PENDING',
++    "resolvedByUserId" TEXT,
++    "resolvedAt" TIMESTAMP(3),
++    "grantedUntil" TIMESTAMP(3),
++    "adminNote" TEXT,
++
++    CONSTRAINT "LateUploadRequest_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE "AttendanceUploadBatch" (
++    "id" TEXT NOT NULL,
++    "periodId" TEXT NOT NULL,
++    "storeId" TEXT NOT NULL,
++    "uploadedByUserId" TEXT NOT NULL,
++    "uploadedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "fileName" TEXT NOT NULL,
++    "otMode" "OvertimeSource" NOT NULL,
++    "status" "BatchStatus" NOT NULL DEFAULT 'VALIDATING',
++    "rowCount" INTEGER NOT NULL DEFAULT 0,
++    "errorCount" INTEGER NOT NULL DEFAULT 0,
++    "warningCount" INTEGER NOT NULL DEFAULT 0,
++    "isLate" BOOLEAN NOT NULL DEFAULT false,
++    "parsedSnapshot" JSONB,
++    "errorReport" JSONB,
++
++    CONSTRAINT "AttendanceUploadBatch_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE "EmployeeMonthlyOvertime" (
++    "id" TEXT NOT NULL,
++    "periodId" TEXT NOT NULL,
++    "employeeId" TEXT NOT NULL,
++    "totalHours" DECIMAL(6,2) NOT NULL,
++    "source" "OvertimeSource" NOT NULL,
++    "hasDiscrepancy" BOOLEAN NOT NULL DEFAULT false,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "EmployeeMonthlyOvertime_pkey" PRIMARY KEY ("id")
++);
++
++-- AlterTable
++ALTER TABLE "ManualAttendanceEntry" ADD COLUMN     "otHours" DECIMAL(5,2),
++ADD COLUMN     "source" "AttendanceEntrySource" NOT NULL DEFAULT 'MANUAL_DAILY_EDIT',
++ADD COLUMN     "uploadBatchId" TEXT;
++
++-- CreateIndex
++CREATE UNIQUE INDEX "AttendanceDeadlinePolicy_clientId_key" ON "AttendanceDeadlinePolicy"("clientId");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "AttendanceDeadlinePolicy_storeId_key" ON "AttendanceDeadlinePolicy"("storeId");
++
++-- CreateIndex
++CREATE INDEX "AttendancePeriod_status_idx" ON "AttendancePeriod"("status");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "AttendancePeriod_storeId_periodYear_periodMonth_key" ON "AttendancePeriod"("storeId", "periodYear", "periodMonth");
++
++-- CreateIndex
++CREATE INDEX "LateUploadRequest_periodId_status_idx" ON "LateUploadRequest"("periodId", "status");
++
++-- CreateIndex
++CREATE INDEX "AttendanceUploadBatch_periodId_status_idx" ON "AttendanceUploadBatch"("periodId", "status");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "EmployeeMonthlyOvertime_periodId_employeeId_key" ON "EmployeeMonthlyOvertime"("periodId", "employeeId");
++
++-- CreateIndex
++CREATE INDEX "ManualAttendanceEntry_uploadBatchId_idx" ON "ManualAttendanceEntry"("uploadBatchId");
++
++-- AddForeignKey
++ALTER TABLE "AttendanceDeadlinePolicy" ADD CONSTRAINT "AttendanceDeadlinePolicy_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "Client"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "AttendanceDeadlinePolicy" ADD CONSTRAINT "AttendanceDeadlinePolicy_storeId_fkey" FOREIGN KEY ("storeId") REFERENCES "Store"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "AttendancePeriod" ADD CONSTRAINT "AttendancePeriod_storeId_fkey" FOREIGN KEY ("storeId") REFERENCES "Store"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "LateUploadRequest" ADD CONSTRAINT "LateUploadRequest_periodId_fkey" FOREIGN KEY ("periodId") REFERENCES "AttendancePeriod"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "LateUploadRequest" ADD CONSTRAINT "LateUploadRequest_requestedByUserId_fkey" FOREIGN KEY ("requestedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "LateUploadRequest" ADD CONSTRAINT "LateUploadRequest_resolvedByUserId_fkey" FOREIGN KEY ("resolvedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "AttendanceUploadBatch" ADD CONSTRAINT "AttendanceUploadBatch_periodId_fkey" FOREIGN KEY ("periodId") REFERENCES "AttendancePeriod"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "AttendanceUploadBatch" ADD CONSTRAINT "AttendanceUploadBatch_uploadedByUserId_fkey" FOREIGN KEY ("uploadedByUserId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "EmployeeMonthlyOvertime" ADD CONSTRAINT "EmployeeMonthlyOvertime_periodId_fkey" FOREIGN KEY ("periodId") REFERENCES "AttendancePeriod"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "EmployeeMonthlyOvertime" ADD CONSTRAINT "EmployeeMonthlyOvertime_employeeId_fkey" FOREIGN KEY ("employeeId") REFERENCES "Employee"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "ManualAttendanceEntry" ADD CONSTRAINT "ManualAttendanceEntry_uploadBatchId_fkey" FOREIGN KEY ("uploadBatchId") REFERENCES "AttendanceUploadBatch"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 4fc7007..0e89eca 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -53,13 +53,76 @@ enum AttendanceMode {
+ }
+ 
+ /**
+- * Daily attendance status for a MANUAL-mode store's manual entry form.
++ * Daily attendance status for a MANUAL-mode store's manual entry form,
++ * and for the same-shaped rows in a CSV upload (Section: CSV Upload spec).
++ * Kept deliberately short — WEEK_OFF/HOLIDAY added alongside CSV upload so a
++ * whole month's roster can be marked without every non-working day landing
++ * in ON_LEAVE, which would otherwise pollute leave-balance reporting.
+  */
+ enum ManualAttendanceStatus {
+   PRESENT
+   ABSENT
+   HALF_DAY
+   ON_LEAVE
++  WEEK_OFF
++  HOLIDAY
++}
++
++/**
++ * Where a ManualAttendanceEntry row came from — the Daily Register (one row,
++ * one save) or a committed CSV upload batch (many rows, one save). Both write
++ * through the same upsert path; this field is purely for audit/reporting.
++ */
++enum AttendanceEntrySource {
++  MANUAL_DAILY_EDIT
++  MANUAL_CSV
++}
++
++/**
++ * Deadline policy scope — CLIENT rows are the default for every store under
++ * that client; a STORE row overrides the client default for one specific store.
++ * Resolution order: store override > client default > SYSTEM_DEFAULT_DEADLINE_DAY.
++ */
++enum DeadlineScope {
++  CLIENT
++  STORE
++}
++
++/**
++ * Lifecycle of one store's one calendar month attendance window.
++ * See AttendancePeriod below for the full state machine in context.
++ */
++enum PeriodStatus {
++  OPEN           /// Before deadline, uploads/edits allowed.
++  CLOSED         /// Submitted on time, finalized.
++  MISSED         /// Deadline passed, nothing submitted — uploads blocked, must request late access.
++  LATE_REQUESTED /// Manager filed a late-access request, awaiting Admin decision.
++  LATE_GRANTED   /// Admin approved — uploads allowed again until grantedUntil.
++  LATE_DENIED    /// Admin denied — manager may file a new request.
++  CLOSED_LATE    /// Uploaded successfully under an approved late grant.
++}
++
++enum LateRequestStatus {
++  PENDING
++  APPROVED
++  DENIED
++}
++
++enum BatchStatus {
++  VALIDATING
++  VALIDATED_PENDING_COMMIT
++  COMMITTED
++  FAILED
++}
++
++/**
++ * Where EmployeeMonthlyOvertime.totalHours came from — a straight sum of
++ * daily otHours entries, or one manually-entered monthly figure when the
++ * manager used the "monthly total" CSV template mode instead of "daily OT".
++ */
++enum OvertimeSource {
++  DAILY_SUM
++  MANUAL_TOTAL
+ }
+ 
+ enum EmployeeStatus {
+@@ -118,6 +181,7 @@ model Client {
+ 
+   stores    Store[]
+   users     User[]
++  deadlinePolicies AttendanceDeadlinePolicy[]
+   createdAt DateTime @default(now())
+ }
+ 
+@@ -173,6 +237,8 @@ model Store {
+   devices   Device[]
+   employees Employee[]
+   users     User[]
++  deadlinePolicyOverride AttendanceDeadlinePolicy[]
++  attendancePeriods      AttendancePeriod[]
+ 
+   createdAt DateTime @default(now())
+ 
+@@ -245,6 +311,7 @@ model Employee {
+   /// Manual attendance entries recorded on this employee's behalf — only
+   /// populated if this employee's Store has attendanceMode = MANUAL.
+   manualAttendanceEntries ManualAttendanceEntry[]
++  monthlyOvertimes        EmployeeMonthlyOvertime[]
+ 
+   createdAt DateTime @default(now())
+   updatedAt DateTime @updatedAt
+@@ -282,6 +349,9 @@ model User {
+   auditLogs AuditLog[]
+   /// Manual attendance entries this user has personally recorded (Manager/SI, MANUAL-mode stores only).
+   manualAttendanceEntriesEntered ManualAttendanceEntry[]
++  lateUploadRequestsFiled    LateUploadRequest[] @relation("LateRequestsFiled")
++  lateUploadRequestsResolved LateUploadRequest[] @relation("LateRequestsResolved")
++  attendanceUploadBatches    AttendanceUploadBatch[]
+ }
+ 
+ /**
+@@ -384,6 +454,20 @@ model ManualAttendanceEntry {
+   checkOutTime DateTime?
+   notes        String?
+ 
++  /// PER-DAY overtime hours. Only populated when the entry came from the
++  /// Daily Register with OT entered directly, or a CSV batch uploaded in
++  /// "daily OT" mode. Left null for "monthly total" mode uploads — see
++  /// EmployeeMonthlyOvertime, which is the value payroll actually reads.
++  otHours Decimal? @db.Decimal(5, 2)
++
++  /// MANUAL_DAILY_EDIT (Daily Register, one row) or MANUAL_CSV (CSV batch,
++  /// many rows) — both write through this same model/upsert path.
++  source AttendanceEntrySource @default(MANUAL_DAILY_EDIT)
++
++  /// Set when source = MANUAL_CSV — links back to the batch that wrote this row.
++  uploadBatchId String?
++  uploadBatch   AttendanceUploadBatch? @relation(fields: [uploadBatchId], references: [id])
++
+   employeeId String
+   employee   Employee @relation(fields: [employeeId], references: [id])
+ 
+@@ -398,6 +482,150 @@ model ManualAttendanceEntry {
+ 
+   @@unique([employeeId, date])
+   @@index([employeeId, date])
++  @@index([uploadBatchId])
++}
++
++// ─────────────────────────────────────────────────────────────────────────────
++// ATTENDANCE CSV UPLOAD, MONTHLY DEADLINES & OVERTIME
++// See attendance-upload-and-daily-register-spec.md for the full design.
++// ─────────────────────────────────────────────────────────────────────────────
++
++/**
++ * Deadline policy: how many days into the following month a store's
++ * attendance for a given month is due. One CLIENT row = default for every
++ * store under that client. One STORE row = override for a single store.
++ * Resolution done in code (src/lib/attendance/period.ts), not in SQL.
++ */
++model AttendanceDeadlinePolicy {
++  id          String        @id @default(cuid())
++  scope       DeadlineScope
++  /// One row per Client (scope = CLIENT). Field-level @unique so multiple
++  /// clients can each have a row while storeId stays NULL on all of them —
++  /// Postgres treats NULLs as distinct in a unique index, which is exactly
++  /// what's needed here.
++  clientId    String?       @unique
++  client      Client?       @relation(fields: [clientId], references: [id])
++  /// One row per Store (scope = STORE), overriding that store's client default.
++  storeId     String?       @unique
++  store       Store?        @relation(fields: [storeId], references: [id])
++  /// Day-of-month in the month AFTER the one being reported, e.g. 5 = "5th
++  /// of the following month". Attendance for August is due before 5 Sep.
++  deadlineDay Int
++  createdByUserId String
++  createdAt   DateTime      @default(now())
++  updatedAt   DateTime      @updatedAt
++}
++
++/**
++ * One store's one calendar-month attendance window. Created lazily (first
++ * access, or a daily cron opening next month's window on the 1st).
++ * deadlineAt is snapshotted from AttendanceDeadlinePolicy at creation time —
++ * editing the policy later does NOT retroactively move an already-open
++ * period's deadline. Extending an individual period is what the late-access
++ * grant (LateUploadRequest.grantedUntil) is for.
++ */
++model AttendancePeriod {
++  id          String       @id @default(cuid())
++  storeId     String
++  store       Store        @relation(fields: [storeId], references: [id])
++  periodYear  Int
++  periodMonth Int          /// 1–12, the month attendance covers (August = 8)
++  deadlineAt  DateTime
++  status      PeriodStatus @default(OPEN)
++  submittedAt DateTime?
++  closedAt    DateTime?
++  isLate      Boolean      @default(false)
++  createdAt   DateTime     @default(now())
++  updatedAt   DateTime     @updatedAt
++
++  uploadBatches     AttendanceUploadBatch[]
++  lateRequests      LateUploadRequest[]
++  monthlyOvertimes  EmployeeMonthlyOvertime[]
++
++  @@unique([storeId, periodYear, periodMonth])
++  @@index([status])
++}
++
++/**
++ * A manager's request to unlock uploads for a MISSED period, and the
++ * Admin's decision. grantedUntil is an explicit date/time chosen by the
++ * Admin at approval time — not a fixed "+N days" rule.
++ */
++model LateUploadRequest {
++  id             String             @id @default(cuid())
++  periodId       String
++  period         AttendancePeriod   @relation(fields: [periodId], references: [id])
++  requestedByUserId String
++  requestedByUser   User            @relation("LateRequestsFiled", fields: [requestedByUserId], references: [id])
++  requestedAt    DateTime           @default(now())
++  reason         String?
++  status         LateRequestStatus  @default(PENDING)
++  resolvedByUserId String?
++  resolvedByUser   User?            @relation("LateRequestsResolved", fields: [resolvedByUserId], references: [id])
++  resolvedAt     DateTime?
++  grantedUntil   DateTime?
++  adminNote      String?
++
++  @@index([periodId, status])
++}
++
++/**
++ * One CSV upload attempt for one store+period. Validation runs first
++ * (VALIDATING → VALIDATED_PENDING_COMMIT, nothing written to
++ * ManualAttendanceEntry yet); the manager reviews flagged rows, then a
++ * separate commit step writes the actual attendance rows and flips this
++ * to COMMITTED. parsedSnapshot/errorReport hold the full row-level detail
++ * for audit — there's no object storage in this app yet, so the raw file
++ * itself isn't retained, only the parsed+validated data.
++ */
++model AttendanceUploadBatch {
++  id             String      @id @default(cuid())
++  periodId       String
++  period         AttendancePeriod @relation(fields: [periodId], references: [id])
++  storeId        String
++  uploadedByUserId String
++  uploadedByUser   User      @relation(fields: [uploadedByUserId], references: [id])
++  uploadedAt     DateTime    @default(now())
++  fileName       String
++  /// Detected from the CSV header shape — paired "N_OT" columns vs one
++  /// trailing "OT_Hours" column. See src/lib/attendance/csv.ts.
++  otMode         OvertimeSource
++  status         BatchStatus @default(VALIDATING)
++  rowCount       Int         @default(0)
++  errorCount     Int         @default(0)
++  warningCount   Int         @default(0)
++  isLate         Boolean     @default(false)
++  parsedSnapshot Json?
++  errorReport    Json?
++
++  /// The actual ManualAttendanceEntry rows this batch wrote (only once COMMITTED).
++  manualAttendanceEntries ManualAttendanceEntry[]
++
++  @@index([periodId, status])
++}
++
++/**
++ * The monthly OT figure payroll actually reads, regardless of which CSV
++ * template mode produced it. DAILY_SUM = sum of ManualAttendanceEntry.otHours
++ * across the period; MANUAL_TOTAL = one figure entered directly (no daily
++ * breakdown). hasDiscrepancy is set when a Mode A ("daily OT") upload's
++ * figure disagrees with SmartOffice-derived OT for a Biometric store.
++ * NOTE: SmartOffice/AttendanceLog has no OT field today — "SmartOffice OT"
++ * here means an approximation computed from raw punch times (see
++ * src/lib/attendance/biometricOt.ts). Flagged as an assumption to confirm.
++ */
++model EmployeeMonthlyOvertime {
++  id             String         @id @default(cuid())
++  periodId       String
++  period         AttendancePeriod @relation(fields: [periodId], references: [id])
++  employeeId     String
++  employee       Employee       @relation(fields: [employeeId], references: [id])
++  totalHours     Decimal        @db.Decimal(6, 2)
++  source         OvertimeSource
++  hasDiscrepancy Boolean        @default(false)
++  updatedAt      DateTime       @updatedAt
++
++  @@unique([periodId, employeeId])
+ }
+ 
+ /**
+diff --git a/src/lib/attendance/biometricOt.ts b/src/lib/attendance/biometricOt.ts
+new file mode 100644
+index 0000000..47441bb
+--- /dev/null
++++ b/src/lib/attendance/biometricOt.ts
+@@ -0,0 +1,43 @@
++/**
++ * Approximates a Biometric-mode employee's daily overtime from raw
++ * AttendanceLog punches, purely so a Mode A ("daily OT") CSV upload can be
++ * checked for a discrepancy against it (spec §5.4).
++ *
++ * IMPORTANT — this is a stated assumption, not a synced SmartOffice value:
++ * SmartOffice/AttendanceLog has no OT field. This computes
++ * (last punch − first punch) − STANDARD_SHIFT_HOURS for that employee+day,
++ * floored at 0. If your actual shift/OT rules are more complex (breaks,
++ * night-shift handling, per-store shift lengths), this needs adjusting
++ * before the discrepancy flag can be trusted — treat it as a first pass,
++ * not a payroll-grade OT engine.
++ */
++
++import { prisma } from '@/lib/prisma';
++import { STANDARD_SHIFT_HOURS } from '@/lib/config';
++
++/**
++ * Returns the approximated OT hours for one employee on one calendar day,
++ * or null if there isn't enough punch data (fewer than 2 punches) to compute
++ * anything — callers should treat null as "can't compare, don't flag".
++ */
++export async function approximateBiometricOtHours(
++  staffCode: string,
++  date: Date,
++): Promise<number | null> {
++  const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
++  const dayEnd = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
++
++  const logs = await prisma.attendanceLog.findMany({
++    where: { employeeCode: staffCode, logDate: { gte: dayStart, lte: dayEnd } },
++    orderBy: { logDate: 'asc' },
++    select: { logDate: true },
++  });
++
++  if (logs.length < 2) return null;
++
++  const first = logs[0].logDate;
++  const last = logs[logs.length - 1].logDate;
++  const workedHours = (last.getTime() - first.getTime()) / (1000 * 60 * 60);
++
++  return Math.max(0, Math.round((workedHours - STANDARD_SHIFT_HOURS) * 100) / 100);
++}
+diff --git a/src/lib/attendance/csv.ts b/src/lib/attendance/csv.ts
+new file mode 100644
+index 0000000..7732ffe
+--- /dev/null
++++ b/src/lib/attendance/csv.ts
+@@ -0,0 +1,252 @@
++/**
++ * Wide-format attendance CSV: template generation + parsing.
++ *
++ * No csv library dependency is added — the format is simple enough (no
++ * embedded newlines in any field we write) that a small hand-rolled
++ * RFC4180-ish quote/escape is safer than pulling in a new package for it.
++ *
++ * See attendance-upload-and-daily-register-spec.md §5 for the full design.
++ * Two template modes:
++ *   - "daily": ECode, Name, then a Status + OT pair of columns per calendar
++ *     date ("1", "1_OT", "2", "2_OT", ...).
++ *   - "total": ECode, Name, then one Status column per calendar date, then
++ *     a single trailing OT_Hours column (monthly total).
++ * Upload parsing auto-detects which mode a file is by its header shape —
++ * the manager never has to declare it twice.
++ */
++
++import type { ManualAttendanceStatus } from '@prisma/client';
++
++export type OtTemplateMode = 'daily' | 'total';
++
++export const STATUS_CODES = ['P', 'A', 'HD', 'L', 'WO', 'H'] as const;
++export type StatusCode = (typeof STATUS_CODES)[number];
++
++export const STATUS_CODE_TO_ENUM: Record<StatusCode, ManualAttendanceStatus> = {
++  P: 'PRESENT',
++  A: 'ABSENT',
++  HD: 'HALF_DAY',
++  L: 'ON_LEAVE',
++  WO: 'WEEK_OFF',
++  H: 'HOLIDAY',
++};
++
++export const ENUM_TO_STATUS_CODE: Record<ManualAttendanceStatus, StatusCode> = {
++  PRESENT: 'P',
++  ABSENT: 'A',
++  HALF_DAY: 'HD',
++  ON_LEAVE: 'L',
++  WEEK_OFF: 'WO',
++  HOLIDAY: 'H',
++};
++
++export interface TemplateEmployeeRow {
++  staffCode: string;
++  name: string;
++}
++
++/** Number of calendar days in periodYear/periodMonth (periodMonth is 1-12). */
++export function daysInMonth(periodYear: number, periodMonth: number): number {
++  return new Date(periodYear, periodMonth, 0).getDate();
++}
++
++function csvEscape(value: string): string {
++  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
++    return `"${value.replace(/"/g, '""')}"`;
++  }
++  return value;
++}
++
++/**
++ * Builds the downloadable CSV text for a store+month. Pre-fills ECode and
++ * Name from the given roster (already filtered to active-at-this-store by
++ * the caller) so the manager cross-checks the name against the ecode
++ * before marking anything, rather than typing ecodes from memory.
++ */
++export function generateAttendanceTemplateCsv(
++  employees: TemplateEmployeeRow[],
++  periodYear: number,
++  periodMonth: number,
++  otMode: OtTemplateMode,
++): string {
++  const days = daysInMonth(periodYear, periodMonth);
++  const dateColumns = Array.from({ length: days }, (_, i) => String(i + 1));
++
++  const header: string[] = ['ECode', 'Name'];
++  if (otMode === 'daily') {
++    for (const d of dateColumns) {
++      header.push(d, `${d}_OT`);
++    }
++  } else {
++    header.push(...dateColumns, 'OT_Hours');
++  }
++
++  const rows = employees.map((emp) => {
++    const cells: string[] = [emp.staffCode, emp.name];
++    if (otMode === 'daily') {
++      for (const _d of dateColumns) cells.push('', ''); // status, OT — both blank
++    } else {
++      for (const _d of dateColumns) cells.push(''); // status, blank
++      cells.push(''); // OT_Hours, blank
++    }
++    return cells;
++  });
++
++  const lines = [header, ...rows].map((row) => row.map(csvEscape).join(','));
++  return lines.join('\r\n') + '\r\n';
++}
++
++/** Minimal RFC4180 line splitter — handles quoted fields with embedded commas/quotes. */
++function parseCsvLine(line: string): string[] {
++  const cells: string[] = [];
++  let cur = '';
++  let inQuotes = false;
++
++  for (let i = 0; i < line.length; i++) {
++    const ch = line[i];
++    if (inQuotes) {
++      if (ch === '"') {
++        if (line[i + 1] === '"') {
++          cur += '"';
++          i++;
++        } else {
++          inQuotes = false;
++        }
++      } else {
++        cur += ch;
++      }
++    } else if (ch === '"') {
++      inQuotes = true;
++    } else if (ch === ',') {
++      cells.push(cur);
++      cur = '';
++    } else {
++      cur += ch;
++    }
++  }
++  cells.push(cur);
++  return cells;
++}
++
++export interface ParsedAttendanceRow {
++  rowIndex: number; // 1-based, matches spreadsheet row (header = row 1)
++  staffCode: string;
++  name: string;
++  /// dayOfMonth (1-31) -> raw status cell text, uppercased, trimmed. Empty string = blank.
++  statusByDay: Map<number, string>;
++  /// Only set when otMode = 'daily'. dayOfMonth -> raw OT cell text.
++  otByDay?: Map<number, string>;
++  /// Only set when otMode = 'total'. Raw OT_Hours cell text.
++  otTotal?: string;
++}
++
++export interface ParsedAttendanceCsv {
++  otMode: OtTemplateMode;
++  days: number[]; // the date columns actually present in the file, in order
++  rows: ParsedAttendanceRow[];
++}
++
++/**
++ * Parses raw CSV text into structured rows, detecting otMode from the
++ * header shape. Does NOT validate against the DB (ecode existence, name
++ * match, etc.) or against the target period's month — that's
++ * validateParsedAttendance in actions.ts, which needs DB access. This
++ * function only has to agree with generateAttendanceTemplateCsv's shape.
++ */
++export function parseAttendanceCsv(csvText: string): ParsedAttendanceCsv {
++  const lines = csvText.split(/\r\n|\n|\r/).filter((l) => l.length > 0);
++  if (lines.length === 0) {
++    throw new Error('CSV file is empty.');
++  }
++
++  const header = parseCsvLine(lines[0]).map((h) => h.trim());
++  if (header[0] !== 'ECode' || header[1] !== 'Name') {
++    throw new Error('CSV header must start with "ECode,Name" — this doesn\'t look like the downloaded template.');
++  }
++
++  // Detect mode: does the header contain any "N_OT" columns? -> daily.
++  // Otherwise, does it end in "OT_Hours"? -> total. Otherwise: no OT columns
++  // at all is treated as an error — the template always includes one or the other.
++  const hasDailyOtColumns = header.some((h) => /^\d+_OT$/.test(h));
++  const hasTotalOtColumn = header[header.length - 1] === 'OT_Hours';
++
++  if (hasDailyOtColumns) {
++    return parseDailyMode(header, lines);
++  }
++  if (hasTotalOtColumn) {
++    return parseTotalMode(header, lines);
++  }
++  throw new Error(
++    'Could not detect OT column format — expected either paired "N_OT" columns (daily mode) ' +
++    'or a trailing "OT_Hours" column (total mode). Re-download the template rather than editing headers.',
++  );
++}
++
++function parseDailyMode(header: string[], lines: string[]): ParsedAttendanceCsv {
++  const days: number[] = [];
++  const dayColIndex = new Map<number, { status: number; ot: number }>();
++
++  for (let i = 2; i < header.length; i += 2) {
++    const statusHeader = header[i];
++    const otHeader = header[i + 1];
++    const day = Number(statusHeader);
++    if (!Number.isInteger(day) || otHeader !== `${statusHeader}_OT`) {
++      throw new Error(`Unexpected column pair at position ${i + 1}: "${statusHeader}", "${otHeader}".`);
++    }
++    days.push(day);
++    dayColIndex.set(day, { status: i, ot: i + 1 });
++  }
++
++  const rows: ParsedAttendanceRow[] = lines.slice(1).map((line, idx) => {
++    const cells = parseCsvLine(line);
++    const statusByDay = new Map<number, string>();
++    const otByDay = new Map<number, string>();
++    for (const day of days) {
++      const cols = dayColIndex.get(day)!;
++      statusByDay.set(day, (cells[cols.status] ?? '').trim().toUpperCase());
++      otByDay.set(day, (cells[cols.ot] ?? '').trim());
++    }
++    return {
++      rowIndex: idx + 2,
++      staffCode: (cells[0] ?? '').trim(),
++      name: (cells[1] ?? '').trim(),
++      statusByDay,
++      otByDay,
++    };
++  });
++
++  return { otMode: 'daily', days, rows };
++}
++
++function parseTotalMode(header: string[], lines: string[]): ParsedAttendanceCsv {
++  const dayColIndex = new Map<number, number>();
++  const days: number[] = [];
++
++  // Every column between index 2 and the last (OT_Hours) is a date column.
++  for (let i = 2; i < header.length - 1; i++) {
++    const day = Number(header[i]);
++    if (!Number.isInteger(day)) {
++      throw new Error(`Unexpected column "${header[i]}" at position ${i + 1} — expected a date number.`);
++    }
++    days.push(day);
++    dayColIndex.set(day, i);
++  }
++  const otColIndex = header.length - 1;
++
++  const rows: ParsedAttendanceRow[] = lines.slice(1).map((line, idx) => {
++    const cells = parseCsvLine(line);
++    const statusByDay = new Map<number, string>();
++    for (const day of days) {
++      statusByDay.set(day, (cells[dayColIndex.get(day)!] ?? '').trim().toUpperCase());
++    }
++    return {
++      rowIndex: idx + 2,
++      staffCode: (cells[0] ?? '').trim(),
++      name: (cells[1] ?? '').trim(),
++      statusByDay,
++      otTotal: (cells[otColIndex] ?? '').trim(),
++    };
++  });
++
++  return { otMode: 'total', days, rows };
++}
+diff --git a/src/lib/attendance/period.ts b/src/lib/attendance/period.ts
+new file mode 100644
+index 0000000..af6c200
+--- /dev/null
++++ b/src/lib/attendance/period.ts
+@@ -0,0 +1,165 @@
++/**
++ * Monthly attendance period + deadline resolution.
++ *
++ * See attendance-upload-and-daily-register-spec.md (Sections 3-4) for the
++ * full state machine and design rationale. Short version:
++ *
++ *   - Every store has one AttendancePeriod row per calendar month it has
++ *     ever been "open" for. Created lazily — first time something touches
++ *     that store+month (or a daily cron opening the current month, see
++ *     ensureCurrentPeriodsExist below).
++ *   - deadlineAt is snapshotted from AttendanceDeadlinePolicy at CREATION
++ *     time. Editing the policy later does not retroactively move an
++ *     already-open period's deadline — see resolveDeadlineDay's docstring.
++ */
++
++import { prisma } from '@/lib/prisma';
++import { SYSTEM_DEFAULT_DEADLINE_DAY } from '@/lib/config';
++import type { AttendancePeriod, PeriodStatus } from '@prisma/client';
++
++/**
++ * Resolves the deadline day-of-month for a store, in priority order:
++ * store override > client default > SYSTEM_DEFAULT_DEADLINE_DAY.
++ *
++ * This is only ever called at period-creation time (see getOrCreatePeriod
++ * below) — it is NOT re-run against already-created periods, by design.
++ * If you want a policy change to retroactively shift open periods too,
++ * that's a one-line change (call this instead of reading period.deadlineAt),
++ * but the default here treats deadlineAt as a snapshot.
++ */
++export async function resolveDeadlineDay(storeId: string, clientId: string): Promise<number> {
++  const storeOverride = await prisma.attendanceDeadlinePolicy.findUnique({
++    where: { storeId },
++  });
++  if (storeOverride) return storeOverride.deadlineDay;
++
++  const clientDefault = await prisma.attendanceDeadlinePolicy.findUnique({
++    where: { clientId },
++  });
++  if (clientDefault) return clientDefault.deadlineDay;
++
++  return SYSTEM_DEFAULT_DEADLINE_DAY;
++}
++
++/**
++ * Computes the deadline instant for a given period: 23:59:59 on
++ * `deadlineDay` of the month AFTER periodMonth/periodYear, rolling the
++ * year forward for December. Kept naive (server-local time) to match the
++ * rest of the codebase's Date handling — if you want this pinned to IST
++ * specifically regardless of server timezone, use date-fns-tz's
++ * `fromZonedTime` the same way src/lib/sync/attendance.ts does for
++ * SmartOffice timestamps.
++ */
++export function computeDeadlineAt(periodYear: number, periodMonth: number, deadlineDay: number): Date {
++  const deadlineMonth = periodMonth === 12 ? 1 : periodMonth + 1;
++  const deadlineYear = periodMonth === 12 ? periodYear + 1 : periodYear;
++  return new Date(deadlineYear, deadlineMonth - 1, deadlineDay, 23, 59, 59, 999);
++}
++
++/**
++ * Gets the AttendancePeriod for a store+month, creating it (with a freshly
++ * resolved deadline snapshot) if it doesn't exist yet. Also flips an
++ * existing OPEN period to MISSED if its deadline has since passed — this
++ * lazy transition means you don't strictly need a cron for correctness,
++ * though a daily cron calling this for every store is still worth having
++ * so Admin's "missed periods" dashboard doesn't only update on next access.
++ */
++export async function getOrCreatePeriod(
++  storeId: string,
++  periodYear: number,
++  periodMonth: number,
++): Promise<AttendancePeriod> {
++  const existing = await prisma.attendancePeriod.findUnique({
++    where: { storeId_periodYear_periodMonth: { storeId, periodYear, periodMonth } },
++  });
++
++  if (existing) {
++    return maybeExpireToMissed(existing);
++  }
++
++  const store = await prisma.store.findUniqueOrThrow({
++    where: { id: storeId },
++    select: { clientId: true },
++  });
++
++  const deadlineDay = await resolveDeadlineDay(storeId, store.clientId);
++  const deadlineAt = computeDeadlineAt(periodYear, periodMonth, deadlineDay);
++
++  const created = await prisma.attendancePeriod.create({
++    data: { storeId, periodYear, periodMonth, deadlineAt, status: 'OPEN' },
++  });
++
++  return maybeExpireToMissed(created);
++}
++
++/**
++ * OPEN → MISSED once deadlineAt has passed with nothing submitted.
++ * LATE_GRANTED → MISSED once grantedUntil (on the most recent approved
++ * LateUploadRequest) has passed with nothing submitted.
++ * All other statuses are left alone (CLOSED/CLOSED_LATE are terminal;
++ * LATE_REQUESTED/LATE_DENIED are waiting on/reflect an Admin decision, not
++ * a clock).
++ */
++async function maybeExpireToMissed(period: AttendancePeriod): Promise<AttendancePeriod> {
++  const now = new Date();
++
++  if (period.status === 'OPEN' && period.deadlineAt < now) {
++    return prisma.attendancePeriod.update({
++      where: { id: period.id },
++      data: { status: 'MISSED' },
++    });
++  }
++
++  if (period.status === 'LATE_GRANTED') {
++    const latestGrant = await prisma.lateUploadRequest.findFirst({
++      where: { periodId: period.id, status: 'APPROVED' },
++      orderBy: { resolvedAt: 'desc' },
++    });
++    if (latestGrant?.grantedUntil && latestGrant.grantedUntil < now) {
++      return prisma.attendancePeriod.update({
++        where: { id: period.id },
++        data: { status: 'MISSED' },
++      });
++    }
++  }
++
++  return period;
++}
++
++/** Whether uploads/edits are currently allowed for this period. */
++export function isPeriodWritable(status: PeriodStatus): boolean {
++  return status === 'OPEN' || status === 'LATE_GRANTED';
++}
++
++const STATUS_MESSAGES: Partial<Record<PeriodStatus, string>> = {
++  MISSED: 'The deadline for this period has passed. Request late upload access to continue.',
++  LATE_REQUESTED: 'A late-access request is pending Admin approval for this period.',
++  LATE_DENIED: 'Your late-access request for this period was denied. You may file a new request.',
++  CLOSED: 'This period has already been submitted and closed.',
++  CLOSED_LATE: 'This period has already been submitted (late) and closed.',
++};
++
++/** Human-readable reason uploads/edits are blocked, or null if they're allowed. */
++export function writeBlockedReason(status: PeriodStatus): string | null {
++  if (isPeriodWritable(status)) return null;
++  return STATUS_MESSAGES[status] ?? 'This period is not currently open for edits.';
++}
++
++/**
++ * Opens (or expires-to-MISSED) the AttendancePeriod for every active store
++ * for the current calendar month. Intended to be called once daily from a
++ * cron route (mirroring the existing pattern in src/app/api/sync/attendance
++ * — see src/app/api/attendance/periods/tick/route.ts).
++ */
++export async function ensureCurrentPeriodsExist(): Promise<{ storesProcessed: number }> {
++  const stores = await prisma.store.findMany({ select: { id: true } });
++  const now = new Date();
++  const periodYear = now.getFullYear();
++  const periodMonth = now.getMonth() + 1;
++
++  for (const store of stores) {
++    await getOrCreatePeriod(store.id, periodYear, periodMonth);
++  }
++
++  return { storesProcessed: stores.length };
++}
+diff --git a/src/lib/auth/can.ts b/src/lib/auth/can.ts
+index a51ce14..ddc3d9c 100644
+--- a/src/lib/auth/can.ts
++++ b/src/lib/auth/can.ts
+@@ -13,6 +13,10 @@ export type Action =
+   | 'employee:view'
+   | 'attendance:view'
+   | 'attendance:manualEntry'
++  | 'attendance:csvUpload'
++  | 'attendance:lateAccess:request'
++  | 'attendance:lateAccess:approve'
++  | 'attendance:deadlinePolicy:manage'
+   | 'device:manage'
+   | 'store:create'
+   | 'store:manage'
+@@ -116,6 +120,36 @@ export function can(
+         default: return false;
+       }
+ 
++    // CSV upload — same scope as manual entry, but explicitly BOTH
++    // Manual and Biometric stores (unlike attendance:manualEntry, which is
++    // gated at the action layer to MANUAL-mode stores only).
++    case 'attendance:csvUpload':
++      switch (role) {
++        case 'ADMIN': return true;
++        case 'CLIENT': return inClient(ctx.clientId);
++        case 'MANAGER':
++        case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
++        default: return false;
++      }
++
++    // Filing a late-upload-access request — same people who can upload.
++    case 'attendance:lateAccess:request':
++      switch (role) {
++        case 'ADMIN': return true;
++        case 'CLIENT': return inClient(ctx.clientId);
++        case 'MANAGER':
++        case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
++        default: return false;
++      }
++
++    // Approving/denying a late-upload-access request — Admin only (spec decision).
++    case 'attendance:lateAccess:approve':
++      return role === 'ADMIN';
++
++    // Setting client-default / store-override deadline policy — Admin only.
++    case 'attendance:deadlinePolicy:manage':
++      return role === 'ADMIN';
++
+     // ── Device management ─────────────────────────────────────────────
+     case 'device:manage':
+       switch (role) {
+diff --git a/src/lib/config.ts b/src/lib/config.ts
+index 2ed3b86..cf21a5a 100644
+--- a/src/lib/config.ts
++++ b/src/lib/config.ts
+@@ -69,6 +69,33 @@ export const MANAGER_HARD_DELETE_LOOKBACK_DAYS: number = 30;
+  */
+ export const ATTENDANCE_SYNC_DEFAULT_LOOKBACK_DAYS: number = 7;
+ 
++/**
++ * Fallback deadline day (day-of-month, in the month AFTER the one being
++ * reported) used when neither a store override nor a client default
++ * AttendanceDeadlinePolicy row exists. e.g. 5 = attendance for August is
++ * due before the 5th of September.
++ */
++export const SYSTEM_DEFAULT_DEADLINE_DAY: number =
++  Number(process.env.ATTENDANCE_DEFAULT_DEADLINE_DAY) || 5;
++
++/**
++ * Standard shift length used to approximate daily overtime from raw
++ * SmartOffice punch times (first IN → last OUT) for a Biometric-mode store,
++ * for the purpose of flagging a discrepancy against a manually-uploaded
++ * daily OT figure. SmartOffice/AttendanceLog has no OT field of its own —
++ * this is a stated assumption, not a synced value. Adjust if your actual
++ * shift length differs (or varies by store — flag if you need per-store).
++ */
++export const STANDARD_SHIFT_HOURS: number =
++  Number(process.env.ATTENDANCE_STANDARD_SHIFT_HOURS) || 8;
++
++/**
++ * Tolerance (hours) within which a manually-uploaded daily OT figure is
++ * considered to "match" the biometric-approximated figure — below this,
++ * no discrepancy flag is raised. Guards against flagging rounding noise.
++ */
++export const OT_DISCREPANCY_TOLERANCE_HOURS: number = 0.25;
++
+ /**
+  * Google Forms integration config.
+  */

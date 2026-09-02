@@ -70,6 +70,33 @@ export const MANAGER_HARD_DELETE_LOOKBACK_DAYS: number = 30;
 export const ATTENDANCE_SYNC_DEFAULT_LOOKBACK_DAYS: number = 7;
 
 /**
+ * Fallback deadline day (day-of-month, in the month AFTER the one being
+ * reported) used when neither a store override nor a client default
+ * AttendanceDeadlinePolicy row exists. e.g. 5 = attendance for August is
+ * due before the 5th of September.
+ */
+export const SYSTEM_DEFAULT_DEADLINE_DAY: number =
+  Number(process.env.ATTENDANCE_DEFAULT_DEADLINE_DAY) || 5;
+
+/**
+ * Standard shift length used to approximate daily overtime from raw
+ * SmartOffice punch times (first IN → last OUT) for a Biometric-mode store,
+ * for the purpose of flagging a discrepancy against a manually-uploaded
+ * daily OT figure. SmartOffice/AttendanceLog has no OT field of its own —
+ * this is a stated assumption, not a synced value. Adjust if your actual
+ * shift length differs (or varies by store — flag if you need per-store).
+ */
+export const STANDARD_SHIFT_HOURS: number =
+  Number(process.env.ATTENDANCE_STANDARD_SHIFT_HOURS) || 8;
+
+/**
+ * Tolerance (hours) within which a manually-uploaded daily OT figure is
+ * considered to "match" the biometric-approximated figure — below this,
+ * no discrepancy flag is raised. Guards against flagging rounding noise.
+ */
+export const OT_DISCREPANCY_TOLERANCE_HOURS: number = 0.25;
+
+/**
  * Google Forms integration config.
  */
 export const GOOGLE_FORM_BASE_URL: string =

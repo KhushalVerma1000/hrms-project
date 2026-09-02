@@ -53,13 +53,76 @@ enum AttendanceMode {
 }
 
 /**
- * Daily attendance status for a MANUAL-mode store's manual entry form.
+ * Daily attendance status for a MANUAL-mode store's manual entry form,
+ * and for the same-shaped rows in a CSV upload (Section: CSV Upload spec).
+ * Kept deliberately short — WEEK_OFF/HOLIDAY added alongside CSV upload so a
+ * whole month's roster can be marked without every non-working day landing
+ * in ON_LEAVE, which would otherwise pollute leave-balance reporting.
  */
 enum ManualAttendanceStatus {
   PRESENT
   ABSENT
   HALF_DAY
   ON_LEAVE
+  WEEK_OFF
+  HOLIDAY
+}
+
+/**
+ * Where a ManualAttendanceEntry row came from — the Daily Register (one row,
+ * one save) or a committed CSV upload batch (many rows, one save). Both write
+ * through the same upsert path; this field is purely for audit/reporting.
+ */
+enum AttendanceEntrySource {
+  MANUAL_DAILY_EDIT
+  MANUAL_CSV
+}
+
+/**
+ * Deadline policy scope — CLIENT rows are the default for every store under
+ * that client; a STORE row overrides the client default for one specific store.
+ * Resolution order: store override > client default > SYSTEM_DEFAULT_DEADLINE_DAY.
+ */
+enum DeadlineScope {
+  CLIENT
+  STORE
+}
+
+/**
+ * Lifecycle of one store's one calendar month attendance window.
+ * See AttendancePeriod below for the full state machine in context.
+ */
+enum PeriodStatus {
+  OPEN           /// Before deadline, uploads/edits allowed.
+  CLOSED         /// Submitted on time, finalized.
+  MISSED         /// Deadline passed, nothing submitted — uploads blocked, must request late access.
+  LATE_REQUESTED /// Manager filed a late-access request, awaiting Admin decision.
+  LATE_GRANTED   /// Admin approved — uploads allowed again until grantedUntil.
+  LATE_DENIED    /// Admin denied — manager may file a new request.
+  CLOSED_LATE    /// Uploaded successfully under an approved late grant.
+}
+
+enum LateRequestStatus {
+  PENDING
+  APPROVED
+  DENIED
+}
+
+enum BatchStatus {
+  VALIDATING
+  VALIDATED_PENDING_COMMIT
+  COMMITTED
+  FAILED
+}
+
+/**
+ * Where EmployeeMonthlyOvertime.totalHours came from — a straight sum of
+ * daily otHours entries, or one manually-entered monthly figure when the
+ * manager used the "monthly total" CSV template mode instead of "daily OT".
+ */
+enum OvertimeSource {
+  DAILY_SUM
+  MANUAL_TOTAL
 }
 
 enum EmployeeStatus {
@@ -118,6 +181,7 @@ model Client {
 
   stores    Store[]
   users     User[]
+  deadlinePolicies AttendanceDeadlinePolicy[]
   createdAt DateTime @default(now())
 }
 
@@ -173,6 +237,8 @@ model Store {
   devices   Device[]
   employees Employee[]
   users     User[]
+  deadlinePolicyOverride AttendanceDeadlinePolicy[]
+  attendancePeriods      AttendancePeriod[]
 
   createdAt DateTime @default(now())
 
@@ -245,6 +311,7 @@ model Employee {
   /// Manual attendance entries recorded on this employee's behalf — only
   /// populated if this employee's Store has attendanceMode = MANUAL.
   manualAttendanceEntries ManualAttendanceEntry[]
+  monthlyOvertimes        EmployeeMonthlyOvertime[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -282,6 +349,9 @@ model User {
   auditLogs AuditLog[]
   /// Manual attendance entries this user has personally recorded (Manager/SI, MANUAL-mode stores only).
   manualAttendanceEntriesEntered ManualAttendanceEntry[]
+  lateUploadRequestsFiled    LateUploadRequest[] @relation("LateRequestsFiled")
+  lateUploadRequestsResolved LateUploadRequest[] @relation("LateRequestsResolved")
+  attendanceUploadBatches    AttendanceUploadBatch[]
 }
 
 /**
@@ -384,6 +454,20 @@ model ManualAttendanceEntry {
   checkOutTime DateTime?
   notes        String?
 
+  /// PER-DAY overtime hours. Only populated when the entry came from the
+  /// Daily Register with OT entered directly, or a CSV batch uploaded in
+  /// "daily OT" mode. Left null for "monthly total" mode uploads — see
+  /// EmployeeMonthlyOvertime, which is the value payroll actually reads.
+  otHours Decimal? @db.Decimal(5, 2)
+
+  /// MANUAL_DAILY_EDIT (Daily Register, one row) or MANUAL_CSV (CSV batch,
+  /// many rows) — both write through this same model/upsert path.
+  source AttendanceEntrySource @default(MANUAL_DAILY_EDIT)
+
+  /// Set when source = MANUAL_CSV — links back to the batch that wrote this row.
+  uploadBatchId String?
+  uploadBatch   AttendanceUploadBatch? @relation(fields: [uploadBatchId], references: [id])
+
   employeeId String
   employee   Employee @relation(fields: [employeeId], references: [id])
 
@@ -398,6 +482,150 @@ model ManualAttendanceEntry {
 
   @@unique([employeeId, date])
   @@index([employeeId, date])
+  @@index([uploadBatchId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTENDANCE CSV UPLOAD, MONTHLY DEADLINES & OVERTIME
+// See attendance-upload-and-daily-register-spec.md for the full design.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Deadline policy: how many days into the following month a store's
+ * attendance for a given month is due. One CLIENT row = default for every
+ * store under that client. One STORE row = override for a single store.
+ * Resolution done in code (src/lib/attendance/period.ts), not in SQL.
+ */
+model AttendanceDeadlinePolicy {
+  id          String        @id @default(cuid())
+  scope       DeadlineScope
+  /// One row per Client (scope = CLIENT). Field-level @unique so multiple
+  /// clients can each have a row while storeId stays NULL on all of them —
+  /// Postgres treats NULLs as distinct in a unique index, which is exactly
+  /// what's needed here.
+  clientId    String?       @unique
+  client      Client?       @relation(fields: [clientId], references: [id])
+  /// One row per Store (scope = STORE), overriding that store's client default.
+  storeId     String?       @unique
+  store       Store?        @relation(fields: [storeId], references: [id])
+  /// Day-of-month in the month AFTER the one being reported, e.g. 5 = "5th
+  /// of the following month". Attendance for August is due before 5 Sep.
+  deadlineDay Int
+  createdByUserId String
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+}
+
+/**
+ * One store's one calendar-month attendance window. Created lazily (first
+ * access, or a daily cron opening next month's window on the 1st).
+ * deadlineAt is snapshotted from AttendanceDeadlinePolicy at creation time —
+ * editing the policy later does NOT retroactively move an already-open
+ * period's deadline. Extending an individual period is what the late-access
+ * grant (LateUploadRequest.grantedUntil) is for.
+ */
+model AttendancePeriod {
+  id          String       @id @default(cuid())
+  storeId     String
+  store       Store        @relation(fields: [storeId], references: [id])
+  periodYear  Int
+  periodMonth Int          /// 1–12, the month attendance covers (August = 8)
+  deadlineAt  DateTime
+  status      PeriodStatus @default(OPEN)
+  submittedAt DateTime?
+  closedAt    DateTime?
+  isLate      Boolean      @default(false)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  uploadBatches     AttendanceUploadBatch[]
+  lateRequests      LateUploadRequest[]
+  monthlyOvertimes  EmployeeMonthlyOvertime[]
+
+  @@unique([storeId, periodYear, periodMonth])
+  @@index([status])
+}
+
+/**
+ * A manager's request to unlock uploads for a MISSED period, and the
+ * Admin's decision. grantedUntil is an explicit date/time chosen by the
+ * Admin at approval time — not a fixed "+N days" rule.
+ */
+model LateUploadRequest {
+  id             String             @id @default(cuid())
+  periodId       String
+  period         AttendancePeriod   @relation(fields: [periodId], references: [id])
+  requestedByUserId String
+  requestedByUser   User            @relation("LateRequestsFiled", fields: [requestedByUserId], references: [id])
+  requestedAt    DateTime           @default(now())
+  reason         String?
+  status         LateRequestStatus  @default(PENDING)
+  resolvedByUserId String?
+  resolvedByUser   User?            @relation("LateRequestsResolved", fields: [resolvedByUserId], references: [id])
+  resolvedAt     DateTime?
+  grantedUntil   DateTime?
+  adminNote      String?
+
+  @@index([periodId, status])
+}
+
+/**
+ * One CSV upload attempt for one store+period. Validation runs first
+ * (VALIDATING → VALIDATED_PENDING_COMMIT, nothing written to
+ * ManualAttendanceEntry yet); the manager reviews flagged rows, then a
+ * separate commit step writes the actual attendance rows and flips this
+ * to COMMITTED. parsedSnapshot/errorReport hold the full row-level detail
+ * for audit — there's no object storage in this app yet, so the raw file
+ * itself isn't retained, only the parsed+validated data.
+ */
+model AttendanceUploadBatch {
+  id             String      @id @default(cuid())
+  periodId       String
+  period         AttendancePeriod @relation(fields: [periodId], references: [id])
+  storeId        String
+  uploadedByUserId String
+  uploadedByUser   User      @relation(fields: [uploadedByUserId], references: [id])
+  uploadedAt     DateTime    @default(now())
+  fileName       String
+  /// Detected from the CSV header shape — paired "N_OT" columns vs one
+  /// trailing "OT_Hours" column. See src/lib/attendance/csv.ts.
+  otMode         OvertimeSource
+  status         BatchStatus @default(VALIDATING)
+  rowCount       Int         @default(0)
+  errorCount     Int         @default(0)
+  warningCount   Int         @default(0)
+  isLate         Boolean     @default(false)
+  parsedSnapshot Json?
+  errorReport    Json?
+
+  /// The actual ManualAttendanceEntry rows this batch wrote (only once COMMITTED).
+  manualAttendanceEntries ManualAttendanceEntry[]
+
+  @@index([periodId, status])
+}
+
+/**
+ * The monthly OT figure payroll actually reads, regardless of which CSV
+ * template mode produced it. DAILY_SUM = sum of ManualAttendanceEntry.otHours
+ * across the period; MANUAL_TOTAL = one figure entered directly (no daily
+ * breakdown). hasDiscrepancy is set when a Mode A ("daily OT") upload's
+ * figure disagrees with SmartOffice-derived OT for a Biometric store.
+ * NOTE: SmartOffice/AttendanceLog has no OT field today — "SmartOffice OT"
+ * here means an approximation computed from raw punch times (see
+ * src/lib/attendance/biometricOt.ts). Flagged as an assumption to confirm.
+ */
+model EmployeeMonthlyOvertime {
+  id             String         @id @default(cuid())
+  periodId       String
+  period         AttendancePeriod @relation(fields: [periodId], references: [id])
+  employeeId     String
+  employee       Employee       @relation(fields: [employeeId], references: [id])
+  totalHours     Decimal        @db.Decimal(6, 2)
+  source         OvertimeSource
+  hasDiscrepancy Boolean        @default(false)
+  updatedAt      DateTime       @updatedAt
+
+  @@unique([periodId, employeeId])
 }
 
 /**

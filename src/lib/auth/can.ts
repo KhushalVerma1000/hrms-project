@@ -13,6 +13,10 @@ export type Action =
   | 'employee:view'
   | 'attendance:view'
   | 'attendance:manualEntry'
+  | 'attendance:csvUpload'
+  | 'attendance:lateAccess:request'
+  | 'attendance:lateAccess:approve'
+  | 'attendance:deadlinePolicy:manage'
   | 'device:manage'
   | 'store:create'
   | 'store:manage'
@@ -115,6 +119,36 @@ export function can(
         case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
         default: return false;
       }
+
+    // CSV upload — same scope as manual entry, but explicitly BOTH
+    // Manual and Biometric stores (unlike attendance:manualEntry, which is
+    // gated at the action layer to MANUAL-mode stores only).
+    case 'attendance:csvUpload':
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return inClient(ctx.clientId);
+        case 'MANAGER':
+        case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
+        default: return false;
+      }
+
+    // Filing a late-upload-access request — same people who can upload.
+    case 'attendance:lateAccess:request':
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return inClient(ctx.clientId);
+        case 'MANAGER':
+        case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
+        default: return false;
+      }
+
+    // Approving/denying a late-upload-access request — Admin only (spec decision).
+    case 'attendance:lateAccess:approve':
+      return role === 'ADMIN';
+
+    // Setting client-default / store-override deadline policy — Admin only.
+    case 'attendance:deadlinePolicy:manage':
+      return role === 'ADMIN';
 
     // ── Device management ─────────────────────────────────────────────
     case 'device:manage':
