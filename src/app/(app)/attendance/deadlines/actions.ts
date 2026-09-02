@@ -11,6 +11,15 @@ import { writeAuditLog } from '@/lib/smartoffice/audit';
 
 // ─── Deadline policy ────────────────────────────────────────────────────
 
+export async function listStoresForClient(clientId: string) {
+  await requireAuth('attendance:deadlinePolicy:manage');
+  return prisma.store.findMany({
+    where: { clientId },
+    select: { id: true, name: true },
+    orderBy: { name: 'asc' },
+  });
+}
+
 export async function getDeadlinePolicyForClient(clientId: string) {
   await requireAuth('attendance:deadlinePolicy:manage');
 

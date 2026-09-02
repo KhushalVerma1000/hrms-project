@@ -12,8 +12,7 @@ import { requireAuth } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import { getOrCreatePeriod, isPeriodWritable, writeBlockedReason } from '@/lib/attendance/period';
-import { approximateBiometricOtHours } from '@/lib/attendance/biometricOt';
-import { OT_DISCREPANCY_TOLERANCE_HOURS } from '@/lib/config';
+import { approximateBiometricOtHours } from '@/lib/attendance/biometricOt';import { OT_DISCREPANCY_TOLERANCE_HOURS } from '@/lib/config';
 import {
   parseAttendanceCsv,
   daysInMonth,
@@ -23,6 +22,80 @@ import {
   type OtTemplateMode,
 } from '@/lib/attendance/csv';
 import type { Prisma } from '@prisma/client';
+
+/** Stores this user is allowed to upload attendance for. */
+export async function getUploadEligibleStores() {
+  const session = await requireAuth('attendance:csvUpload');
+  const role = session.user.role;
+
+  return prisma.store.findMany({
+    where:
+      role === 'MANAGER' || role === 'SHIFT_INCHARGE'
+        ? { id: session.user.storeId ?? undefined }
+        : role === 'CLIENT'
+        ? { clientId: session.user.clientId ?? undefined }
+        : {},
+    select: { id: true, name: true, attendanceMode: true, client: { select: { shortName: true } } },
+    orderBy: { name: 'asc' },
+  });
+}
+
+export interface UploadPageContext {
+  store: { id: string; name: string; attendanceMode: 'BIOMETRIC' | 'MANUAL' };
+  periodId: string;
+  periodStatus: string;
+  deadlineAt: string;
+  isWritable: boolean;
+  blockedReason: string | null;
+  pendingLateRequest: { id: string; requestedAt: string; reason: string | null } | null;
+  lastLateRequest: { status: string; adminNote: string | null; grantedUntil: string | null } | null;
+}
+
+/** Everything the upload page needs to render for a given store + month. */
+export async function getUploadPageContext(
+  storeId: string,
+  periodYear: number,
+  periodMonth: number,
+): Promise<UploadPageContext> {
+  const session = await requireAuth('attendance:csvUpload', { storeId });
+
+  const store = await prisma.store.findUniqueOrThrow({
+    where: { id: storeId },
+    select: { id: true, name: true, attendanceMode: true, clientId: true },
+  });
+  if (session.user.role === 'CLIENT' && session.user.clientId !== store.clientId) {
+    throw new Error('Not authorized for this store.');
+  }
+
+  const period = await getOrCreatePeriod(storeId, periodYear, periodMonth);
+
+  const pendingLateRequest = await prisma.lateUploadRequest.findFirst({
+    where: { periodId: period.id, status: 'PENDING' },
+    orderBy: { requestedAt: 'desc' },
+  });
+
+  const lastLateRequest = pendingLateRequest
+    ? null
+    : await prisma.lateUploadRequest.findFirst({
+        where: { periodId: period.id },
+        orderBy: { requestedAt: 'desc' },
+      });
+
+  return {
+    store: { id: store.id, name: store.name, attendanceMode: store.attendanceMode },
+    periodId: period.id,
+    periodStatus: period.status,
+    deadlineAt: period.deadlineAt.toISOString(),
+    isWritable: isPeriodWritable(period.status),
+    blockedReason: writeBlockedReason(period.status),
+    pendingLateRequest: pendingLateRequest
+      ? { id: pendingLateRequest.id, requestedAt: pendingLateRequest.requestedAt.toISOString(), reason: pendingLateRequest.reason }
+      : null,
+    lastLateRequest: lastLateRequest
+      ? { status: lastLateRequest.status, adminNote: lastLateRequest.adminNote, grantedUntil: lastLateRequest.grantedUntil?.toISOString() ?? null }
+      : null,
+  };
+}
 
 interface ValidationIssue {
   rowIndex: number;
