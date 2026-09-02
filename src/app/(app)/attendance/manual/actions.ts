@@ -50,7 +50,21 @@ export async function getManualAttendanceForDate(storeId: string, dateStr: strin
     where: { employeeId: { in: employees.map((e) => e.id) }, date },
   });
 
-  const entryByEmployeeId = new Map(entries.map((e) => [e.employeeId, e]));
+  // Serialize to strings — RosterRow (ManualAttendanceForm.tsx) expects
+  // existingEntry.checkInTime/checkOutTime as string | null, not a Prisma
+  // Date object. Also narrows to just the fields the form actually reads.
+  const entryByEmployeeId = new Map(
+    entries.map((e) => [
+      e.employeeId,
+      {
+        status: e.status,
+        checkInTime: e.checkInTime ? e.checkInTime.toISOString() : null,
+        checkOutTime: e.checkOutTime ? e.checkOutTime.toISOString() : null,
+        notes: e.notes,
+        otHours: e.otHours ? Number(e.otHours) : null,
+      },
+    ]),
+  );
 
   return {
     store: { id: store.id, name: store.name },
