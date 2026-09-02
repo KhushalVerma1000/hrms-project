@@ -4,6 +4,7 @@ import { requireAuth, getAuthSession } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import { AuthorizationError } from '@/lib/errors';
+import { getOrCreatePeriod, writeBlockedReason } from '@/lib/attendance/period';
 import type { ManualAttendanceStatus } from '@prisma/client';
 
 /**
@@ -36,6 +37,8 @@ export async function getManualAttendanceForDate(storeId: string, dateStr: strin
   }
 
   const date = new Date(dateStr);
+  const period = await getOrCreatePeriod(storeId, date.getFullYear(), date.getMonth() + 1);
+  const blockedReason = writeBlockedReason(period.status);
 
   const employees = await prisma.employee.findMany({
     where: { storeId, status: 'ACTIVE' },
@@ -52,6 +55,10 @@ export async function getManualAttendanceForDate(storeId: string, dateStr: strin
   return {
     store: { id: store.id, name: store.name },
     date: dateStr,
+    /// Non-null when the Daily Register should be shown read-only for this
+    /// date's period (deadline passed / already closed) — see spec §7.
+    /// ADMIN can still write; the UI should only lock the form for other roles.
+    readOnlyReason: session.user.role === 'ADMIN' ? null : blockedReason,
     roster: employees.map((emp) => ({
       ...emp,
       existingEntry: entryByEmployeeId.get(emp.id) ?? null,
@@ -65,6 +72,9 @@ export interface ManualAttendanceInput {
   checkInTime?: string; // "HH:mm", optional
   checkOutTime?: string;
   notes?: string;
+  /// Optional per-day overtime hours entered directly in the Daily Register
+  /// (same field CSV "daily OT" mode writes to — see spec §5, §7).
+  otHours?: number;
 }
 
 /**
@@ -95,6 +105,16 @@ export async function saveManualAttendanceBatch(
     return { ok: false, error: 'Not authorized for this store.' };
   }
 
+  const date = new Date(dateStr);
+  const period = await getOrCreatePeriod(storeId, date.getFullYear(), date.getMonth() + 1);
+
+  // ADMIN can edit through a closed/missed period (matches spec §7 — Admin
+  // retains edit rights after close); everyone else is gated by period status.
+  if (session.user.role !== 'ADMIN') {
+    const blockedReason = writeBlockedReason(period.status);
+    if (blockedReason) return { ok: false, error: blockedReason };
+  }
+
   // Confirm every employeeId in the batch actually belongs to this store —
   // prevents a tampered request from writing attendance for another store's staff.
   const validEmployeeIds = new Set(
@@ -106,14 +126,15 @@ export async function saveManualAttendanceBatch(
     ).map((e) => e.id),
   );
 
-  const date = new Date(dateStr);
   let saved = 0;
+  const touchedEmployeeIds = new Set<string>();
 
   for (const entry of entries) {
     if (!validEmployeeIds.has(entry.employeeId)) continue; // silently skip, don't fail the whole batch
 
     const checkInTime = entry.checkInTime ? combineDateAndTime(date, entry.checkInTime) : null;
     const checkOutTime = entry.checkOutTime ? combineDateAndTime(date, entry.checkOutTime) : null;
+    const otHours = entry.otHours ?? null;
 
     await prisma.manualAttendanceEntry.upsert({
       where: { employeeId_date: { employeeId: entry.employeeId, date } },
@@ -124,6 +145,8 @@ export async function saveManualAttendanceBatch(
         checkInTime,
         checkOutTime,
         notes: entry.notes || null,
+        otHours,
+        source: 'MANUAL_DAILY_EDIT',
         enteredByUserId: session.user.id,
       },
       update: {
@@ -131,11 +154,19 @@ export async function saveManualAttendanceBatch(
         checkInTime,
         checkOutTime,
         notes: entry.notes || null,
+        otHours,
+        // A direct Daily Register edit always takes precedence over a prior
+        // CSV row for this same day — flip source and detach the old batch link.
+        source: 'MANUAL_DAILY_EDIT',
+        uploadBatchId: null,
         enteredByUserId: session.user.id, // last editor wins
       },
     });
     saved++;
+    touchedEmployeeIds.add(entry.employeeId);
   }
+
+  await recomputeMonthlyOvertimeForEmployees(period.id, period.periodYear, period.periodMonth, touchedEmployeeIds);
 
   await writeAuditLog({
     userId: session.user.id,
@@ -146,6 +177,39 @@ export async function saveManualAttendanceBatch(
   });
 
   return { ok: true, saved };
+}
+
+/**
+ * Re-sums ManualAttendanceEntry.otHours across the whole period for each
+ * touched employee and upserts EmployeeMonthlyOvertime as DAILY_SUM. Only
+ * runs for employees that actually have at least one non-null otHours entry
+ * this period — an employee with no daily OT entered at all is left alone,
+ * so a previously-uploaded MANUAL_TOTAL figure for someone nobody has
+ * touched in the Daily Register isn't clobbered by an empty sum.
+ */
+async function recomputeMonthlyOvertimeForEmployees(
+  periodId: string,
+  periodYear: number,
+  periodMonth: number,
+  employeeIds: Set<string>,
+): Promise<void> {
+  const monthStart = new Date(periodYear, periodMonth - 1, 1);
+  const monthEnd = new Date(periodYear, periodMonth, 0, 23, 59, 59, 999);
+
+  for (const employeeId of employeeIds) {
+    const entries = await prisma.manualAttendanceEntry.findMany({
+      where: { employeeId, date: { gte: monthStart, lte: monthEnd }, otHours: { not: null } },
+      select: { otHours: true },
+    });
+    if (entries.length === 0) continue;
+
+    const totalHours = entries.reduce((sum, e) => sum + Number(e.otHours), 0);
+    await prisma.employeeMonthlyOvertime.upsert({
+      where: { periodId_employeeId: { periodId, employeeId } },
+      create: { periodId, employeeId, totalHours, source: 'DAILY_SUM' },
+      update: { totalHours, source: 'DAILY_SUM' },
+    });
+  }
 }
 
 function combineDateAndTime(date: Date, timeStr: string): Date {
