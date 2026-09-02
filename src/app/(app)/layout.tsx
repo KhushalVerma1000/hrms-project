@@ -13,6 +13,8 @@ export default async function AppLayout({
   const userRole = session.user.role;
   const canViewAttendance = can(session, 'attendance:view', {});
   const canManualAttendance = can(session, 'attendance:manualEntry', { storeId: session.user.storeId });
+  const canCsvUpload = can(session, 'attendance:csvUpload', { storeId: session.user.storeId });
+  const canManageDeadlines = can(session, 'attendance:deadlinePolicy:manage');
   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
 
   return (
@@ -42,6 +44,14 @@ export default async function AppLayout({
 
             {canManualAttendance && (
               <NavLink href="/attendance/manual" label="Manual Attendance" icon="📝" />
+            )}
+
+            {canCsvUpload && (
+              <NavLink href="/attendance/upload" label="Attendance Upload" icon="📤" />
+            )}
+
+            {canManageDeadlines && (
+              <NavLink href="/attendance/deadlines" label="Attendance Deadlines" icon="⏰" />
             )}
 
             <NavLink href="/onboarding" label="Onboarding Wizard" icon="✨" />
