@@ -1,0 +1,23 @@
+diff --git a/src/lib/smartoffice/client.ts b/src/lib/smartoffice/client.ts
+index a5f069c..f07434e 100644
+--- a/src/lib/smartoffice/client.ts
++++ b/src/lib/smartoffice/client.ts
+@@ -191,9 +191,15 @@ export async function setUserExpiration(
+ export async function getDeviceCommands(
+   params: Omit<GetDeviceCommandsParams, 'APIKey'>,
+ ): Promise<SmartOfficeResult<DeviceCommandRecord[]>> {
+-  // NOTE: no "v2" in this path — confirmed against SmartOfficeAPIDocumentation.pdf.
+-  // Every other endpoint in this file uses /api/v2/WebAPI/..., this one doesn't.
+-  return smartGet('/api/WebAPI/GetDeviceCommands', { APIKey: SMARTOFFICE_API_KEY, ...params });
++  // Confirmed live against the deployed server (not just the PDF doc) on
++  // 2026-09-03: /api/WebAPI/GetDeviceCommands (no v2) 404s with "No HTTP
++  // resource was found that matches the request URI" — both from this
++  // app's own diagnostics and a direct browser hit. /api/v2/WebAPI/...
++  // returns a real 200 {"status":"success",...}. The old comment here
++  // claiming "no v2, confirmed against SmartOfficeAPIDocumentation.pdf"
++  // was wrong (or the doc is stale relative to what's actually deployed)
++  // — every other endpoint uses v2, and now so does this one.
++  return smartGet('/api/v2/WebAPI/GetDeviceCommands', { APIKey: SMARTOFFICE_API_KEY, ...params });
+ }
+ 
+ /**
