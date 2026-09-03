@@ -253,9 +253,14 @@ export async function triggerUserOnlineEnrollment(
 export async function addEmployee(
   params: Omit<AddEmployeeParams, 'APIKey'>,
 ): Promise<SmartOfficeResult> {
-  // Doc specifies GET despite documenting a "Request JSON Object" — matches
-  // the pattern used by every other Add* endpoint in this file.
-  return smartGet('/api/v2/WebAPI/AddEmployee', { APIKey: SMARTOFFICE_API_KEY, ...params });
+  // SmartOfficeAPIDocumentation.pdf (v1.0.4, page 15) documents this as
+  // "GET /api/v2/WebAPI/AddEmployee" — but our live instance rejects that
+  // with "The requested resource does not support http method 'GET'."
+  // Confirmed both via a real dispatched command failure (Sync Issues) and
+  // by hitting the URL directly in a browser. The doc is wrong for this
+  // deployed instance; use POST instead. See hrms-smartoffice-curl-check.sh
+  // for a repeatable way to re-verify this against the live server.
+  return smartPost('/api/v2/WebAPI/AddEmployee', { APIKey: SMARTOFFICE_API_KEY, ...params });
 }
 
 export async function deleteEmployee(
