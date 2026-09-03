@@ -1,0 +1,127 @@
+diff --git a/prisma/seed.ts b/prisma/seed.ts
+index 04ca2f3..88b869e 100644
+--- a/prisma/seed.ts
++++ b/prisma/seed.ts
+@@ -203,8 +203,17 @@ async function main() {
+     create: { serialNumber: 'AMDB24122800519', name: 'Saket', storeId: store.id },
+   });
+ 
++  // Normalizes a Location/csvLocationKeys string for matching: lowercase,
++  // strip spaces and hyphens. Declared here (not down by the CSV loop)
++  // because it's needed both when POPULATING storeByCsvKey below and when
++  // looking rows up against it — using it on one side only was a bug in an
++  // earlier version of this seed (multi-word store names like "Punjabi
++  // Bagh" never matched because the map key kept its space while the
++  // lookup key didn't).
++  const normalizeLocation = (s: string) => s.trim().toLowerCase().replace(/[\s-]+/g, '');
++
+   const storeByCsvKey = new Map<string, { id: string; name: string }>();
+-  storeByCsvKey.set('saket', { id: store.id, name: store.name });
++  storeByCsvKey.set(normalizeLocation('saket'), { id: store.id, name: store.name });
+ 
+   let nextStoreCode = 11;
+   for (const rs of REAL_STORES) {
+@@ -230,13 +239,47 @@ async function main() {
+       create: { serialNumber: rs.serialNumber, name: rs.name, storeId: createdStore.id },
+     });
+     for (const key of rs.csvLocationKeys) {
+-      storeByCsvKey.set(key, { id: createdStore.id, name: createdStore.name });
++      storeByCsvKey.set(normalizeLocation(key), { id: createdStore.id, name: createdStore.name });
+     }
+     nextStoreCode = Math.max(nextStoreCode, Number(rs.code) + 1);
+   }
+   await prisma.counter.update({ where: { id: `storeCode:${client.id}` }, data: { value: nextStoreCode - 1 } });
+   console.log(`✅ Real stores + devices seeded: Saket + ${REAL_STORES.length} more, all under ${client.name}`);
+ 
++  // ─── Legacy e-code store-segment cross-check ───────────────────────────
++  // A subset of EmployeeCode values follow a structured legacy scheme:
++  // YYYY (year) + ClientCode (2-digit, "01" = Mansa Maharani here) +
++  // StoreCode (2-digit) + Serial (6-digit) — 14 digits total, e.g.
++  // "20250101000001" = 2025 + client 01 + store 01 (Saket) + serial 1.
++  // Confirmed empirically against this export: 01=Saket, 02=Khizrabad,
++  // 03=Punjabi Bagh, 04=Burari, 05=Faridabad Sec-16. Most rows DON'T follow
++  // this scheme (ad-hoc SmartOffice-issued codes of varying length), so
++  // it's used as a secondary signal, not the primary source of truth:
++  //   - If Location gives no store but the code decodes to one, we recover
++  //     the employee into that store instead of skipping them.
++  //   - If Location AND the code both give a store but they disagree,
++  //     that's logged as a mismatch for manual review — Location still wins
++  //     (an employee's assignment can legitimately change after their code
++  //     was issued), but it's worth a human looking at the printed list.
++  const LEGACY_CODE_PATTERN = /^(\d{4})(\d{2})(\d{2})(\d{6})$/;
++  const LEGACY_CLIENT_CODE = '01'; // Mansa Maharani, per the embedded code
++  const LEGACY_STORE_CODE_MAP: Record<string, string> = {
++    '01': normalizeLocation('saket'),
++    '02': normalizeLocation('khizrabad'),
++    '03': normalizeLocation('punjabi bagh'),
++    '04': normalizeLocation('burari'),
++    '05': normalizeLocation('faridabad sec-16'),
++  };
++
++  function decodeLegacyStore(staffCode: string): { id: string; name: string } | null {
++    const match = staffCode.match(LEGACY_CODE_PATTERN);
++    if (!match) return null;
++    const [, , clientSegment, storeSegment] = match;
++    if (clientSegment !== LEGACY_CLIENT_CODE) return null;
++    const key = LEGACY_STORE_CODE_MAP[storeSegment];
++    return key ? storeByCsvKey.get(key) ?? null : null;
++  }
++
+   // ─── Real employees (from SmartOffice employee export) ────────────────
+   // prisma/seed-data/employee-details-export.csv is the raw
+   // EmployeeDetails_Export from SmartOffice. staffCode is kept as the
+@@ -274,14 +317,15 @@ async function main() {
+     'SM': null,
+   };
+ 
+-  const normalizeLocation = (s: string) => s.trim().toLowerCase().replace(/[\s-]+/g, '');
+   const isPlaceholderDate = (s: string) => !s || s === '1900-01-01' || s === '3000-01-01';
+ 
+   let created = 0;
+   let skippedNoStore = 0;
+   let skippedManager = 0;
+   let skippedTestRow = 0;
++  let recoveredViaCode = 0;
+   const perStoreCount = new Map<string, number>();
++  const storeMismatches: string[] = [];
+ 
+   for (let i = 1; i < employeeCsvLines.length; i++) {
+     const cells = employeeCsvLines[i].split(',');
+@@ -307,9 +351,19 @@ async function main() {
+       continue;
+     }
+ 
+-    const matchedStore = storeByCsvKey.get(normalizeLocation(location));
++    const locationStore = storeByCsvKey.get(normalizeLocation(location));
++    const codeStore = decodeLegacyStore(staffCode);
++
++    let matchedStore = locationStore;
++    if (locationStore && codeStore && locationStore.id !== codeStore.id) {
++      storeMismatches.push(`${staffCode} (${name}): Location says "${location}" → ${locationStore.name}, but the e-code decodes to ${codeStore.name}. Kept ${locationStore.name} (Location wins).`);
++    } else if (!locationStore && codeStore) {
++      matchedStore = codeStore; // recovered via embedded store code
++      recoveredViaCode++;
++    }
++
+     if (!matchedStore) {
+-      skippedNoStore++; // e.g. Location = "Default" — no real store to attach to
++      skippedNoStore++; // e.g. Location = "Default" and the code didn't decode either
+       continue;
+     }
+ 
+@@ -342,7 +396,14 @@ async function main() {
+   for (const [storeName, count] of perStoreCount) {
+     console.log(`   - ${storeName}: ${count}`);
+   }
+-  console.log(`   Skipped: ${skippedNoStore} with no matching store (Location = "Default" or unrecognized), ${skippedManager} Store Manager rows ('SM' designation — not modeled as Employee), ${skippedTestRow} test/malformed rows.`);
++  console.log(`   Skipped: ${skippedNoStore} with no matching store (Location = "Default"/unmapped and e-code didn't decode either), ${skippedManager} Store Manager rows ('SM' designation — not modeled as Employee), ${skippedTestRow} test/malformed rows.`);
++  if (recoveredViaCode > 0) {
++    console.log(`   ℹ️  ${recoveredViaCode} employee(s) had no usable Location but were assigned via their e-code's embedded store segment instead.`);
++  }
++  if (storeMismatches.length > 0) {
++    console.log(`   ⚠️  ${storeMismatches.length} employee(s) where Location and the e-code's embedded store disagree (Location was kept — review these):`);
++    for (const line of storeMismatches) console.log(`      - ${line}`);
++  }
+ 
+ 
+   // ─── Second Demo Store: Okhla (Blinkit, MANUAL mode) ──────────────────────
