@@ -1,0 +1,114 @@
+diff --git a/prisma/migrations/20260904090000_biometric_provider_config/migration.sql b/prisma/migrations/20260904090000_biometric_provider_config/migration.sql
+new file mode 100644
+index 0000000..c83aa1c
+--- /dev/null
++++ b/prisma/migrations/20260904090000_biometric_provider_config/migration.sql
+@@ -0,0 +1,40 @@
++-- CreateEnum
++CREATE TYPE "BiometricProviderType" AS ENUM ('SMARTOFFICE', 'MANUAL');
++
++-- CreateTable
++CREATE TABLE "BiometricProviderConfig" (
++    "id" TEXT NOT NULL,
++    "type" "BiometricProviderType" NOT NULL,
++    "label" TEXT NOT NULL,
++    "baseUrl" TEXT,
++    "apiKeyEnv" TEXT,
++    "timezone" TEXT,
++    "isDefault" BOOLEAN NOT NULL DEFAULT false,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++
++    CONSTRAINT "BiometricProviderConfig_pkey" PRIMARY KEY ("id")
++);
++
++-- AlterTable
++-- Added nullable first so it can be backfilled below before being made
++-- required — every existing Device row must end up pointing at a provider.
++ALTER TABLE "Device" ADD COLUMN "providerId" TEXT;
++
++-- Data migration
++-- Backfill a single default SmartOffice provider config, pointed at the
++-- existing SMARTOFFICE_BASE_URL / SMARTOFFICE_API_KEY env vars (via the
++-- apiKeyEnv pointer, not the secret itself). Every current Device is wired
++-- to it, matching today's behavior with no manual per-store work.
++INSERT INTO "BiometricProviderConfig" ("id", "type", "label", "apiKeyEnv", "isDefault", "createdAt")
++VALUES ('default-smartoffice-provider', 'SMARTOFFICE', 'SmartOffice — Primary', 'SMARTOFFICE_API_KEY', true, CURRENT_TIMESTAMP);
++
++UPDATE "Device" SET "providerId" = 'default-smartoffice-provider' WHERE "providerId" IS NULL;
++
++-- AlterTable
++ALTER TABLE "Device" ALTER COLUMN "providerId" SET NOT NULL;
++
++-- CreateIndex
++CREATE INDEX "Device_providerId_idx" ON "Device"("providerId");
++
++-- AddForeignKey
++ALTER TABLE "Device" ADD CONSTRAINT "Device_providerId_fkey" FOREIGN KEY ("providerId") REFERENCES "BiometricProviderConfig"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 0e89eca..91c35d2 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -144,6 +144,16 @@ enum OnboardingFormStatus {
+   SUBMITTED  /// Confirmed submitted and matched via webhook/polling.
+ }
+ 
++/// Which biometric backend a Device is wired to. SmartOffice is the only
++/// vendor integration today (Patch A/B); MANUAL formalizes stores that have
++/// no biometric device at all. Add new values only once an adapter for that
++/// vendor actually exists (Patch D+) — see src/lib/biometric/.
++enum BiometricProviderType {
++  SMARTOFFICE
++  MANUAL
++  // Future: ESSL, ZKTECO, GENERIC_REST — add as adapters are built.
++}
++
+ // ─────────────────────────────────────────────────────────────────────────────
+ // CORE MODELS
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -264,6 +274,46 @@ model Device {
+   /// silently stays NULL in Postgres, so this must start at 0 to ever count.
+   attLogsCount Int       @default(0)
+   createdAt    DateTime  @default(now())
++
++  /// Which biometric backend this device talks to. Every existing Device is
++  /// backfilled to the default SmartOffice config on migration — zero
++  /// behavior change on day one (see BiometricProviderConfig).
++  providerId String
++  provider   BiometricProviderConfig @relation(fields: [providerId], references: [id])
++
++  @@index([providerId])
++}
++
++/**
++ * Config row for a biometric backend a Device can be wired to (Section 2/3 of
++ * the biometric-provider-modularization spec). Provider selection is a
++ * per-device *data* decision (this table), not a code decision — onboarding a
++ * new vendor means implementing its adapter once and inserting a row here,
++ * with zero changes to onboarding/attendance/device route logic.
++ */
++model BiometricProviderConfig {
++  id   String                @id @default(cuid())
++  type BiometricProviderType
++
++  /// e.g. "SmartOffice — Primary", shown in device admin UI.
++  label String
++
++  baseUrl String?
++
++  /// Name of the env var holding the API key — NOT the key itself. Storing a
++  /// pointer instead of the secret avoids taking on secret-encryption-at-rest
++  /// scope while single-tenant on SmartOffice; revisit with a KMS-backed
++  /// secrets table once a second client brings their own vendor credentials.
++  apiKeyEnv String?
++
++  timezone String?
++
++  /// Used to pre-select a provider when creating a new Device.
++  isDefault Boolean @default(false)
++
++  devices Device[]
++
++  createdAt DateTime @default(now())
+ }
+ 
+ /**

@@ -144,6 +144,16 @@ enum OnboardingFormStatus {
   SUBMITTED  /// Confirmed submitted and matched via webhook/polling.
 }
 
+/// Which biometric backend a Device is wired to. SmartOffice is the only
+/// vendor integration today (Patch A/B); MANUAL formalizes stores that have
+/// no biometric device at all. Add new values only once an adapter for that
+/// vendor actually exists (Patch D+) — see src/lib/biometric/.
+enum BiometricProviderType {
+  SMARTOFFICE
+  MANUAL
+  // Future: ESSL, ZKTECO, GENERIC_REST — add as adapters are built.
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CORE MODELS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +274,46 @@ model Device {
   /// silently stays NULL in Postgres, so this must start at 0 to ever count.
   attLogsCount Int       @default(0)
   createdAt    DateTime  @default(now())
+
+  /// Which biometric backend this device talks to. Every existing Device is
+  /// backfilled to the default SmartOffice config on migration — zero
+  /// behavior change on day one (see BiometricProviderConfig).
+  providerId String
+  provider   BiometricProviderConfig @relation(fields: [providerId], references: [id])
+
+  @@index([providerId])
+}
+
+/**
+ * Config row for a biometric backend a Device can be wired to (Section 2/3 of
+ * the biometric-provider-modularization spec). Provider selection is a
+ * per-device *data* decision (this table), not a code decision — onboarding a
+ * new vendor means implementing its adapter once and inserting a row here,
+ * with zero changes to onboarding/attendance/device route logic.
+ */
+model BiometricProviderConfig {
+  id   String                @id @default(cuid())
+  type BiometricProviderType
+
+  /// e.g. "SmartOffice — Primary", shown in device admin UI.
+  label String
+
+  baseUrl String?
+
+  /// Name of the env var holding the API key — NOT the key itself. Storing a
+  /// pointer instead of the secret avoids taking on secret-encryption-at-rest
+  /// scope while single-tenant on SmartOffice; revisit with a KMS-backed
+  /// secrets table once a second client brings their own vendor credentials.
+  apiKeyEnv String?
+
+  timezone String?
+
+  /// Used to pre-select a provider when creating a new Device.
+  isDefault Boolean @default(false)
+
+  devices Device[]
+
+  createdAt DateTime @default(now())
 }
 
 /**
