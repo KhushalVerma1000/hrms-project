@@ -77,6 +77,57 @@ export async function getProviderById(
 }
 
 /**
+ * Resolves the provider a given Device is wired to, looked up by the
+ * device's unique serial number rather than its internal id. Used by
+ * `queue/worker.ts`, whose SmartOfficeCommand payloads carry SmartOffice's
+ * own `SerialNumber` field, not a Device id.
+ *
+ * Returns null (not a throw) when no Device matches — callers decide what
+ * that means for them (e.g. a stale/unknown serial should fail the command
+ * rather than crash the worker loop).
+ */
+export async function getProviderBySerialNumber(
+  serialNumber: string,
+): Promise<{ provider: BiometricProvider; config: BiometricProviderConfig; deviceId: string } | null> {
+  const device = await prisma.device.findUnique({
+    where: { serialNumber },
+    include: { provider: true },
+  });
+  if (!device) return null;
+  return { provider: resolveProvider(device.provider), config: device.provider, deviceId: device.id };
+}
+
+/**
+ * Resolves providers for a comma-joined SerialNumber list (SmartOffice's own
+ * multi-device convention — see UploadUser/DeleteUser), grouped by which
+ * BiometricProviderConfig each serial's Device row is wired to. Today every
+ * Device points at the same single SmartOffice config, so this always
+ * collapses to one group — but grouping (rather than assuming one provider)
+ * is what keeps a single UPLOAD_USER/DELETE_USER command correct once a
+ * second vendor is actually in the mix (Patch D+).
+ *
+ * Serials with no matching Device row are silently omitted from the result;
+ * callers should treat an empty map as "nothing resolved."
+ */
+export async function getProvidersForSerialNumbers(
+  serialNumbers: string[],
+): Promise<Map<string, { provider: BiometricProvider; serialNumbers: string[] }>> {
+  const devices = await prisma.device.findMany({
+    where: { serialNumber: { in: serialNumbers } },
+    include: { provider: true },
+  });
+  const groups = new Map<string, { provider: BiometricProvider; serialNumbers: string[] }>();
+  for (const device of devices) {
+    const key = device.providerId;
+    if (!groups.has(key)) {
+      groups.set(key, { provider: resolveProvider(device.provider), serialNumbers: [] });
+    }
+    groups.get(key)!.serialNumbers.push(device.serialNumber);
+  }
+  return groups;
+}
+
+/**
  * Resolves the org's default provider — today effectively always the single
  * backfilled SmartOffice config (see migration 20260904090000). Callers that
  * don't yet have a principled per-store/per-device provider to resolve

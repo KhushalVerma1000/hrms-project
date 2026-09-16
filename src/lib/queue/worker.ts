@@ -2,7 +2,15 @@
  * SmartOffice command queue worker.
  *
  * Processes SmartOfficeCommand rows, dispatching each to the appropriate
- * SmartOffice endpoint with retry/backoff logic.
+ * biometric provider (via the facade — Patch C of the biometric provider
+ * modularization spec) with retry/backoff logic.
+ *
+ * Six command types (ADD_LOCATION, ADD_COMPANY, ADD_DEPARTMENT,
+ * ADD_DESIGNATION, ADD_GRADE, ADD_TEAM) are deliberately NOT routed through
+ * the facade — they're SmartOffice account/taxonomy setup calls with no
+ * equivalent concept for a device vendor, and stay directly on
+ * `smartoffice/client.ts`. See the doc comment at the top of
+ * `src/lib/biometric/types.ts` for the full rationale.
  *
  * This module is imported by the standalone worker process (src/worker/index.ts)
  * and should NOT be imported inside Next.js App Router pages/routes.
@@ -17,6 +25,9 @@ import {
 import { SmartOfficeError } from '@/lib/errors';
 import { isTerminalError } from '@/lib/smartoffice/types';
 import * as so from '@/lib/smartoffice/client';
+import * as facade from '@/lib/biometric/facade';
+import { getDefaultProvider } from '@/lib/biometric/registry';
+import type { BiometricResult } from '@/lib/biometric/types';
 import type { SmartOfficeCommand } from '@prisma/client';
 
 /** Compute the next retry timestamp based on attempt count. */
@@ -57,10 +68,21 @@ export async function recoverStuckCommands(): Promise<void> {
 }
 
 /**
+ * Every dispatch path below — whether it goes through the facade
+ * (BiometricResult) or straight to smartoffice/client.ts (SmartOfficeResult,
+ * for the 6 taxonomy command types) — converges on this shape so the
+ * success/failure handling further down stays a single code path, unchanged
+ * from before this patch.
+ */
+function toLegacyResult(r: BiometricResult<unknown>): { ok: boolean; message: string } {
+  return r.ok ? { ok: true, message: 'OK' } : { ok: false, message: r.message };
+}
+
+/**
  * Dispatches a single SmartOfficeCommand to the appropriate endpoint.
  */
 export async function dispatchCommand(cmd: SmartOfficeCommand): Promise<void> {
-  const payload = cmd.payload as Record<string, unknown>;
+  const payload = cmd.payload as Record<string, any>;
 
   await prisma.smartOfficeCommand.update({
     where: { id: cmd.id },
@@ -68,26 +90,84 @@ export async function dispatchCommand(cmd: SmartOfficeCommand): Promise<void> {
   });
 
   try {
-    let result;
+    let result: { ok: boolean; message: string };
 
     switch (cmd.commandType) {
-      case 'ADD_EMPLOYEE':
-        result = await so.addEmployee(payload as Parameters<typeof so.addEmployee>[0]);
+      case 'ADD_EMPLOYEE': {
+        const { config } = await getDefaultProvider();
+        result = toLegacyResult(
+          await facade.enrollEmployee(config.id, {
+            staffCode: payload.StaffCode,
+            staffName: payload.StaffName,
+            gender: payload.Gender,
+            status: payload.Status,
+            companyShortName: payload.CompanySName,
+            departmentShortName: payload.DepartmentSName,
+            locationName: payload.Location,
+            designation: payload.Designation,
+            grade: payload.Grade,
+            team: payload.Team,
+            dateOfJoining: payload.DOJ,
+            dateOfConfirmation: payload.DOC,
+            dateOfBirth: payload.DOB,
+            dateOfRelieving: payload.DOR,
+          }),
+        );
         break;
+      }
       case 'UPLOAD_USER':
-        result = await so.uploadUser(payload as Parameters<typeof so.uploadUser>[0]);
+        result = toLegacyResult(
+          await facade.uploadEmployeeToDeviceBySerials(payload.SerialNumber, {
+            employeeCode: payload.EmployeeCode,
+            employeeName: payload.EmployeeName,
+            cardNumber: payload.CardNumber,
+            verifyMode: payload.VerifyMode,
+            isFaceUpload: payload.IsFaceUpload,
+            isFingerprintUpload: payload.IsFPUpload,
+            isCardUpload: payload.IsCardUpload,
+            isBioPasswordUpload: payload.IsBioPasswordUpload,
+          }),
+        );
         break;
       case 'DELETE_USER':
-        result = await so.deleteUser(payload as Parameters<typeof so.deleteUser>[0]);
+        result = toLegacyResult(
+          await facade.removeEmployeeFromDeviceBySerials(payload.SerialNumber, {
+            employeeCode: payload.EmployeeCode,
+          }),
+        );
         break;
-      case 'DELETE_EMPLOYEE':
-        result = await so.deleteEmployee(payload as Parameters<typeof so.deleteEmployee>[0]);
+      case 'DELETE_EMPLOYEE': {
+        const { config } = await getDefaultProvider();
+        result = toLegacyResult(
+          await facade.deleteEmployee(config.id, { employeeCode: payload.EmployeeCode }),
+        );
         break;
+      }
       case 'ADD_BIOMETRIC':
-        result = await so.addBiometricDevice(payload as Parameters<typeof so.addBiometricDevice>[0]);
+        result = toLegacyResult(
+          await facade.addDeviceBySerial(payload.SerialNumber, { deviceName: payload.DeviceName }),
+        );
         break;
       case 'DELETE_BIOMETRIC':
-        result = await so.deleteBiometricDevice(payload as Parameters<typeof so.deleteBiometricDevice>[0]);
+        // The Device row is deleted synchronously in the same transaction
+        // that enqueues this command (see devices/actions.ts
+        // deleteDeviceAction) — by dispatch time there's no Device row left
+        // to resolve a provider from via SerialNumber, so providerId is
+        // captured in the payload at enqueue time instead.
+        if (!payload.providerId) {
+          result = {
+            ok: false,
+            message:
+              'DELETE_BIOMETRIC payload is missing providerId — this command was enqueued before ' +
+              'Patch C and cannot be routed to a provider automatically. Resolve manually on the Sync Issues screen.',
+          };
+        } else {
+          result = toLegacyResult(
+            await facade.removeDeviceForProvider(payload.providerId, {
+              serialNumber: payload.SerialNumber,
+            }),
+          );
+        }
         break;
       case 'ADD_LOCATION':
         result = await so.addLocation(payload as Parameters<typeof so.addLocation>[0]);
@@ -111,19 +191,40 @@ export async function dispatchCommand(cmd: SmartOfficeCommand): Promise<void> {
       case 'UNBLOCK_USER':
         // Same SmartOffice endpoint handles both — the payload's BlockUser
         // field (0 = block, 1 = unblock) determines behavior.
-        result = await so.blockUserInBiometric(payload as Parameters<typeof so.blockUserInBiometric>[0]);
+        result = toLegacyResult(
+          await facade.blockEmployeeBySerial(payload.SerialNumber, {
+            employeeCode: payload.EmployeeCode,
+            block: payload.BlockUser === 0,
+          }),
+        );
         break;
       case 'SET_USER_EXPIRATION':
-        result = await so.setUserExpiration(payload as Parameters<typeof so.setUserExpiration>[0]);
+        result = toLegacyResult(
+          await facade.setEmployeeExpirationBySerial(payload.SerialNumber, {
+            employeeCode: payload.EmployeeCode,
+            expirationDate: payload.ExpirationDate,
+          }),
+        );
         break;
       case 'CLEAR_LOGS':
-        result = await so.clearAllLogsFromDevice(payload as Parameters<typeof so.clearAllLogsFromDevice>[0]);
+        result = toLegacyResult(await facade.clearAllLogsBySerial(payload.SerialNumber));
         break;
       case 'CLEAR_LOGS_BY_TIME':
-        result = await so.clearLogsFromDeviceByTime(payload as Parameters<typeof so.clearLogsFromDeviceByTime>[0]);
+        result = toLegacyResult(
+          await facade.clearLogsByTimeBySerial(payload.SerialNumber, {
+            startTime: payload.StartTime,
+            endTime: payload.EndTime,
+          }),
+        );
         break;
       case 'TRIGGER_ENROLLMENT':
-        result = await so.triggerUserOnlineEnrollment(payload as Parameters<typeof so.triggerUserOnlineEnrollment>[0]);
+        result = toLegacyResult(
+          await facade.triggerRemoteEnrollmentBySerial(payload.SerialNumber, {
+            employeeCode: payload.EmployeeCode,
+            employeeName: payload.EmployeeName,
+            backupNumber: payload.backup_number,
+          }),
+        );
         break;
       default:
         throw new SmartOfficeError(`Unknown command type: ${cmd.commandType}`, true);

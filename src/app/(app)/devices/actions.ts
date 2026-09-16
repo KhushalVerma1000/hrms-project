@@ -6,6 +6,7 @@ import { can } from '@/lib/auth/can';
 import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
+import { getDefaultProvider } from '@/lib/biometric/registry';
 
 /**
  * Diagnostic: checks SmartOffice reachability + API key validity separately,
@@ -52,6 +53,14 @@ export async function addDeviceAction(data: {
   name: string;
   storeId: string;
   model?: string;
+  /**
+   * Which biometric backend this device is wired to. Defaults to the
+   * isDefault BiometricProviderConfig (effectively always SmartOffice
+   * today) so existing callers/forms that don't pass this yet keep working
+   * unchanged — a "Provider" select can populate it explicitly once a
+   * second provider config actually exists (spec Section 6).
+   */
+  providerId?: string;
 }) {
   const session = await auth();
   if (!session?.user) throw new Error('Unauthorized');
@@ -68,6 +77,8 @@ export async function addDeviceAction(data: {
   }
 
   try {
+    const providerId = data.providerId ?? (await getDefaultProvider()).config.id;
+
     const device = await prisma.$transaction(async (tx) => {
       const dev = await tx.device.create({
         data: {
@@ -75,6 +86,7 @@ export async function addDeviceAction(data: {
           name: data.name.trim(),
           storeId: data.storeId,
           model: data.model?.trim() || 'Standard Biometric',
+          providerId,
         },
       });
 
@@ -145,7 +157,11 @@ export async function deleteDeviceAction(deviceId: string) {
       });
       await enqueueCommand({
         commandType: 'DELETE_BIOMETRIC',
-        payload: { SerialNumber: device.serialNumber },
+        // providerId is captured here, while the Device row still exists —
+        // the row is deleted below in the same transaction, so by the time
+        // the worker dispatches this command asynchronously there's no
+        // Device row left to resolve a provider from (see queue/worker.ts).
+        payload: { SerialNumber: device.serialNumber, providerId: device.providerId },
         idempotencyKey: delBioKey,
         relatedType: 'Device',
         relatedId: device.id,

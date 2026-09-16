@@ -25,7 +25,7 @@
 
 import { prisma } from '@/lib/prisma';
 import { NotFoundError } from '@/lib/errors';
-import { resolveProvider, getProviderById } from './registry';
+import { resolveProvider, getProviderById, getProviderBySerialNumber, getProvidersForSerialNumbers } from './registry';
 import { UNSUPPORTED_BY_PROVIDER_CODE } from './types';
 import type {
   BiometricProvider,
@@ -37,6 +37,7 @@ import type {
   BlockEmployeeParams,
   SetExpirationParams,
   AddDeviceParams,
+  RemoveDeviceParams,
   GetDeviceLogsParams,
   NormalizedLogRecord,
   GetDeviceCommandsParams,
@@ -70,6 +71,29 @@ function unsupported<T = void>(methodName: string): BiometricResult<T> {
   };
 }
 
+async function resolveBySerial(serialNumber: string): Promise<{ provider: BiometricProvider; deviceId: string }> {
+  const resolved = await getProviderBySerialNumber(serialNumber);
+  if (!resolved) throw new NotFoundError('Device', serialNumber);
+  return resolved;
+}
+
+function aggregateVoidResults(results: BiometricResult<void>[]): BiometricResult<void> {
+  const failures = results.filter(
+    (r): r is Extract<BiometricResult<void>, { ok: false }> => !r.ok,
+  );
+  if (failures.length === 0) return { ok: true, data: undefined };
+  // If every failing group failed terminally, the whole call is terminal;
+  // if any group only hit a retryable/unreachable failure, the caller
+  // (queue/worker.ts) should still retry the command as a whole — a single
+  // SmartOfficeCommand row doesn't track partial per-device success today.
+  return {
+    ok: false,
+    terminal: failures.every((f) => f.terminal),
+    code: failures[0].code,
+    message: failures.map((f) => f.message).join('; '),
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider-scoped (no existing Device row to resolve against)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +120,38 @@ export async function addDevice(
 ): Promise<BiometricResult<void>> {
   const { provider } = await getProviderById(providerId);
   return provider.addDevice(params);
+}
+
+/**
+ * Removes a device by explicit providerId rather than deviceId. Needed
+ * because `deleteDeviceAction` deletes the Device row synchronously, in the
+ * same transaction that enqueues DELETE_BIOMETRIC — by the time this async
+ * command dispatches, there's no Device row left to resolve a provider from
+ * (see queue/worker.ts). The caller (worker) captures providerId in the
+ * command payload at enqueue time, while the row still exists.
+ */
+export async function removeDeviceForProvider(
+  providerId: string,
+  params: RemoveDeviceParams,
+): Promise<BiometricResult<void>> {
+  const { provider } = await getProviderById(providerId);
+  return provider.removeDevice(params);
+}
+
+/**
+ * Registers a device with its already-assigned provider, resolved by serial
+ * number rather than deviceId — used by queue/worker.ts for ADD_BIOMETRIC,
+ * where the payload carries SerialNumber/DeviceName in SmartOffice's own
+ * wire format. Unlike DELETE_BIOMETRIC, the Device row still exists at
+ * dispatch time here (addDeviceAction never deletes it), so serial-based
+ * lookup works.
+ */
+export async function addDeviceBySerial(
+  serialNumber: string,
+  params: Omit<AddDeviceParams, 'serialNumber'>,
+): Promise<BiometricResult<void>> {
+  const { provider } = await resolveBySerial(serialNumber);
+  return provider.addDevice({ ...params, serialNumber });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,4 +262,100 @@ export async function triggerRemoteEnrollment(
     return unsupported('triggerRemoteEnrollment');
   }
   return provider.triggerRemoteEnrollment({ ...params, serialNumber });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serial-number-scoped — for queue/worker.ts, whose SmartOfficeCommand
+// payloads carry SmartOffice's own SerialNumber field(s) rather than a
+// deviceId. Single-serial functions mirror the deviceId-scoped ones above;
+// the two *BySerials (plural) functions handle SmartOffice's
+// comma-joined-multi-device convention (UploadUser/DeleteUser) by grouping
+// per resolved provider — see registry.getProvidersForSerialNumbers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function blockEmployeeBySerial(
+  serialNumber: string,
+  params: Omit<BlockEmployeeParams, 'serialNumber'>,
+): Promise<BiometricResult<void>> {
+  const { provider } = await resolveBySerial(serialNumber);
+  return provider.blockEmployee({ ...params, serialNumber });
+}
+
+export async function setEmployeeExpirationBySerial(
+  serialNumber: string,
+  params: Omit<SetExpirationParams, 'serialNumber'>,
+): Promise<BiometricResult<void>> {
+  const { provider } = await resolveBySerial(serialNumber);
+  return provider.setEmployeeExpiration({ ...params, serialNumber });
+}
+
+export async function clearAllLogsBySerial(serialNumber: string): Promise<BiometricResult<void>> {
+  const { provider } = await resolveBySerial(serialNumber);
+  return provider.clearAllLogs({ serialNumber });
+}
+
+export async function clearLogsByTimeBySerial(
+  serialNumber: string,
+  params: Omit<ClearLogsByTimeParams, 'serialNumber'>,
+): Promise<BiometricResult<void>> {
+  const { provider } = await resolveBySerial(serialNumber);
+  if (!provider.capabilities.clearLogsByTime || !provider.clearLogsByTime) {
+    return unsupported('clearLogsByTime');
+  }
+  return provider.clearLogsByTime({ ...params, serialNumber });
+}
+
+export async function triggerRemoteEnrollmentBySerial(
+  serialNumber: string,
+  params: Omit<TriggerEnrollmentParams, 'serialNumber'>,
+): Promise<BiometricResult<void>> {
+  const { provider } = await resolveBySerial(serialNumber);
+  if (!provider.capabilities.remoteEnrollment || !provider.triggerRemoteEnrollment) {
+    return unsupported('triggerRemoteEnrollment');
+  }
+  return provider.triggerRemoteEnrollment({ ...params, serialNumber });
+}
+
+export async function uploadEmployeeToDeviceBySerials(
+  serialNumbers: string,
+  params: Omit<UploadEmployeeToDeviceParams, 'serialNumbers'>,
+): Promise<BiometricResult<void>> {
+  const serials = serialNumbers.split(',').map((s) => s.trim()).filter(Boolean);
+  const groups = await getProvidersForSerialNumbers(serials);
+  if (groups.size === 0) {
+    return {
+      ok: false,
+      terminal: true,
+      code: 'DEVICE_NOT_FOUND',
+      message: `No device found for serial number(s): ${serialNumbers}`,
+    };
+  }
+  const results = await Promise.all(
+    Array.from(groups.values()).map(({ provider, serialNumbers: groupSerials }) =>
+      provider.uploadEmployeeToDevice({ ...params, serialNumbers: groupSerials.join(',') }),
+    ),
+  );
+  return aggregateVoidResults(results);
+}
+
+export async function removeEmployeeFromDeviceBySerials(
+  serialNumbers: string,
+  params: Omit<RemoveEmployeeFromDeviceParams, 'serialNumbers'>,
+): Promise<BiometricResult<void>> {
+  const serials = serialNumbers.split(',').map((s) => s.trim()).filter(Boolean);
+  const groups = await getProvidersForSerialNumbers(serials);
+  if (groups.size === 0) {
+    return {
+      ok: false,
+      terminal: true,
+      code: 'DEVICE_NOT_FOUND',
+      message: `No device found for serial number(s): ${serialNumbers}`,
+    };
+  }
+  const results = await Promise.all(
+    Array.from(groups.values()).map(({ provider, serialNumbers: groupSerials }) =>
+      provider.removeEmployeeFromDevice({ ...params, serialNumbers: groupSerials.join(',') }),
+    ),
+  );
+  return aggregateVoidResults(results);
 }

@@ -1,15 +1,24 @@
 /**
  * Attendance sync job.
  *
- * Pulls device logs from SmartOffice and upserts into AttendanceLog.
+ * Pulls device logs via the biometric provider facade (Patch C of the
+ * biometric provider modularization spec) and upserts into AttendanceLog.
+ * Device-specific provider resolution (SmartOffice today) happens inside
+ * the facade — this file no longer knows or cares which vendor a given
+ * device is wired to.
+ *
  * SmartOffice timestamps are interpreted in SMARTOFFICE_TIMEZONE (default: Asia/Kolkata).
- * See src/lib/config.ts for the configurable timezone constant.
+ * See src/lib/config.ts for the configurable timezone constant. (Once a
+ * second vendor exists, per-device timezone may need to move onto
+ * BiometricProviderConfig — flagged here, not solved.)
  */
 
 import { prisma } from '@/lib/prisma';
-import { getDeviceLogs, formatSmartOfficeDate } from '@/lib/smartoffice/client';
+import * as facade from '@/lib/biometric/facade';
+// Pure date-formatting utility (not a vendor API call), reused as-is per
+// spec Section 2.4 — smartoffice/client.ts is untouched by this migration.
+import { formatSmartOfficeDate } from '@/lib/smartoffice/client';
 import { SMARTOFFICE_TIMEZONE, ATTENDANCE_SYNC_DEFAULT_LOOKBACK_DAYS } from '@/lib/config';
-import type { DeviceLogRecord } from '@/lib/smartoffice/types';
 import { fromZonedTime } from 'date-fns-tz';
 
 export interface AttendanceSyncResult {
@@ -82,39 +91,38 @@ export async function runAttendanceSync(): Promise<AttendanceSyncResult> {
 
       const toDate = new Date();
 
-      const soResult = await getDeviceLogs({
-        FromDate: formatSmartOfficeDate(fromDate),
-        ToDate: formatSmartOfficeDate(toDate),
-        SerialNumber: device.serialNumber,
+      const bioResult = await facade.getDeviceLogs(device.id, {
+        fromDate: formatSmartOfficeDate(fromDate),
+        toDate: formatSmartOfficeDate(toDate),
       });
 
-      if (!soResult.ok) {
-        result.errors.push({ serialNumber: device.serialNumber, error: soResult.message });
+      if (!bioResult.ok) {
+        result.errors.push({ serialNumber: device.serialNumber, error: bioResult.message });
         continue;
       }
 
-      const logs: DeviceLogRecord[] = Array.isArray(soResult.data) ? soResult.data : [];
+      const logs = bioResult.data;
 
       for (const log of logs) {
         await prisma.attendanceLog.upsert({
           where: {
             employeeCode_logDate_serialNumber: {
-              employeeCode: log.EmployeeCode,
-              logDate: parseSmartOfficeDate(log.LogDate),
-              serialNumber: log.SerialNumber,
+              employeeCode: log.employeeCode,
+              logDate: parseSmartOfficeDate(log.logDate),
+              serialNumber: log.serialNumber,
             },
           },
           update: {
-            punchDirection: log.PunchDirection,
-            temperature: log.Temperature,
+            punchDirection: log.punchDirection,
+            temperature: log.temperature,
             syncedAt: new Date(),
           },
           create: {
-            employeeCode: log.EmployeeCode,
-            logDate: parseSmartOfficeDate(log.LogDate),
-            serialNumber: log.SerialNumber,
-            punchDirection: log.PunchDirection,
-            temperature: log.Temperature,
+            employeeCode: log.employeeCode,
+            logDate: parseSmartOfficeDate(log.logDate),
+            serialNumber: log.serialNumber,
+            punchDirection: log.punchDirection,
+            temperature: log.temperature,
           },
         });
         result.logsUpserted++;
