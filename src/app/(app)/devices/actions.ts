@@ -6,7 +6,7 @@ import { can } from '@/lib/auth/can';
 import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import { testSmartOfficeConnection } from '@/lib/smartoffice/test-connection';
-import { getDefaultProvider } from '@/lib/biometric/registry';
+import { getDefaultProviderId } from '@/lib/biometric/facade';
 
 /**
  * Diagnostic: checks SmartOffice reachability + API key validity separately,
@@ -77,7 +77,7 @@ export async function addDeviceAction(data: {
   }
 
   try {
-    const providerId = data.providerId ?? (await getDefaultProvider()).config.id;
+    const providerId = data.providerId ?? (await getDefaultProviderId());
 
     const device = await prisma.$transaction(async (tx) => {
       const dev = await tx.device.create({

@@ -162,74 +162,80 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
         });
       }
 
-      // 4. Enqueue ADD_EMPLOYEE command
-      // Field names below must match SmartOffice's AddEmployee contract exactly
-      // (see SmartOfficeAPIDocumentation.pdf) — they intentionally do NOT mirror
-      // our internal Prisma field names.
-      const addEmpKey = deriveIdempotencyKey('ADD_EMPLOYEE', { employeeId: employee.id });
-      const addEmpCmd = await enqueueCommand({
-        commandType: 'ADD_EMPLOYEE',
-        payload: {
-          StaffCode: staffCode,
-          StaffName: employee.name,
-          Gender: employee.gender || undefined,
-          Status: 'Working',
-          CompanySName: storeForEmployee.warehouseType.name,
-          Location: storeForEmployee.name,
-          Designation: employee.designation,
-          Grade: employee.grade || undefined,
-          Team: employee.team || undefined,
-          DOJ: employee.dateOfJoining
-            ? employee.dateOfJoining.toISOString().split('T')[0]
-            : new Date().toISOString().split('T')[0],
-          DOB: input.dateOfBirth || undefined,
-        },
-        idempotencyKey: addEmpKey,
-        relatedType: 'Employee',
-        relatedId: employee.id,
-        createdBy: user.id,
-        tx,
-      });
+      // 4 & 5. Enqueue biometric enrollment commands — MANUAL-mode stores have
+      // no device to enroll on and no worker expected to ever process these,
+      // so skip enqueueing entirely rather than let stale commands pile up
+      // and fire unexpectedly whenever biometric sync is turned on for this
+      // store later. Field names below must match SmartOffice's AddEmployee
+      // contract exactly (see SmartOfficeAPIDocumentation.pdf) — they
+      // intentionally do NOT mirror our internal Prisma field names.
+      let addEmpCmd: { id: string } | null = null;
+      let uploadCmd: { id: string } | null = null;
 
-      // 5. Enqueue UPLOAD_USER or TRIGGER_ENROLLMENT command
-      let uploadCmd = null;
-      if (input.enrollmentMode === 'DIRECT_UPLOAD') {
-        const uploadKey = deriveIdempotencyKey('UPLOAD_USER', { employeeId: employee.id });
-        uploadCmd = await enqueueCommand({
-          commandType: 'UPLOAD_USER',
+      if (storeForEmployee.attendanceMode === 'BIOMETRIC') {
+        const addEmpKey = deriveIdempotencyKey('ADD_EMPLOYEE', { employeeId: employee.id });
+        addEmpCmd = await enqueueCommand({
+          commandType: 'ADD_EMPLOYEE',
           payload: {
-            EmployeeCode: staffCode,
-            EmployeeName: employee.name,
-            SerialNumber: input.deviceSerialNumber || '',
-            CardNumber: employee.cardNumber || '',
+            StaffCode: staffCode,
+            StaffName: employee.name,
+            Gender: employee.gender || undefined,
+            Status: 'Working',
+            CompanySName: storeForEmployee.warehouseType.name,
+            Location: storeForEmployee.name,
+            Designation: employee.designation,
+            Grade: employee.grade || undefined,
+            Team: employee.team || undefined,
+            DOJ: employee.dateOfJoining
+              ? employee.dateOfJoining.toISOString().split('T')[0]
+              : new Date().toISOString().split('T')[0],
+            DOB: input.dateOfBirth || undefined,
           },
-          idempotencyKey: uploadKey,
+          idempotencyKey: addEmpKey,
           relatedType: 'Employee',
           relatedId: employee.id,
           createdBy: user.id,
           tx,
         });
-      } else {
-        // NOTE: TriggerUserOnlineEnrollment requires SerialNumber per SmartOffice's
-        // docs, but REMOTE_LINK mode doesn't collect a target device up front
-        // (the whole point is the employee enrolls remotely without staff
-        // picking a device). If SmartOffice rejects a blank SerialNumber in
-        // practice, this needs a product decision — e.g. defaulting to the
-        // store's primary device, or collecting one at form-submission time.
-        const triggerKey = deriveIdempotencyKey('TRIGGER_ENROLLMENT', { employeeId: employee.id, enrollmentRound: 1 });
-        uploadCmd = await enqueueCommand({
-          commandType: 'TRIGGER_ENROLLMENT',
-          payload: {
-            SerialNumber: input.deviceSerialNumber || '',
-            EmployeeCode: staffCode,
-            EmployeeName: employee.name,
-          },
-          idempotencyKey: triggerKey,
-          relatedType: 'Employee',
-          relatedId: employee.id,
-          createdBy: user.id,
-          tx,
-        });
+
+        if (input.enrollmentMode === 'DIRECT_UPLOAD') {
+          const uploadKey = deriveIdempotencyKey('UPLOAD_USER', { employeeId: employee.id });
+          uploadCmd = await enqueueCommand({
+            commandType: 'UPLOAD_USER',
+            payload: {
+              EmployeeCode: staffCode,
+              EmployeeName: employee.name,
+              SerialNumber: input.deviceSerialNumber || '',
+              CardNumber: employee.cardNumber || '',
+            },
+            idempotencyKey: uploadKey,
+            relatedType: 'Employee',
+            relatedId: employee.id,
+            createdBy: user.id,
+            tx,
+          });
+        } else {
+          // NOTE: TriggerUserOnlineEnrollment requires SerialNumber per SmartOffice's
+          // docs, but REMOTE_LINK mode doesn't collect a target device up front
+          // (the whole point is the employee enrolls remotely without staff
+          // picking a device). If SmartOffice rejects a blank SerialNumber in
+          // practice, this needs a product decision — e.g. defaulting to the
+          // store's primary device, or collecting one at form-submission time.
+          const triggerKey = deriveIdempotencyKey('TRIGGER_ENROLLMENT', { employeeId: employee.id, enrollmentRound: 1 });
+          uploadCmd = await enqueueCommand({
+            commandType: 'TRIGGER_ENROLLMENT',
+            payload: {
+              SerialNumber: input.deviceSerialNumber || '',
+              EmployeeCode: staffCode,
+              EmployeeName: employee.name,
+            },
+            idempotencyKey: triggerKey,
+            relatedType: 'Employee',
+            relatedId: employee.id,
+            createdBy: user.id,
+            tx,
+          });
+        }
       }
 
       return { employee, createdUser, addEmpCmd, uploadCmd, staffCode };
@@ -257,7 +263,11 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
       employeeId: result.employee.id,
       staffCode: result.staffCode,
       googleFormUrl,
-      commandId: result.addEmpCmd.id,
+      // null for MANUAL-mode stores — no biometric command was enqueued, so
+      // there's nothing for getCommandStatusAction to poll. Callers should
+      // treat a null commandId as "onboarding complete, no sync needed"
+      // rather than an error or a stuck sync.
+      commandId: result.addEmpCmd?.id ?? null,
     };
   } catch (err: any) {
     return { ok: false, error: err.message || 'Failed to complete onboarding transaction.' };

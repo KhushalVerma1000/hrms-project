@@ -1,11 +1,12 @@
 /**
  * Attendance sync job.
  *
- * Pulls device logs via the biometric provider facade (Patch C of the
- * biometric provider modularization spec) and upserts into AttendanceLog.
- * Device-specific provider resolution (SmartOffice today) happens inside
- * the facade — this file no longer knows or cares which vendor a given
- * device is wired to.
+ * Pulls device logs via the biometric provider facade and upserts into
+ * AttendanceLog. Device-specific provider resolution (SmartOffice today)
+ * happens inside the facade — this file has no import outside
+ * @/lib/biometric/facade, @/lib/prisma, and @/lib/config; it doesn't know or
+ * care which vendor a given device is wired to. (eslint.config.mjs enforces
+ * this — see the no-restricted-imports block there.)
  *
  * SmartOffice timestamps are interpreted in SMARTOFFICE_TIMEZONE (default: Asia/Kolkata).
  * See src/lib/config.ts for the configurable timezone constant. (Once a
@@ -15,11 +16,13 @@
 
 import { prisma } from '@/lib/prisma';
 import * as facade from '@/lib/biometric/facade';
-// Pure date-formatting utility (not a vendor API call), reused as-is per
-// spec Section 2.4 — smartoffice/client.ts is untouched by this migration.
-import { formatSmartOfficeDate } from '@/lib/smartoffice/client';
 import { SMARTOFFICE_TIMEZONE, ATTENDANCE_SYNC_DEFAULT_LOOKBACK_DAYS } from '@/lib/config';
 import { fromZonedTime } from 'date-fns-tz';
+
+/** yyyy-MM-dd — inlined rather than imported from smartoffice/client.ts so
+ *  this file has zero imports outside the biometric facade (see module
+ *  boundary note above); it's one line, not worth a shared dependency. */
+const yyyyMMdd = (date: Date): string => date.toISOString().split('T')[0]!;
 
 export interface AttendanceSyncResult {
   devicesProcessed: number;
@@ -92,8 +95,8 @@ export async function runAttendanceSync(): Promise<AttendanceSyncResult> {
       const toDate = new Date();
 
       const bioResult = await facade.getDeviceLogs(device.id, {
-        fromDate: formatSmartOfficeDate(fromDate),
-        toDate: formatSmartOfficeDate(toDate),
+        fromDate: yyyyMMdd(fromDate),
+        toDate: yyyyMMdd(toDate),
       });
 
       if (!bioResult.ok) {

@@ -1,0 +1,261 @@
+diff --git a/prisma/migrations/20260916100000_default_manual_attendance/migration.sql b/prisma/migrations/20260916100000_default_manual_attendance/migration.sql
+new file mode 100644
+index 0000000..ecd4f2b
+--- /dev/null
++++ b/prisma/migrations/20260916100000_default_manual_attendance/migration.sql
+@@ -0,0 +1,7 @@
++-- AlterTable
++-- Only changes the default applied to NEW rows going forward — existing
++-- Store rows keep whatever attendanceMode they already have (e.g. the
++-- seeded Saket/BIOMETRIC demo store is untouched). The product should work
++-- fully standalone (MANUAL) unless a store deliberately opts into
++-- biometric; see the paired change in stores/actions.ts.
++ALTER TABLE "Store" ALTER COLUMN "attendanceMode" SET DEFAULT 'MANUAL';
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 91c35d2..64a506e 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -236,7 +236,7 @@ model Store {
+   /// BIOMETRIC (default, synced from SmartOffice) or MANUAL (no device —
+   /// Manager/SI enter attendance via ManualAttendanceEntry below). Editable
+   /// after creation by Admin/Client if the store's hardware situation changes.
+-  attendanceMode AttendanceMode @default(BIOMETRIC)
++  attendanceMode AttendanceMode @default(MANUAL)
+ 
+   address        String?
+   latitude       Float?
+diff --git a/src/app/(app)/employees/actions.ts b/src/app/(app)/employees/actions.ts
+index 60c8062..4ab951b 100644
+--- a/src/app/(app)/employees/actions.ts
++++ b/src/app/(app)/employees/actions.ts
+@@ -289,13 +289,33 @@ export async function hardDeleteEmployeeAction(employeeId: string) {
+     const serialNumberList = storeDevices.map((d) => d.serialNumber).join(',');
+ 
+     await prisma.$transaction(async (tx) => {
+-      // Enqueue DELETE_USER (un-enrolls from the physical device(s))...
+-      if (serialNumberList) {
+-        const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
++      // Skip entirely for MANUAL-mode stores — there's no device to
++      // un-enroll from and no SmartOffice employee record to remove, so
++      // enqueueing here would just leave permanently-unprocessable commands
++      // sitting in the queue. (DELETE_USER already self-gated via
++      // serialNumberList being empty; DELETE_EMPLOYEE did not — gate both
++      // explicitly and consistently on the store's actual mode.)
++      if (employee.store.attendanceMode === 'BIOMETRIC') {
++        // Enqueue DELETE_USER (un-enrolls from the physical device(s))...
++        if (serialNumberList) {
++          const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
++          await enqueueCommand({
++            commandType: 'DELETE_USER',
++            payload: { EmployeeCode: employee.staffCode, SerialNumber: serialNumberList },
++            idempotencyKey: delUserKey,
++            relatedType: 'Employee',
++            relatedId: employee.id,
++            createdBy: user.id,
++            tx,
++          });
++        }
++
++        // ...and DELETE_EMPLOYEE (removes the employee record from SmartOffice itself).
++        const delEmpKey = deriveIdempotencyKey('DELETE_EMPLOYEE', { employeeId: employee.id });
+         await enqueueCommand({
+-          commandType: 'DELETE_USER',
+-          payload: { EmployeeCode: employee.staffCode, SerialNumber: serialNumberList },
+-          idempotencyKey: delUserKey,
++          commandType: 'DELETE_EMPLOYEE',
++          payload: { EmployeeCode: employee.staffCode },
++          idempotencyKey: delEmpKey,
+           relatedType: 'Employee',
+           relatedId: employee.id,
+           createdBy: user.id,
+@@ -303,18 +323,6 @@ export async function hardDeleteEmployeeAction(employeeId: string) {
+         });
+       }
+ 
+-      // ...and DELETE_EMPLOYEE (removes the employee record from SmartOffice itself).
+-      const delEmpKey = deriveIdempotencyKey('DELETE_EMPLOYEE', { employeeId: employee.id });
+-      await enqueueCommand({
+-        commandType: 'DELETE_EMPLOYEE',
+-        payload: { EmployeeCode: employee.staffCode },
+-        idempotencyKey: delEmpKey,
+-        relatedType: 'Employee',
+-        relatedId: employee.id,
+-        createdBy: user.id,
+-        tx,
+-      });
+-
+       // If linked user account exists, delete linked user row
+       if (employee.linkedUser) {
+         await tx.user.delete({ where: { id: employee.linkedUser.id } });
+diff --git a/src/app/(app)/onboarding/actions.ts b/src/app/(app)/onboarding/actions.ts
+index ba74b1b..ca9dcf8 100644
+--- a/src/app/(app)/onboarding/actions.ts
++++ b/src/app/(app)/onboarding/actions.ts
+@@ -162,74 +162,80 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+         });
+       }
+ 
+-      // 4. Enqueue ADD_EMPLOYEE command
+-      // Field names below must match SmartOffice's AddEmployee contract exactly
+-      // (see SmartOfficeAPIDocumentation.pdf) — they intentionally do NOT mirror
+-      // our internal Prisma field names.
+-      const addEmpKey = deriveIdempotencyKey('ADD_EMPLOYEE', { employeeId: employee.id });
+-      const addEmpCmd = await enqueueCommand({
+-        commandType: 'ADD_EMPLOYEE',
+-        payload: {
+-          StaffCode: staffCode,
+-          StaffName: employee.name,
+-          Gender: employee.gender || undefined,
+-          Status: 'Working',
+-          CompanySName: storeForEmployee.warehouseType.name,
+-          Location: storeForEmployee.name,
+-          Designation: employee.designation,
+-          Grade: employee.grade || undefined,
+-          Team: employee.team || undefined,
+-          DOJ: employee.dateOfJoining
+-            ? employee.dateOfJoining.toISOString().split('T')[0]
+-            : new Date().toISOString().split('T')[0],
+-          DOB: input.dateOfBirth || undefined,
+-        },
+-        idempotencyKey: addEmpKey,
+-        relatedType: 'Employee',
+-        relatedId: employee.id,
+-        createdBy: user.id,
+-        tx,
+-      });
+-
+-      // 5. Enqueue UPLOAD_USER or TRIGGER_ENROLLMENT command
+-      let uploadCmd = null;
+-      if (input.enrollmentMode === 'DIRECT_UPLOAD') {
+-        const uploadKey = deriveIdempotencyKey('UPLOAD_USER', { employeeId: employee.id });
+-        uploadCmd = await enqueueCommand({
+-          commandType: 'UPLOAD_USER',
++      // 4 & 5. Enqueue biometric enrollment commands — MANUAL-mode stores have
++      // no device to enroll on and no worker expected to ever process these,
++      // so skip enqueueing entirely rather than let stale commands pile up
++      // and fire unexpectedly whenever biometric sync is turned on for this
++      // store later. Field names below must match SmartOffice's AddEmployee
++      // contract exactly (see SmartOfficeAPIDocumentation.pdf) — they
++      // intentionally do NOT mirror our internal Prisma field names.
++      let addEmpCmd: { id: string } | null = null;
++      let uploadCmd: { id: string } | null = null;
++
++      if (storeForEmployee.attendanceMode === 'BIOMETRIC') {
++        const addEmpKey = deriveIdempotencyKey('ADD_EMPLOYEE', { employeeId: employee.id });
++        addEmpCmd = await enqueueCommand({
++          commandType: 'ADD_EMPLOYEE',
+           payload: {
+-            EmployeeCode: staffCode,
+-            EmployeeName: employee.name,
+-            SerialNumber: input.deviceSerialNumber || '',
+-            CardNumber: employee.cardNumber || '',
++            StaffCode: staffCode,
++            StaffName: employee.name,
++            Gender: employee.gender || undefined,
++            Status: 'Working',
++            CompanySName: storeForEmployee.warehouseType.name,
++            Location: storeForEmployee.name,
++            Designation: employee.designation,
++            Grade: employee.grade || undefined,
++            Team: employee.team || undefined,
++            DOJ: employee.dateOfJoining
++              ? employee.dateOfJoining.toISOString().split('T')[0]
++              : new Date().toISOString().split('T')[0],
++            DOB: input.dateOfBirth || undefined,
+           },
+-          idempotencyKey: uploadKey,
+-          relatedType: 'Employee',
+-          relatedId: employee.id,
+-          createdBy: user.id,
+-          tx,
+-        });
+-      } else {
+-        // NOTE: TriggerUserOnlineEnrollment requires SerialNumber per SmartOffice's
+-        // docs, but REMOTE_LINK mode doesn't collect a target device up front
+-        // (the whole point is the employee enrolls remotely without staff
+-        // picking a device). If SmartOffice rejects a blank SerialNumber in
+-        // practice, this needs a product decision — e.g. defaulting to the
+-        // store's primary device, or collecting one at form-submission time.
+-        const triggerKey = deriveIdempotencyKey('TRIGGER_ENROLLMENT', { employeeId: employee.id, enrollmentRound: 1 });
+-        uploadCmd = await enqueueCommand({
+-          commandType: 'TRIGGER_ENROLLMENT',
+-          payload: {
+-            SerialNumber: input.deviceSerialNumber || '',
+-            EmployeeCode: staffCode,
+-            EmployeeName: employee.name,
+-          },
+-          idempotencyKey: triggerKey,
++          idempotencyKey: addEmpKey,
+           relatedType: 'Employee',
+           relatedId: employee.id,
+           createdBy: user.id,
+           tx,
+         });
++
++        if (input.enrollmentMode === 'DIRECT_UPLOAD') {
++          const uploadKey = deriveIdempotencyKey('UPLOAD_USER', { employeeId: employee.id });
++          uploadCmd = await enqueueCommand({
++            commandType: 'UPLOAD_USER',
++            payload: {
++              EmployeeCode: staffCode,
++              EmployeeName: employee.name,
++              SerialNumber: input.deviceSerialNumber || '',
++              CardNumber: employee.cardNumber || '',
++            },
++            idempotencyKey: uploadKey,
++            relatedType: 'Employee',
++            relatedId: employee.id,
++            createdBy: user.id,
++            tx,
++          });
++        } else {
++          // NOTE: TriggerUserOnlineEnrollment requires SerialNumber per SmartOffice's
++          // docs, but REMOTE_LINK mode doesn't collect a target device up front
++          // (the whole point is the employee enrolls remotely without staff
++          // picking a device). If SmartOffice rejects a blank SerialNumber in
++          // practice, this needs a product decision — e.g. defaulting to the
++          // store's primary device, or collecting one at form-submission time.
++          const triggerKey = deriveIdempotencyKey('TRIGGER_ENROLLMENT', { employeeId: employee.id, enrollmentRound: 1 });
++          uploadCmd = await enqueueCommand({
++            commandType: 'TRIGGER_ENROLLMENT',
++            payload: {
++              SerialNumber: input.deviceSerialNumber || '',
++              EmployeeCode: staffCode,
++              EmployeeName: employee.name,
++            },
++            idempotencyKey: triggerKey,
++            relatedType: 'Employee',
++            relatedId: employee.id,
++            createdBy: user.id,
++            tx,
++          });
++        }
+       }
+ 
+       return { employee, createdUser, addEmpCmd, uploadCmd, staffCode };
+@@ -257,7 +263,11 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+       employeeId: result.employee.id,
+       staffCode: result.staffCode,
+       googleFormUrl,
+-      commandId: result.addEmpCmd.id,
++      // null for MANUAL-mode stores — no biometric command was enqueued, so
++      // there's nothing for getCommandStatusAction to poll. Callers should
++      // treat a null commandId as "onboarding complete, no sync needed"
++      // rather than an error or a stuck sync.
++      commandId: result.addEmpCmd?.id ?? null,
+     };
+   } catch (err: any) {
+     return { ok: false, error: err.message || 'Failed to complete onboarding transaction.' };
+diff --git a/src/app/(app)/stores/actions.ts b/src/app/(app)/stores/actions.ts
+index 97c5ddc..a6d959f 100644
+--- a/src/app/(app)/stores/actions.ts
++++ b/src/app/(app)/stores/actions.ts
+@@ -204,7 +204,7 @@ export async function createStoreAction(data: {
+           externalStoreCode: data.externalStoreCode?.trim() || null,
+           address: data.address?.trim() || null,
+           geofenceRadius: data.geofenceRadius || 200,
+-          attendanceMode: data.attendanceMode || 'BIOMETRIC',
++          attendanceMode: data.attendanceMode || 'MANUAL',
+         },
+       });
+     });

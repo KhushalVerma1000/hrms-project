@@ -289,31 +289,39 @@ export async function hardDeleteEmployeeAction(employeeId: string) {
     const serialNumberList = storeDevices.map((d) => d.serialNumber).join(',');
 
     await prisma.$transaction(async (tx) => {
-      // Enqueue DELETE_USER (un-enrolls from the physical device(s))...
-      if (serialNumberList) {
-        const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
+      // Skip entirely for MANUAL-mode stores — there's no device to
+      // un-enroll from and no SmartOffice employee record to remove, so
+      // enqueueing here would just leave permanently-unprocessable commands
+      // sitting in the queue. (DELETE_USER already self-gated via
+      // serialNumberList being empty; DELETE_EMPLOYEE did not — gate both
+      // explicitly and consistently on the store's actual mode.)
+      if (employee.store.attendanceMode === 'BIOMETRIC') {
+        // Enqueue DELETE_USER (un-enrolls from the physical device(s))...
+        if (serialNumberList) {
+          const delUserKey = deriveIdempotencyKey('DELETE_USER', { employeeId: employee.id });
+          await enqueueCommand({
+            commandType: 'DELETE_USER',
+            payload: { EmployeeCode: employee.staffCode, SerialNumber: serialNumberList },
+            idempotencyKey: delUserKey,
+            relatedType: 'Employee',
+            relatedId: employee.id,
+            createdBy: user.id,
+            tx,
+          });
+        }
+
+        // ...and DELETE_EMPLOYEE (removes the employee record from SmartOffice itself).
+        const delEmpKey = deriveIdempotencyKey('DELETE_EMPLOYEE', { employeeId: employee.id });
         await enqueueCommand({
-          commandType: 'DELETE_USER',
-          payload: { EmployeeCode: employee.staffCode, SerialNumber: serialNumberList },
-          idempotencyKey: delUserKey,
+          commandType: 'DELETE_EMPLOYEE',
+          payload: { EmployeeCode: employee.staffCode },
+          idempotencyKey: delEmpKey,
           relatedType: 'Employee',
           relatedId: employee.id,
           createdBy: user.id,
           tx,
         });
       }
-
-      // ...and DELETE_EMPLOYEE (removes the employee record from SmartOffice itself).
-      const delEmpKey = deriveIdempotencyKey('DELETE_EMPLOYEE', { employeeId: employee.id });
-      await enqueueCommand({
-        commandType: 'DELETE_EMPLOYEE',
-        payload: { EmployeeCode: employee.staffCode },
-        idempotencyKey: delEmpKey,
-        relatedType: 'Employee',
-        relatedId: employee.id,
-        createdBy: user.id,
-        tx,
-      });
 
       // If linked user account exists, delete linked user row
       if (employee.linkedUser) {

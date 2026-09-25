@@ -25,7 +25,7 @@
 
 import { prisma } from '@/lib/prisma';
 import { NotFoundError } from '@/lib/errors';
-import { resolveProvider, getProviderById, getProviderBySerialNumber, getProvidersForSerialNumbers } from './registry';
+import { resolveProvider, getProviderById, getProviderBySerialNumber, getProvidersForSerialNumbers, getDefaultProvider } from './registry';
 import { UNSUPPORTED_BY_PROVIDER_CODE } from './types';
 import type {
   BiometricProvider,
@@ -120,6 +120,18 @@ export async function addDevice(
 ): Promise<BiometricResult<void>> {
   const { provider } = await getProviderById(providerId);
   return provider.addDevice(params);
+}
+
+/**
+ * The id of the org's default provider (today, effectively always the single
+ * backfilled SmartOffice config). For callers like addDeviceAction that need
+ * to default a new Device's providerId without importing registry.ts
+ * directly — facade.ts stays the one import surface outside the biometric
+ * module (see eslint.config.mjs).
+ */
+export async function getDefaultProviderId(): Promise<string> {
+  const { config } = await getDefaultProvider();
+  return config.id;
 }
 
 /**

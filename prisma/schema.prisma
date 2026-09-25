@@ -236,7 +236,7 @@ model Store {
   /// BIOMETRIC (default, synced from SmartOffice) or MANUAL (no device —
   /// Manager/SI enter attendance via ManualAttendanceEntry below). Editable
   /// after creation by Admin/Client if the store's hardware situation changes.
-  attendanceMode AttendanceMode @default(BIOMETRIC)
+  attendanceMode AttendanceMode @default(MANUAL)
 
   address        String?
   latitude       Float?

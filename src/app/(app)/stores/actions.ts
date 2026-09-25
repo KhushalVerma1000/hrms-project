@@ -204,7 +204,7 @@ export async function createStoreAction(data: {
           externalStoreCode: data.externalStoreCode?.trim() || null,
           address: data.address?.trim() || null,
           geofenceRadius: data.geofenceRadius || 200,
-          attendanceMode: data.attendanceMode || 'BIOMETRIC',
+          attendanceMode: data.attendanceMode || 'MANUAL',
         },
       });
     });
