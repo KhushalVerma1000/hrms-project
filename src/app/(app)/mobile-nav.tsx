@@ -5,6 +5,7 @@ import { Menu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { NavLink, type NavItem } from './nav-link';
+import { LogoutButton } from './logout-button';
 
 export function MobileNav({
   navItems,
@@ -46,7 +47,7 @@ export function MobileNav({
               ))}
             </nav>
 
-            <div className="p-4 border-t border-slate-800 bg-slate-950/40">
+            <div className="p-4 border-t border-slate-800 bg-slate-950/40 space-y-3">
               <div className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded-full bg-primary/20 border border-primary/30 flex items-center justify-center font-bold text-xs text-primary shrink-0">
                   {userName.charAt(0).toUpperCase()}
@@ -56,6 +57,7 @@ export function MobileNav({
                   <p className="text-[11px] text-slate-400 truncate">{userEmail}</p>
                 </div>
               </div>
+              <LogoutButton />
             </div>
           </SheetContent>
         </Sheet>

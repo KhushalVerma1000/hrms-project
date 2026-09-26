@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { can } from '@/lib/auth/can';
 import { NavLink, type NavItem } from './nav-link';
 import { MobileNav } from './mobile-nav';
+import { LogoutButton } from './logout-button';
 
 export default async function AppLayout({
   children,
@@ -61,7 +62,7 @@ export default async function AppLayout({
             ))}
           </nav>
 
-          <div className="p-4 border-t border-slate-800 bg-slate-950/40">
+          <div className="p-4 border-t border-slate-800 bg-slate-950/40 space-y-3">
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-primary/20 border border-primary/30 flex items-center justify-center font-bold text-xs text-primary">
                 {session.user.name?.charAt(0).toUpperCase()}
@@ -71,6 +72,7 @@ export default async function AppLayout({
                 <p className="text-[11px] text-slate-400 truncate">{session.user.email}</p>
               </div>
             </div>
+            <LogoutButton />
           </div>
         </aside>
 
