@@ -1,6 +1,8 @@
 import { auth } from '@/auth';
 import { redirect } from 'next/navigation';
 import { can } from '@/lib/auth/can';
+import { NavLink, type NavItem } from './nav-link';
+import { MobileNav } from './mobile-nav';
 
 export default async function AppLayout({
   children,
@@ -16,10 +18,28 @@ export default async function AppLayout({
   const canCsvUpload = can(session, 'attendance:csvUpload', { storeId: session.user.storeId });
   const canManageDeadlines = can(session, 'attendance:deadlinePolicy:manage');
   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
+  const canManageDevices = can(session, 'device:manage', { clientId: session.user.clientId });
+  const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
+  const canViewSyncIssues = can(session, 'syncIssues:view', {});
+
+  const navItems: NavItem[] = [
+    { href: '/dashboard', label: 'Dashboard', icon: '📊' },
+    ...(canViewAttendance ? [{ href: '/attendance', label: 'Attendance Logs', icon: '🕒' }] : []),
+    ...(canManualAttendance ? [{ href: '/attendance/manual', label: 'Manual Attendance', icon: '📝' }] : []),
+    ...(canCsvUpload ? [{ href: '/attendance/upload', label: 'Attendance Upload', icon: '📤' }] : []),
+    ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),
+    { href: '/onboarding', label: 'Onboarding Wizard', icon: '✨' },
+    { href: '/onboarding/pending-forms', label: 'Pending Forms', icon: '📋' },
+    { href: '/employees', label: 'Employee Directory', icon: '👥' },
+    ...(canManageStores ? [{ href: '/stores', label: 'Stores & Brands', icon: '🏬' }] : []),
+    ...(canManageDevices ? [{ href: '/devices', label: 'Biometric Devices', icon: '📱' }] : []),
+    ...(canManageUsers ? [{ href: '/users', label: 'App Users & Roles', icon: '🛡️' }] : []),
+    ...(canViewSyncIssues ? [{ href: '/sync-issues', label: 'SmartOffice Sync Issues', icon: '⚡' }] : []),
+  ];
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-900">
-      <div className="flex min-h-screen">
+      <div className="flex min-h-screen flex-col lg:flex-row">
         <aside className="w-64 min-h-screen bg-slate-900 border-r border-slate-800 hidden lg:flex flex-col">
           <div className="p-6 border-b border-slate-800">
             <div className="flex items-center gap-3">
@@ -36,35 +56,9 @@ export default async function AppLayout({
           </div>
 
           <nav className="flex-1 p-4 space-y-1.5">
-            <NavLink href="/dashboard" label="Dashboard" icon="📊" />
-            
-            {canViewAttendance && (
-              <NavLink href="/attendance" label="Attendance Logs" icon="🕒" />
-            )}
-
-            {canManualAttendance && (
-              <NavLink href="/attendance/manual" label="Manual Attendance" icon="📝" />
-            )}
-
-            {canCsvUpload && (
-              <NavLink href="/attendance/upload" label="Attendance Upload" icon="📤" />
-            )}
-
-            {canManageDeadlines && (
-              <NavLink href="/attendance/deadlines" label="Attendance Deadlines" icon="⏰" />
-            )}
-
-            <NavLink href="/onboarding" label="Onboarding Wizard" icon="✨" />
-            <NavLink href="/onboarding/pending-forms" label="Pending Forms" icon="📋" />
-            <NavLink href="/employees" label="Employee Directory" icon="👥" />
-
-            {canManageStores && (
-              <NavLink href="/stores" label="Stores & Brands" icon="🏬" />
-            )}
-
-            <NavLink href="/devices" label="Biometric Devices" icon="📱" />
-            <NavLink href="/users" label="App Users & Roles" icon="🛡️" />
-            <NavLink href="/sync-issues" label="SmartOffice Sync Issues" icon="⚡" />
+            {navItems.map((item) => (
+              <NavLink key={item.href} {...item} />
+            ))}
           </nav>
 
           <div className="p-4 border-t border-slate-800 bg-slate-950/40">
@@ -80,22 +74,17 @@ export default async function AppLayout({
           </div>
         </aside>
 
-        <main className="flex-1 overflow-auto bg-slate-50 dark:bg-slate-950">
+        <MobileNav
+          navItems={navItems}
+          userName={session.user.name ?? ''}
+          userEmail={session.user.email ?? ''}
+          userRole={userRole}
+        />
+
+        <main className="flex-1 min-w-0 overflow-auto bg-slate-50 dark:bg-slate-950">
           {children}
         </main>
       </div>
     </div>
-  );
-}
-
-function NavLink({ href, label, icon }: { href: string; label: string; icon: string }) {
-  return (
-    <a
-      href={href}
-      className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-all text-sm font-medium"
-    >
-      <span className="text-base">{icon}</span>
-      <span>{label}</span>
-    </a>
   );
 }

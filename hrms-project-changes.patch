@@ -1,0 +1,437 @@
+diff --git a/src/app/(app)/devices/page.tsx b/src/app/(app)/devices/page.tsx
+index cf594db..9ae93c0 100644
+--- a/src/app/(app)/devices/page.tsx
++++ b/src/app/(app)/devices/page.tsx
+@@ -1,5 +1,6 @@
+ import { auth } from '@/auth';
+ import { redirect } from 'next/navigation';
++import { can } from '@/lib/auth/can';
+ import { DeviceManagement } from '@/components/devices/DeviceManagement';
+ 
+ export default async function DevicesPage() {
+@@ -7,6 +8,9 @@ export default async function DevicesPage() {
+   if (!session?.user) {
+     redirect('/login');
+   }
++  if (!can(session, 'device:manage', { clientId: session.user.clientId })) {
++    redirect('/dashboard');
++  }
+ 
+   return (
+     <div className="container mx-auto py-6 px-4">
+diff --git a/src/app/(app)/layout.tsx b/src/app/(app)/layout.tsx
+index ca50169..7986bcc 100644
+--- a/src/app/(app)/layout.tsx
++++ b/src/app/(app)/layout.tsx
+@@ -1,6 +1,9 @@
+ import { auth } from '@/auth';
+ import { redirect } from 'next/navigation';
+ import { can } from '@/lib/auth/can';
++import { NavLink, type NavItem } from './nav-link';
++import { MobileNav } from './mobile-nav';
++import { LogoutButton } from './logout-button';
+ 
+ export default async function AppLayout({
+   children,
+@@ -16,10 +19,28 @@ export default async function AppLayout({
+   const canCsvUpload = can(session, 'attendance:csvUpload', { storeId: session.user.storeId });
+   const canManageDeadlines = can(session, 'attendance:deadlinePolicy:manage');
+   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
++  const canManageDevices = can(session, 'device:manage', { clientId: session.user.clientId });
++  const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
++  const canViewSyncIssues = can(session, 'syncIssues:view', {});
++
++  const navItems: NavItem[] = [
++    { href: '/dashboard', label: 'Dashboard', icon: '📊' },
++    ...(canViewAttendance ? [{ href: '/attendance', label: 'Attendance Logs', icon: '🕒' }] : []),
++    ...(canManualAttendance ? [{ href: '/attendance/manual', label: 'Manual Attendance', icon: '📝' }] : []),
++    ...(canCsvUpload ? [{ href: '/attendance/upload', label: 'Attendance Upload', icon: '📤' }] : []),
++    ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),
++    { href: '/onboarding', label: 'Onboarding Wizard', icon: '✨' },
++    { href: '/onboarding/pending-forms', label: 'Pending Forms', icon: '📋' },
++    { href: '/employees', label: 'Employee Directory', icon: '👥' },
++    ...(canManageStores ? [{ href: '/stores', label: 'Stores & Brands', icon: '🏬' }] : []),
++    ...(canManageDevices ? [{ href: '/devices', label: 'Biometric Devices', icon: '📱' }] : []),
++    ...(canManageUsers ? [{ href: '/users', label: 'App Users & Roles', icon: '🛡️' }] : []),
++    ...(canViewSyncIssues ? [{ href: '/sync-issues', label: 'SmartOffice Sync Issues', icon: '⚡' }] : []),
++  ];
+ 
+   return (
+     <div className="min-h-screen bg-slate-50 dark:bg-slate-900">
+-      <div className="flex min-h-screen">
++      <div className="flex min-h-screen flex-col lg:flex-row">
+         <aside className="w-64 min-h-screen bg-slate-900 border-r border-slate-800 hidden lg:flex flex-col">
+           <div className="p-6 border-b border-slate-800">
+             <div className="flex items-center gap-3">
+@@ -36,38 +57,12 @@ export default async function AppLayout({
+           </div>
+ 
+           <nav className="flex-1 p-4 space-y-1.5">
+-            <NavLink href="/dashboard" label="Dashboard" icon="📊" />
+-            
+-            {canViewAttendance && (
+-              <NavLink href="/attendance" label="Attendance Logs" icon="🕒" />
+-            )}
+-
+-            {canManualAttendance && (
+-              <NavLink href="/attendance/manual" label="Manual Attendance" icon="📝" />
+-            )}
+-
+-            {canCsvUpload && (
+-              <NavLink href="/attendance/upload" label="Attendance Upload" icon="📤" />
+-            )}
+-
+-            {canManageDeadlines && (
+-              <NavLink href="/attendance/deadlines" label="Attendance Deadlines" icon="⏰" />
+-            )}
+-
+-            <NavLink href="/onboarding" label="Onboarding Wizard" icon="✨" />
+-            <NavLink href="/onboarding/pending-forms" label="Pending Forms" icon="📋" />
+-            <NavLink href="/employees" label="Employee Directory" icon="👥" />
+-
+-            {canManageStores && (
+-              <NavLink href="/stores" label="Stores & Brands" icon="🏬" />
+-            )}
+-
+-            <NavLink href="/devices" label="Biometric Devices" icon="📱" />
+-            <NavLink href="/users" label="App Users & Roles" icon="🛡️" />
+-            <NavLink href="/sync-issues" label="SmartOffice Sync Issues" icon="⚡" />
++            {navItems.map((item) => (
++              <NavLink key={item.href} {...item} />
++            ))}
+           </nav>
+ 
+-          <div className="p-4 border-t border-slate-800 bg-slate-950/40">
++          <div className="p-4 border-t border-slate-800 bg-slate-950/40 space-y-3">
+             <div className="flex items-center gap-3">
+               <div className="w-8 h-8 rounded-full bg-primary/20 border border-primary/30 flex items-center justify-center font-bold text-xs text-primary">
+                 {session.user.name?.charAt(0).toUpperCase()}
+@@ -77,25 +72,21 @@ export default async function AppLayout({
+                 <p className="text-[11px] text-slate-400 truncate">{session.user.email}</p>
+               </div>
+             </div>
++            <LogoutButton />
+           </div>
+         </aside>
+ 
+-        <main className="flex-1 overflow-auto bg-slate-50 dark:bg-slate-950">
++        <MobileNav
++          navItems={navItems}
++          userName={session.user.name ?? ''}
++          userEmail={session.user.email ?? ''}
++          userRole={userRole}
++        />
++
++        <main className="flex-1 min-w-0 overflow-auto bg-slate-50 dark:bg-slate-950">
+           {children}
+         </main>
+       </div>
+     </div>
+   );
+ }
+-
+-function NavLink({ href, label, icon }: { href: string; label: string; icon: string }) {
+-  return (
+-    <a
+-      href={href}
+-      className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-all text-sm font-medium"
+-    >
+-      <span className="text-base">{icon}</span>
+-      <span>{label}</span>
+-    </a>
+-  );
+-}
+diff --git a/src/app/(app)/logout-action.ts b/src/app/(app)/logout-action.ts
+new file mode 100644
+index 0000000..06510c5
+--- /dev/null
++++ b/src/app/(app)/logout-action.ts
+@@ -0,0 +1,7 @@
++'use server';
++
++import { signOut } from '@/auth';
++
++export async function logoutAction() {
++  await signOut({ redirectTo: '/login' });
++}
+diff --git a/src/app/(app)/logout-button.tsx b/src/app/(app)/logout-button.tsx
+new file mode 100644
+index 0000000..ac3ccc2
+--- /dev/null
++++ b/src/app/(app)/logout-button.tsx
+@@ -0,0 +1,18 @@
++import { logoutAction } from './logout-action';
++
++export function LogoutButton({ className }: { className?: string }) {
++  return (
++    <form action={logoutAction}>
++      <button
++        type="submit"
++        className={
++          className ??
++          'flex items-center gap-2 text-xs font-medium text-slate-400 hover:text-red-400 transition-colors'
++        }
++      >
++        <span aria-hidden="true">⏻</span>
++        <span>Log out</span>
++      </button>
++    </form>
++  );
++}
+diff --git a/src/app/(app)/mobile-nav.tsx b/src/app/(app)/mobile-nav.tsx
+new file mode 100644
+index 0000000..0a6e81c
+--- /dev/null
++++ b/src/app/(app)/mobile-nav.tsx
+@@ -0,0 +1,67 @@
++'use client';
++
++import { useState } from 'react';
++import { Menu } from 'lucide-react';
++import { Button } from '@/components/ui/button';
++import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
++import { NavLink, type NavItem } from './nav-link';
++import { LogoutButton } from './logout-button';
++
++export function MobileNav({
++  navItems,
++  userName,
++  userEmail,
++  userRole,
++}: {
++  navItems: NavItem[];
++  userName: string;
++  userEmail: string;
++  userRole: string;
++}) {
++  const [open, setOpen] = useState(false);
++
++  return (
++    <>
++      <header className="lg:hidden sticky top-0 z-40 flex items-center justify-between gap-3 bg-slate-900 border-b border-slate-800 px-4 py-3">
++        <div className="flex items-center gap-3 min-w-0">
++          <div className="w-8 h-8 shrink-0 rounded-lg bg-primary flex items-center justify-center font-bold text-white text-sm">
++            WW
++          </div>
++          <p className="text-sm font-bold text-white truncate">Workforce Platform</p>
++        </div>
++        <Sheet open={open} onOpenChange={setOpen}>
++          <SheetTrigger asChild>
++            <Button variant="ghost" size="icon" className="text-slate-300 hover:text-white hover:bg-slate-800" aria-label="Open menu">
++              <Menu className="h-5 w-5" />
++            </Button>
++          </SheetTrigger>
++          <SheetContent side="left" className="w-3/4 max-w-xs bg-slate-900 border-slate-800 p-0 flex flex-col">
++            <SheetHeader className="p-6 border-b border-slate-800">
++              <SheetTitle className="text-white text-sm font-bold">Workforce Platform</SheetTitle>
++              <p className="text-xs text-blue-400 font-mono capitalize">{userRole.toLowerCase().replace(/_/g, ' ')}</p>
++            </SheetHeader>
++
++            <nav className="flex-1 overflow-y-auto p-4 space-y-1.5">
++              {navItems.map((item) => (
++                <NavLink key={item.href} {...item} onNavigate={() => setOpen(false)} />
++              ))}
++            </nav>
++
++            <div className="p-4 border-t border-slate-800 bg-slate-950/40 space-y-3">
++              <div className="flex items-center gap-3">
++                <div className="w-8 h-8 rounded-full bg-primary/20 border border-primary/30 flex items-center justify-center font-bold text-xs text-primary shrink-0">
++                  {userName.charAt(0).toUpperCase()}
++                </div>
++                <div className="flex-1 min-w-0">
++                  <p className="text-xs font-semibold text-white truncate">{userName}</p>
++                  <p className="text-[11px] text-slate-400 truncate">{userEmail}</p>
++                </div>
++              </div>
++              <LogoutButton />
++            </div>
++          </SheetContent>
++        </Sheet>
++      </header>
++    </>
++  );
++}
+diff --git a/src/app/(app)/nav-link.tsx b/src/app/(app)/nav-link.tsx
+new file mode 100644
+index 0000000..9f3d322
+--- /dev/null
++++ b/src/app/(app)/nav-link.tsx
+@@ -0,0 +1,19 @@
++export type NavItem = { href: string; label: string; icon: string };
++
++export function NavLink({
++  href,
++  label,
++  icon,
++  onNavigate,
++}: NavItem & { onNavigate?: () => void }) {
++  return (
++    <a
++      href={href}
++      onClick={onNavigate}
++      className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-all text-sm font-medium"
++    >
++      <span className="text-base">{icon}</span>
++      <span>{label}</span>
++    </a>
++  );
++}
+diff --git a/src/app/(app)/sync-issues/page.tsx b/src/app/(app)/sync-issues/page.tsx
+index 183b86e..dcefd1d 100644
+--- a/src/app/(app)/sync-issues/page.tsx
++++ b/src/app/(app)/sync-issues/page.tsx
+@@ -1,5 +1,6 @@
+ import { auth } from '@/auth';
+ import { redirect } from 'next/navigation';
++import { can } from '@/lib/auth/can';
+ import { SyncIssuesPanel } from '@/components/sync/SyncIssuesPanel';
+ 
+ export default async function SyncIssuesPage() {
+@@ -7,6 +8,9 @@ export default async function SyncIssuesPage() {
+   if (!session?.user) {
+     redirect('/login');
+   }
++  if (!can(session, 'syncIssues:view', {})) {
++    redirect('/dashboard');
++  }
+ 
+   return (
+     <div className="container mx-auto py-6 px-4">
+diff --git a/src/app/(app)/users/page.tsx b/src/app/(app)/users/page.tsx
+index 6a35381..943f524 100644
+--- a/src/app/(app)/users/page.tsx
++++ b/src/app/(app)/users/page.tsx
+@@ -1,5 +1,6 @@
+ import { auth } from '@/auth';
+ import { redirect } from 'next/navigation';
++import { can } from '@/lib/auth/can';
+ import { UserManagement } from '@/components/users/UserManagement';
+ 
+ export default async function UsersPage() {
+@@ -7,6 +8,9 @@ export default async function UsersPage() {
+   if (!session?.user) {
+     redirect('/login');
+   }
++  if (!can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId })) {
++    redirect('/dashboard');
++  }
+ 
+   return (
+     <div className="container mx-auto py-6 px-4">
+diff --git a/src/components/sync/SyncIssuesPanel.tsx b/src/components/sync/SyncIssuesPanel.tsx
+index cc4efd0..0523103 100644
+--- a/src/components/sync/SyncIssuesPanel.tsx
++++ b/src/components/sync/SyncIssuesPanel.tsx
+@@ -185,7 +185,7 @@ export function SyncIssuesPanel({ userRole }: { userRole: string }) {
+                       {new Date(cmd.createdAt).toLocaleString()}
+                     </TableCell>
+                     <TableCell className="text-right">
+-                      {cmd.status === 'FAILED' && (
++                      {cmd.status === 'FAILED' && (userRole === 'ADMIN' || userRole === 'CLIENT') && (
+                         <Button
+                           variant="outline"
+                           size="sm"
+diff --git a/src/components/ui/sheet.tsx b/src/components/ui/sheet.tsx
+new file mode 100644
+index 0000000..4765b98
+--- /dev/null
++++ b/src/components/ui/sheet.tsx
+@@ -0,0 +1,98 @@
++'use client';
++
++import * as React from 'react';
++import * as SheetPrimitive from '@radix-ui/react-dialog';
++import { cva, type VariantProps } from 'class-variance-authority';
++import { X } from 'lucide-react';
++import { cn } from '@/lib/utils';
++
++const Sheet = SheetPrimitive.Root;
++const SheetTrigger = SheetPrimitive.Trigger;
++const SheetClose = SheetPrimitive.Close;
++const SheetPortal = SheetPrimitive.Portal;
++
++const SheetOverlay = React.forwardRef<
++  React.ElementRef<typeof SheetPrimitive.Overlay>,
++  React.ComponentPropsWithoutRef<typeof SheetPrimitive.Overlay>
++>(({ className, ...props }, ref) => (
++  <SheetPrimitive.Overlay
++    ref={ref}
++    className={cn(
++      'fixed inset-0 z-50 bg-black/50 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
++      className
++    )}
++    {...props}
++  />
++));
++SheetOverlay.displayName = SheetPrimitive.Overlay.displayName;
++
++const sheetVariants = cva(
++  'fixed z-50 gap-4 bg-white dark:bg-slate-900 shadow-lg transition ease-in-out data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:duration-300 data-[state=open]:duration-500',
++  {
++    variants: {
++      side: {
++        top: 'inset-x-0 top-0 border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top',
++        bottom:
++          'inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom',
++        left: 'inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm',
++        right:
++          'inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm',
++      },
++    },
++    defaultVariants: { side: 'right' },
++  }
++);
++
++interface SheetContentProps
++  extends React.ComponentPropsWithoutRef<typeof SheetPrimitive.Content>,
++    VariantProps<typeof sheetVariants> {}
++
++const SheetContent = React.forwardRef<
++  React.ElementRef<typeof SheetPrimitive.Content>,
++  SheetContentProps
++>(({ side = 'left', className, children, ...props }, ref) => (
++  <SheetPortal>
++    <SheetOverlay />
++    <SheetPrimitive.Content ref={ref} className={cn(sheetVariants({ side }), className)} {...props}>
++      {children}
++      <SheetPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none">
++        <X className="h-4 w-4" />
++        <span className="sr-only">Close</span>
++      </SheetPrimitive.Close>
++    </SheetPrimitive.Content>
++  </SheetPortal>
++));
++SheetContent.displayName = SheetPrimitive.Content.displayName;
++
++const SheetHeader = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
++  <div className={cn('flex flex-col space-y-1.5 text-left', className)} {...props} />
++);
++SheetHeader.displayName = 'SheetHeader';
++
++const SheetTitle = React.forwardRef<
++  React.ElementRef<typeof SheetPrimitive.Title>,
++  React.ComponentPropsWithoutRef<typeof SheetPrimitive.Title>
++>(({ className, ...props }, ref) => (
++  <SheetPrimitive.Title ref={ref} className={cn('text-lg font-semibold', className)} {...props} />
++));
++SheetTitle.displayName = SheetPrimitive.Title.displayName;
++
++const SheetDescription = React.forwardRef<
++  React.ElementRef<typeof SheetPrimitive.Description>,
++  React.ComponentPropsWithoutRef<typeof SheetPrimitive.Description>
++>(({ className, ...props }, ref) => (
++  <SheetPrimitive.Description ref={ref} className={cn('text-sm text-gray-500 dark:text-gray-400', className)} {...props} />
++));
++SheetDescription.displayName = SheetPrimitive.Description.displayName;
++
++export {
++  Sheet,
++  SheetPortal,
++  SheetOverlay,
++  SheetTrigger,
++  SheetClose,
++  SheetContent,
++  SheetHeader,
++  SheetTitle,
++  SheetDescription,
++};

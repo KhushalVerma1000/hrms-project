@@ -185,7 +185,7 @@ export function SyncIssuesPanel({ userRole }: { userRole: string }) {
                       {new Date(cmd.createdAt).toLocaleString()}
                     </TableCell>
                     <TableCell className="text-right">
-                      {cmd.status === 'FAILED' && (
+                      {cmd.status === 'FAILED' && (userRole === 'ADMIN' || userRole === 'CLIENT') && (
                         <Button
                           variant="outline"
                           size="sm"
