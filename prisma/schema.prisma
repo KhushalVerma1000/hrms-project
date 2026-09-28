@@ -76,6 +76,9 @@ enum ManualAttendanceStatus {
 enum AttendanceEntrySource {
   MANUAL_DAILY_EDIT
   MANUAL_CSV
+  /// Recorded by a Manager / Shift Incharge / Process Associate scanning the
+  /// employee's face on their phone (see src/app/(app)/face-attendance).
+  FACE_SCAN
 }
 
 /**
@@ -378,6 +381,10 @@ model Employee {
   /// populated if this employee's Store has attendanceMode = MANUAL.
   manualAttendanceEntries ManualAttendanceEntry[]
   monthlyOvertimes        EmployeeMonthlyOvertime[]
+
+  /// Face-scan enrolment samples (3-5 per employee). Only populated for
+  /// employees of MANUAL-mode stores whose consent was recorded at enrolment.
+  faceTemplates FaceTemplate[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -710,4 +717,26 @@ model UnmatchedFormSubmission {
   resolvedAt      DateTime?
   resolvedByUserId String?
   createdAt       DateTime @default(now())
+}
+
+/**
+ * One enrolment sample for face-scan attendance. Stores the 128-number
+ * descriptor produced by face-api in the browser — NOT a photo, and it cannot
+ * be turned back into one. An employee has 3-5 rows; re-enrolling replaces
+ * them all. Rows cascade-delete with the Employee.
+ */
+model FaceTemplate {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  descriptor Float[]
+
+  /// When the employee's consent to store their face data was recorded.
+  consentAt        DateTime
+  enrolledByUserId String
+
+  createdAt DateTime @default(now())
+
+  @@index([employeeId])
 }

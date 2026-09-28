@@ -13,6 +13,8 @@ export type Action =
   | 'employee:view'
   | 'attendance:view'
   | 'attendance:manualEntry'
+  | 'attendance:facePunch'
+  | 'attendance:faceEnroll'
   | 'attendance:csvUpload'
   | 'attendance:lateAccess:request'
   | 'attendance:lateAccess:approve'
@@ -112,6 +114,30 @@ export function can(
 
     // Manual attendance entry — for MANUAL-mode stores only (runtime check in action)
     case 'attendance:manualEntry':
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return inClient(ctx.clientId);
+        case 'MANAGER':
+        case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
+        default: return false;
+      }
+
+    // Face-scan attendance on a phone — MANUAL-mode stores only (runtime check
+    // in the action). Unlike manual entry, Process Associates may punch too.
+    case 'attendance:facePunch':
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return inClient(ctx.clientId);
+        case 'MANAGER':
+        case 'SHIFT_INCHARGE':
+        case 'PROCESS_ASSOCIATE': return inStore(ctx.storeId);
+        default: return false;
+      }
+
+    // Enrolling / removing an employee's face data. Deliberately NOT open to
+    // Process Associates: whoever enrols a face decides who that face "is",
+    // so this is kept to the roles that already own the store roster.
+    case 'attendance:faceEnroll':
       switch (role) {
         case 'ADMIN': return true;
         case 'CLIENT': return inClient(ctx.clientId);

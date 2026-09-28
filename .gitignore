@@ -40,3 +40,6 @@ next-env.d.ts
 
 # prisma
 prisma/*.db
+
+# face-api model files, copied from node_modules by scripts/copy-face-models.mjs
+/public/models/

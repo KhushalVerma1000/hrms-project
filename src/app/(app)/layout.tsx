@@ -16,6 +16,7 @@ export default async function AppLayout({
   const userRole = session.user.role;
   const canViewAttendance = can(session, 'attendance:view', {});
   const canManualAttendance = can(session, 'attendance:manualEntry', { storeId: session.user.storeId });
+  const canFaceAttendance = can(session, 'attendance:facePunch', { storeId: session.user.storeId });
   const canCsvUpload = can(session, 'attendance:csvUpload', { storeId: session.user.storeId });
   const canManageDeadlines = can(session, 'attendance:deadlinePolicy:manage');
   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
@@ -28,6 +29,7 @@ export default async function AppLayout({
     { href: '/dashboard', label: 'Dashboard', icon: '📊' },
     ...(canViewAttendance ? [{ href: '/attendance', label: 'Attendance Logs', icon: '🕒' }] : []),
     ...(canManualAttendance ? [{ href: '/attendance/manual', label: 'Manual Attendance', icon: '📝' }] : []),
+    ...(canFaceAttendance ? [{ href: '/face-attendance', label: 'Face Attendance', icon: '📸' }] : []),
     ...(canCsvUpload ? [{ href: '/attendance/upload', label: 'Attendance Upload', icon: '📤' }] : []),
     ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),
     { href: '/onboarding', label: 'Onboarding Wizard', icon: '✨' },

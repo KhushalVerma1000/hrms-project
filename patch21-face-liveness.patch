@@ -1,0 +1,373 @@
+diff --git a/src/components/attendance/FaceAttendance.tsx b/src/components/attendance/FaceAttendance.tsx
+index 57d124a..1325f61 100644
+--- a/src/components/attendance/FaceAttendance.tsx
++++ b/src/components/attendance/FaceAttendance.tsx
+@@ -9,7 +9,17 @@ import {
+   type FaceContext,
+   type FacePunchResult,
+ } from '@/app/(app)/face-attendance/actions';
+-import { loadFaceEngine, scanFrame, type FrameResult } from '@/lib/face/engine';
++import { loadFaceEngine, scanFrame, poseFrame, type FrameResult } from '@/lib/face/engine';
++import {
++  SAME_PERSON_MAX,
++  challengeHint,
++  isFrontal,
++  pickDirection,
++  startChallenge,
++  stepChallenge,
++  type ChallengeState,
++  type TurnDirection,
++} from '@/lib/face/liveness';
+ import { ENROLL_MAX_SAMPLES, ENROLL_MIN_SAMPLES, distance } from '@/lib/face/match';
+ import { Button } from '@/components/ui/button';
+ import { Badge } from '@/components/ui/badge';
+@@ -40,6 +50,14 @@ interface RecentPunch {
+ const STEADY_DISTANCE = 0.35;
+ const TICK_MS = 500;
+ const PAUSE_AFTER_RESULT_MS = 3000;
++const PAUSE_AFTER_LIVENESS_FAIL_MS = 1500;
++
++/**
++ * Escape hatch for rollout: set NEXT_PUBLIC_FACE_LIVENESS=off to skip the
++ * head-turn check (e.g. if thresholds misbehave on a phone model). Leave unset
++ * for normal use.
++ */
++const LIVENESS_ENABLED = process.env.NEXT_PUBLIC_FACE_LIVENESS !== 'off';
+ 
+ const HINTS: Record<Exclude<FrameResult['status'], 'OK'>, string> = {
+   NO_FACE: 'No face in view',
+@@ -101,9 +119,13 @@ export function FaceAttendance({ stores }: Props) {
+   const lastGoodRef = useRef<number[] | null>(null);
+   const latestForEnrollRef = useRef<{ descriptor: number[]; at: number } | null>(null);
+   const keyRef = useRef(0);
++  const facingRef = useRef<Facing>(facing);
++  const challengeRef = useRef<{ state: ChallengeState; startDescriptor: number[] } | null>(null);
++  const lastDirectionRef = useRef<TurnDirection | null>(null);
+ 
+-  useEffect(() => { tabRef.current = tab; }, [tab]);
++  useEffect(() => { tabRef.current = tab; challengeRef.current = null; }, [tab]);
+   useEffect(() => { storeIdRef.current = storeId; }, [storeId]);
++  useEffect(() => { facingRef.current = facing; }, [facing]);
+ 
+   // ─── Store context (roster + enrolment status) ───────────────────────────
+   const loadContext = useCallback(async (id: string) => {
+@@ -118,6 +140,7 @@ export function FaceAttendance({ stores }: Props) {
+     setEnrollEmployeeId('');
+     setEnrollMsg(null);
+     setResult(null);
++    challengeRef.current = null;
+     void loadContext(storeId);
+   }, [storeId, loadContext]);
+ 
+@@ -171,6 +194,8 @@ export function FaceAttendance({ stores }: Props) {
+ 
+   const flipCamera = useCallback(async () => {
+     const next: Facing = facing === 'environment' ? 'user' : 'environment';
++    challengeRef.current = null; // the left/right mapping changes with the camera
++    facingRef.current = next;
+     setFacing(next);
+     await startCamera(next);
+   }, [facing, startCamera]);
+@@ -185,6 +210,7 @@ export function FaceAttendance({ stores }: Props) {
+     let cancelled = false;
+     let timer: number | undefined;
+     busyRef.current = false; // a previous loop may have been cancelled mid-frame
++    challengeRef.current = null;
+ 
+     const submit = async (descriptor: number[]) => {
+       busyRef.current = true;
+@@ -206,10 +232,18 @@ export function FaceAttendance({ stores }: Props) {
+       setHint('Next person');
+     };
+ 
++    const failLiveness = (hint: string) => {
++      challengeRef.current = null;
++      lastGoodRef.current = null;
++      pausedUntilRef.current = Date.now() + PAUSE_AFTER_LIVENESS_FAIL_MS;
++      setHint(hint);
++    };
++
+     const tick = async () => {
+       if (cancelled) return;
+       const video = videoRef.current;
+       const fa = engineRef.current;
++      let nextDelay = TICK_MS;
+       const ready =
+         video && fa && video.readyState >= 2 && !document.hidden &&
+         !busyRef.current && Date.now() >= pausedUntilRef.current;
+@@ -217,33 +251,75 @@ export function FaceAttendance({ stores }: Props) {
+       if (ready) {
+         busyRef.current = true;
+         try {
+-          const frame = await scanFrame(fa, video);
+-          if (cancelled) return;
+-
+-          if (frame.status !== 'OK') {
+-            lastGoodRef.current = null;
+-            latestForEnrollRef.current = null;
+-            setHint(HINTS[frame.status]);
+-            busyRef.current = false;
+-          } else if (tabRef.current === 'enroll') {
+-            latestForEnrollRef.current = { descriptor: frame.descriptor, at: Date.now() };
+-            setHint('Face ready — tap Capture');
+-            busyRef.current = false;
++          const challenge = challengeRef.current;
++
++          if (challenge && tabRef.current === 'scan') {
++            // ── Liveness challenge in progress: fast pose-only frames ──
++            nextDelay = 0;
++            const pose = await poseFrame(fa, video);
++            if (cancelled) return;
++            const next = stepChallenge(challenge.state, pose.status === 'OK' ? pose.yaw : null, Date.now());
++
++            if (next.phase === 'FAILED') {
++              failLiveness(challengeHint(next));
++            } else if (next.phase === 'PASSED') {
++              // Grab the final frontal descriptor and make sure it's still the same person.
++              const final = await scanFrame(fa, video);
++              if (cancelled) return;
++              if (final.status !== 'OK' || !isFrontal(final.yaw)) {
++                failLiveness('Look straight at the camera — start again');
++              } else if (distance(challenge.startDescriptor, final.descriptor) > SAME_PERSON_MAX) {
++                failLiveness('Face changed during the check — start again');
++              } else {
++                challengeRef.current = null;
++                await submit(final.descriptor);
++              }
++            } else {
++              challengeRef.current = { ...challenge, state: next };
++              setHint(challengeHint(next));
++            }
+           } else {
+-            const prev = lastGoodRef.current;
+-            if (prev && distance(prev, frame.descriptor) < STEADY_DISTANCE) {
+-              await submit(frame.descriptor); // leaves busyRef true until we clear it below
++            // ── Normal scanning ──
++            const frame = await scanFrame(fa, video);
++            if (cancelled) return;
++
++            if (frame.status !== 'OK') {
++              lastGoodRef.current = null;
++              latestForEnrollRef.current = null;
++              setHint(HINTS[frame.status]);
++            } else if (tabRef.current === 'enroll') {
++              latestForEnrollRef.current = { descriptor: frame.descriptor, at: Date.now() };
++              setHint('Face ready — tap Capture');
++            } else if (!isFrontal(frame.yaw)) {
++              lastGoodRef.current = null;
++              setHint('Look straight at the camera');
+             } else {
+-              lastGoodRef.current = frame.descriptor;
+-              setHint('Hold still…');
++              const prev = lastGoodRef.current;
++              if (prev && distance(prev, frame.descriptor) < STEADY_DISTANCE) {
++                if (LIVENESS_ENABLED) {
++                  // Steady, frontal, recognisable face → start a random head-turn challenge.
++                  const direction = pickDirection(lastDirectionRef.current);
++                  lastDirectionRef.current = direction;
++                  const state = startChallenge(direction, facingRef.current === 'user', Date.now());
++                  challengeRef.current = { state, startDescriptor: frame.descriptor };
++                  setResult(null);
++                  setHint(challengeHint(state));
++                } else {
++                  await submit(frame.descriptor);
++                }
++              } else {
++                lastGoodRef.current = frame.descriptor;
++                setHint('Hold still…');
++              }
+             }
+-            busyRef.current = false;
+           }
+         } catch {
++          challengeRef.current = null;
++        } finally {
+           busyRef.current = false;
+         }
+       }
+-      if (!cancelled) timer = window.setTimeout(tick, TICK_MS);
++      if (!cancelled) timer = window.setTimeout(tick, nextDelay);
+     };
+ 
+     timer = window.setTimeout(tick, TICK_MS);
+diff --git a/src/lib/face/engine.ts b/src/lib/face/engine.ts
+index f0ab8c2..d86bd3a 100644
+--- a/src/lib/face/engine.ts
++++ b/src/lib/face/engine.ts
+@@ -9,6 +9,8 @@
+  * /models/face (copied there by scripts/copy-face-models.mjs on npm install).
+  */
+ 
++import { computeYaw } from './liveness';
++
+ type FaceApi = typeof import('@vladmandic/face-api/dist/face-api.esm.js');
+ 
+ const MODEL_URL = '/models/face';
+@@ -48,7 +50,12 @@ export type FrameResult =
+   | { status: 'NO_FACE' }
+   | { status: 'MULTIPLE' }
+   | { status: 'TOO_FAR' }
+-  | { status: 'OK'; descriptor: number[] };
++  | { status: 'OK'; descriptor: number[]; yaw: number };
++
++export type PoseResult =
++  | { status: 'NO_FACE' }
++  | { status: 'MULTIPLE' }
++  | { status: 'OK'; yaw: number };
+ 
+ /** A face narrower than this fraction of the frame is too far away to be reliable. */
+ const MIN_FACE_WIDTH_RATIO = 0.2;
+@@ -67,5 +74,21 @@ export async function scanFrame(faceapi: FaceApi, video: HTMLVideoElement): Prom
+   if (video.videoWidth > 0 && only.detection.box.width < video.videoWidth * MIN_FACE_WIDTH_RATIO) {
+     return { status: 'TOO_FAR' };
+   }
+-  return { status: 'OK', descriptor: Array.from(only.descriptor) };
++  const yaw = computeYaw(only.landmarks.positions);
++  if (yaw === null) return { status: 'NO_FACE' };
++  return { status: 'OK', descriptor: Array.from(only.descriptor), yaw };
++}
++
++/**
++ * Fast pose-only read used while a liveness challenge is running: detector +
++ * landmarks, no recognition net, so it can run several times a second even
++ * on a mid-range phone.
++ */
++export async function poseFrame(faceapi: FaceApi, video: HTMLVideoElement): Promise<PoseResult> {
++  const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
++  const results = await faceapi.detectAllFaces(video, options).withFaceLandmarks(true);
++  if (results.length === 0) return { status: 'NO_FACE' };
++  if (results.length > 1) return { status: 'MULTIPLE' };
++  const yaw = computeYaw(results[0]!.landmarks.positions);
++  return yaw === null ? { status: 'NO_FACE' } : { status: 'OK', yaw };
+ }
+diff --git a/src/lib/face/liveness.ts b/src/lib/face/liveness.ts
+new file mode 100644
+index 0000000..ac2ee5f
+--- /dev/null
++++ b/src/lib/face/liveness.ts
+@@ -0,0 +1,125 @@
++/**
++ * Active liveness check for face-scan attendance: a random "turn your head"
++ * challenge. Pure logic (no camera, no React) so it can be unit tested.
++ *
++ * Why a head turn: a printed or on-screen photo cannot turn. Rotating a flat
++ * photo shifts every facial landmark by the same proportion, but a real 3-D
++ * face moves the nose tip relative to the jaw outline — that is what `yaw`
++ * measures. The direction is random each time, so a pre-recorded video of the
++ * right person turning the wrong way does not pass either.
++ *
++ * What this does NOT stop: a 3-D mask, or someone injecting a fake camera feed
++ * at operating-system level. It is a browser-only, free-tier check — sized for
++ * a supervisor watching the person being scanned, not for unattended kiosks.
++ *
++ * All thresholds live here so they can be tuned in one place after testing on
++ * real phones.
++ */
++
++/** Direction as the person holding the phone sees it on the SCREEN. */
++export type TurnDirection = 'LEFT' | 'RIGHT';
++
++/** |yaw| at or below this counts as facing the camera. (yaw ≈ ±0.5 at full profile) */
++export const FRONTAL_YAW = 0.07;
++/** yaw must reach this far in the requested direction to count as a turn. */
++export const TURN_YAW = 0.15;
++/** Time allowed to complete the turn. */
++export const TURN_TIMEOUT_MS = 8000;
++/** Time allowed to come back to face the camera after turning. */
++export const RETURN_TIMEOUT_MS = 6000;
++/** Consecutive frontal frames needed to finish. */
++export const FRONTAL_HOLD_FRAMES = 2;
++/** The face at the start and at the end must be the same person (Euclidean distance). */
++export const SAME_PERSON_MAX = 0.45;
++
++export interface Point { x: number; y: number }
++
++/**
++ * Head yaw from face-api's 68 landmarks, in image space (un-mirrored camera
++ * frame): 0 = facing the camera, positive = nose moved toward the image's
++ * right. Uses nose tip (30) against the jaw's left/right extremes (0, 16).
++ */
++export function computeYaw(points: readonly Point[]): number | null {
++  const nose = points[30];
++  const jawL = points[0];
++  const jawR = points[16];
++  if (!nose || !jawL || !jawR) return null;
++  const width = jawR.x - jawL.x;
++  if (!(width > 1)) return null;
++  return (nose.x - jawL.x) / width - 0.5;
++}
++
++export function isFrontal(yaw: number): boolean {
++  return Math.abs(yaw) <= FRONTAL_YAW;
++}
++
++/**
++ * Sign of the image-space yaw that satisfies a SCREEN direction. The rear
++ * camera preview is shown as-is; the front camera preview is mirrored, so
++ * screen-left there is image-right.
++ */
++export function requiredYawSign(direction: TurnDirection, mirrored: boolean): 1 | -1 {
++  const base = direction === 'RIGHT' ? 1 : -1;
++  return (mirrored ? -base : base) as 1 | -1;
++}
++
++export function pickDirection(previous: TurnDirection | null, rand: () => number = Math.random): TurnDirection {
++  // Mostly random, but never the same direction twice in a row.
++  const next: TurnDirection = rand() < 0.5 ? 'LEFT' : 'RIGHT';
++  return previous && next === previous ? (previous === 'LEFT' ? 'RIGHT' : 'LEFT') : next;
++}
++
++export type ChallengePhase = 'TURN' | 'RETURN' | 'PASSED' | 'FAILED';
++
++export interface ChallengeState {
++  direction: TurnDirection;
++  mirrored: boolean;
++  phase: ChallengePhase;
++  startedAt: number;
++  turnedAt: number | null;
++  frontalFrames: number;
++  /** Set when phase === 'FAILED'. */
++  failReason: 'LOST_FACE' | 'TIMEOUT' | null;
++}
++
++export function startChallenge(direction: TurnDirection, mirrored: boolean, now: number): ChallengeState {
++  return { direction, mirrored, phase: 'TURN', startedAt: now, turnedAt: null, frontalFrames: 0, failReason: null };
++}
++
++/**
++ * Advances the challenge by one frame. `yaw` is null when there is not
++ * exactly one face in view — that fails the check outright, so the face
++ * cannot be swapped out mid-challenge.
++ */
++export function stepChallenge(state: ChallengeState, yaw: number | null, now: number): ChallengeState {
++  if (state.phase === 'PASSED' || state.phase === 'FAILED') return state;
++
++  if (yaw === null) return { ...state, phase: 'FAILED', failReason: 'LOST_FACE' };
++
++  if (state.phase === 'TURN') {
++    if (now - state.startedAt > TURN_TIMEOUT_MS) return { ...state, phase: 'FAILED', failReason: 'TIMEOUT' };
++    const sign = requiredYawSign(state.direction, state.mirrored);
++    if (yaw * sign >= TURN_YAW) return { ...state, phase: 'RETURN', turnedAt: now, frontalFrames: 0 };
++    return state;
++  }
++
++  // RETURN
++  if (now - (state.turnedAt ?? state.startedAt) > RETURN_TIMEOUT_MS) {
++    return { ...state, phase: 'FAILED', failReason: 'TIMEOUT' };
++  }
++  if (isFrontal(yaw)) {
++    const frontalFrames = state.frontalFrames + 1;
++    return frontalFrames >= FRONTAL_HOLD_FRAMES ? { ...state, phase: 'PASSED', frontalFrames } : { ...state, frontalFrames };
++  }
++  return { ...state, frontalFrames: 0 };
++}
++
++export function challengeHint(state: ChallengeState): string {
++  const side = state.direction === 'LEFT' ? 'left' : 'right';
++  switch (state.phase) {
++    case 'TURN': return `Slowly turn your head to the ${side} of the screen`;
++    case 'RETURN': return 'Now look straight at the camera';
++    case 'PASSED': return 'Checking…';
++    case 'FAILED': return state.failReason === 'LOST_FACE' ? 'Face lost — start again' : 'Too slow — start again';
++  }
++}
