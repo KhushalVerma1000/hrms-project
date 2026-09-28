@@ -59,6 +59,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
 
   // Preview & Submit state
   const [previewCode, setPreviewCode] = useState<string | null>(null);
+  const [previewCapacity, setPreviewCapacity] = useState<{ slotsRemaining: number; nearCapacity: boolean } | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -86,11 +87,18 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
     if (storeId) {
       setLoadingPreview(true);
       getStoreECodePreviewAction(storeId)
-        .then((res) => setPreviewCode(res.previewCode))
-        .catch(() => setPreviewCode(null))
+        .then((res) => {
+          setPreviewCode(res.previewCode);
+          setPreviewCapacity({ slotsRemaining: res.slotsRemaining, nearCapacity: res.nearCapacity });
+        })
+        .catch(() => {
+          setPreviewCode(null);
+          setPreviewCapacity(null);
+        })
         .finally(() => setLoadingPreview(false));
     } else {
       setPreviewCode(null);
+      setPreviewCapacity(null);
     }
   }, [storeId]);
 
@@ -339,7 +347,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   </div>
                   {isAdmin && (
                     <div className="text-xs text-gray-500 mt-1">
-                      [Client Code][Brand Code][Store Code][Serial]
+                      [Client Code][Brand Code][Store Code][Serial][Check Digit]
                     </div>
                   )}
                 </div>
@@ -347,6 +355,13 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   Auto-generated
                 </Badge>
               </div>
+            )}
+            {previewCapacity?.nearCapacity && (
+              <p className="text-xs text-amber-600 dark:text-amber-400 -mt-2">
+                {previewCapacity.slotsRemaining === 0
+                  ? 'This store has no employee codes left — an Admin needs to add another store entry before anyone else can be onboarded here.'
+                  : `Only ${previewCapacity.slotsRemaining} employee code${previewCapacity.slotsRemaining === 1 ? '' : 's'} left for this store — an Admin will need to add another store entry soon.`}
+              </p>
             )}
 
             {/* Conditional App Login Sub-step for PA / SI */}

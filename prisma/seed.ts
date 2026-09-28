@@ -102,6 +102,12 @@ async function main() {
       latitude: 28.5244,
       longitude: 77.2167,
       geofenceRadius: 200,
+      // NOTE: left at 1 (the pre-fix value) deliberately — the 5 demo
+      // employees seeded below are hardcoded fixtures using legacy-style
+      // serials (...0001-...0005) to mirror real imported data, and the
+      // counter is force-set to 6 right after anyway (see below). New
+      // stores created through the live app get the corrected @default(100)
+      // from schema.prisma instead — see src/lib/ecode.ts leading-zero audit.
       nextEmployeeSerial: 1,
       // Explicit (matches the default) — Saket is the biometric-store test
       // fixture: seeded AttendanceLog punches below let you exercise the

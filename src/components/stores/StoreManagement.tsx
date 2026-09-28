@@ -6,6 +6,8 @@ import {
   createClientAction,
   createWarehouseTypeAction,
   createStoreAction,
+  updateClientDetailsAction,
+  updateStoreDetailsAction,
 } from '@/app/(app)/stores/actions';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -23,7 +25,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Building2, Store, Tag, Plus, Loader2, RefreshCw, MapPin } from 'lucide-react';
+import { Building2, Store, Tag, Plus, Loader2, RefreshCw, MapPin, Pencil } from 'lucide-react';
 import { toast } from 'sonner';
 
 export function StoreManagement({ userRole }: { userRole: string }) {
@@ -37,6 +39,8 @@ export function StoreManagement({ userRole }: { userRole: string }) {
   const [clientName, setClientName] = useState('');
   const [clientShort, setClientShort] = useState('');
   const [clientEmail, setClientEmail] = useState('');
+  const [clientLocation, setClientLocation] = useState('');
+  const [clientGstin, setClientGstin] = useState('');
   const [creatingClient, setCreatingClient] = useState(false);
 
   const [showBrandModal, setShowBrandModal] = useState(false);
@@ -49,7 +53,20 @@ export function StoreManagement({ userRole }: { userRole: string }) {
   const [storeWarehouseTypeId, setStoreWarehouseTypeId] = useState('');
   const [storeExtCode, setStoreExtCode] = useState('');
   const [storeAddress, setStoreAddress] = useState('');
+  const [storeLocation, setStoreLocation] = useState('');
+  const [storeGstin, setStoreGstin] = useState('');
   const [creatingStore, setCreatingStore] = useState(false);
+
+  // Edit-details dialog (shared by stores and clients)
+  const [editTarget, setEditTarget] = useState<{
+    kind: 'store' | 'client';
+    id: string;
+    name: string;
+    address: string;
+    location: string;
+    gstin: string;
+  } | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
 
   const fetchData = async () => {
     setLoading(true);
@@ -73,7 +90,7 @@ export function StoreManagement({ userRole }: { userRole: string }) {
   const handleCreateClient = async () => {
     setCreatingClient(true);
     try {
-      const res = await createClientAction(clientName, clientShort, clientEmail);
+      const res = await createClientAction(clientName, clientShort, clientEmail, undefined, undefined, clientLocation, clientGstin);
       if (!res.ok) {
         toast.error(res.error || 'Failed to create client');
         return;
@@ -83,6 +100,8 @@ export function StoreManagement({ userRole }: { userRole: string }) {
       setClientName('');
       setClientShort('');
       setClientEmail('');
+      setClientLocation('');
+      setClientGstin('');
       fetchData();
     } catch (err: any) {
       toast.error(err.message);
@@ -119,16 +138,20 @@ export function StoreManagement({ userRole }: { userRole: string }) {
         warehouseTypeId: storeWarehouseTypeId,
         externalStoreCode: storeExtCode,
         address: storeAddress,
+        location: storeLocation,
+        gstin: storeGstin,
       });
       if (!res.ok) {
         toast.error(res.error || 'Failed to create store');
         return;
       }
-      toast.success(`Store ${res.store?.name} created with Auto 2-Digit Code: ${res.store?.code}`);
+      toast.success(userRole === 'ADMIN' ? `Store ${res.store?.name} created with Auto 2-Digit Code: ${res.store?.code}` : `Store ${res.store?.name} created`);
       setShowStoreModal(false);
       setStoreName('');
       setStoreExtCode('');
       setStoreAddress('');
+      setStoreLocation('');
+      setStoreGstin('');
       fetchData();
     } catch (err: any) {
       toast.error(err.message);
@@ -136,6 +159,37 @@ export function StoreManagement({ userRole }: { userRole: string }) {
       setCreatingStore(false);
     }
   };
+
+  const handleSaveEdit = async () => {
+    if (!editTarget) return;
+    setSavingEdit(true);
+    try {
+      const res =
+        editTarget.kind === 'store'
+          ? await updateStoreDetailsAction(editTarget.id, {
+              address: editTarget.address,
+              location: editTarget.location,
+              gstin: editTarget.gstin,
+            })
+          : await updateClientDetailsAction(editTarget.id, {
+              location: editTarget.location,
+              gstin: editTarget.gstin,
+            });
+      if (!res.ok) {
+        toast.error(res.error || 'Failed to save changes');
+        return;
+      }
+      toast.success('Details saved');
+      setEditTarget(null);
+      fetchData();
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const colCount = userRole === 'ADMIN' ? 10 : 8;
 
   return (
     <div className="space-y-6">
@@ -171,15 +225,14 @@ export function StoreManagement({ userRole }: { userRole: string }) {
           <TabsTrigger value="stores">
             <Store className="w-4 h-4 mr-2" /> Physical Stores ({stores.length})
           </TabsTrigger>
+          <TabsTrigger value="clients">
+            <Building2 className="w-4 h-4 mr-2" />{' '}
+            {userRole === 'ADMIN' ? `Staffing Clients (${clients.length})` : 'Your Company'}
+          </TabsTrigger>
           {userRole === 'ADMIN' && (
-            <>
-              <TabsTrigger value="clients">
-                <Building2 className="w-4 h-4 mr-2" /> Staffing Clients ({clients.length})
-              </TabsTrigger>
-              <TabsTrigger value="brands">
-                <Tag className="w-4 h-4 mr-2" /> Warehouse Brands ({warehouseTypes.length})
-              </TabsTrigger>
-            </>
+            <TabsTrigger value="brands">
+              <Tag className="w-4 h-4 mr-2" /> Warehouse Brands ({warehouseTypes.length})
+            </TabsTrigger>
           )}
         </TabsList>
 
@@ -195,14 +248,16 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                     {userRole === 'ADMIN' && <TableHead>Client Account</TableHead>}
                     <TableHead>Warehouse Brand</TableHead>
                     <TableHead>Brand External Code</TableHead>
+                    <TableHead>Location</TableHead>
+                    <TableHead>GSTIN</TableHead>
                     <TableHead>Active Employees</TableHead>
                     <TableHead>Biometric Devices</TableHead>
+                    <TableHead className="w-10" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {(() => {
-                    const colCount = userRole === 'ADMIN' ? 7 : 5;
-                    if (loading) {
+                                        if (loading) {
                       return (
                         <TableRow>
                           <TableCell colSpan={colCount} className="text-center py-8 text-gray-500">
@@ -257,11 +312,32 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                         <TableCell className="font-mono text-sm">
                           {st.externalStoreCode ? st.externalStoreCode : <span className="text-gray-400 text-xs">None</span>}
                         </TableCell>
+                        <TableCell className="text-sm">{st.location || <span className="text-gray-400 text-xs">—</span>}</TableCell>
+                        <TableCell className="font-mono text-xs">{st.gstin || <span className="text-gray-400">—</span>}</TableCell>
                         <TableCell className="font-semibold text-sm">{st._count?.employees || 0}</TableCell>
                         <TableCell>
                           <Badge variant="secondary" className="text-xs">
                             {st.devices?.length || 0} Devices
                           </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`Edit ${st.name}`}
+                            onClick={() =>
+                              setEditTarget({
+                                kind: 'store',
+                                id: st.id,
+                                name: st.name,
+                                address: st.address || '',
+                                location: st.location || '',
+                                gstin: st.gstin || '',
+                              })
+                            }
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </Button>
                         </TableCell>
                       </TableRow>
                     ))
@@ -273,30 +349,56 @@ export function StoreManagement({ userRole }: { userRole: string }) {
         </TabsContent>
 
         {/* CLIENTS TAB */}
-        {userRole === 'ADMIN' && (
+        {(
           <TabsContent value="clients" className="mt-4">
             <Card className="shadow-sm">
               <CardContent className="p-0 overflow-x-auto">
                 <Table>
                   <TableHeader>
                     <TableRow className="bg-gray-50/50 dark:bg-gray-900/50">
-                      <TableHead>Client Code</TableHead>
-                      <TableHead>Vendor Account Name</TableHead>
-                      <TableHead>Short Name</TableHead>
+                      {userRole === 'ADMIN' && <TableHead>Client Code</TableHead>}
+                      <TableHead>{userRole === 'ADMIN' ? 'Vendor Account Name' : 'Company Name'}</TableHead>
+                      {userRole === 'ADMIN' && <TableHead>Short Name</TableHead>}
                       <TableHead>Contact Email</TableHead>
+                      <TableHead>Location</TableHead>
+                      <TableHead>GSTIN</TableHead>
+                      <TableHead className="w-10" />
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {clients.map((cl) => (
                       <TableRow key={cl.id}>
-                        <TableCell className="font-mono font-bold text-primary">
-                          <Badge variant="outline" className="font-mono bg-primary/5 text-primary border-primary/20">
-                            {cl.code}
-                          </Badge>
-                        </TableCell>
+                        {userRole === 'ADMIN' && (
+                          <TableCell className="font-mono font-bold text-primary">
+                            <Badge variant="outline" className="font-mono bg-primary/5 text-primary border-primary/20">
+                              {cl.code}
+                            </Badge>
+                          </TableCell>
+                        )}
                         <TableCell className="font-semibold text-gray-900 dark:text-white">{cl.name}</TableCell>
-                        <TableCell className="font-mono text-sm">{cl.shortName}</TableCell>
+                        {userRole === 'ADMIN' && <TableCell className="font-mono text-sm">{cl.shortName}</TableCell>}
                         <TableCell className="text-sm text-gray-500">{cl.email || 'N/A'}</TableCell>
+                        <TableCell className="text-sm">{cl.location || <span className="text-gray-400 text-xs">—</span>}</TableCell>
+                        <TableCell className="font-mono text-xs">{cl.gstin || <span className="text-gray-400">—</span>}</TableCell>
+                        <TableCell>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`Edit ${cl.name}`}
+                            onClick={() =>
+                              setEditTarget({
+                                kind: 'client',
+                                id: cl.id,
+                                name: cl.name,
+                                address: '',
+                                location: cl.location || '',
+                                gstin: cl.gstin || '',
+                              })
+                            }
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </Button>
+                        </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
@@ -361,7 +463,7 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                 <SelectContent>
                   {clients.map((c) => (
                     <SelectItem key={c.id} value={c.id}>
-                      {c.name} (Code: {c.code})
+                      {c.name}{userRole === 'ADMIN' ? ` (Code: ${c.code})` : ''}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -377,7 +479,7 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                 <SelectContent>
                   {warehouseTypes.map((wt) => (
                     <SelectItem key={wt.id} value={wt.id}>
-                      {wt.name} (Code: {wt.code})
+                      {wt.name}{userRole === 'ADMIN' ? ` (Code: ${wt.code})` : ''}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -390,8 +492,24 @@ export function StoreManagement({ userRole }: { userRole: string }) {
             </div>
 
             <div className="space-y-2">
-              <Label>Address / Location</Label>
-              <Input placeholder="Physical address" value={storeAddress} onChange={(e) => setStoreAddress(e.target.value)} />
+              <Label>Full Address</Label>
+              <Input placeholder="Street address" value={storeAddress} onChange={(e) => setStoreAddress(e.target.value)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>Location (City / Area)</Label>
+                <Input placeholder="e.g. Saket, New Delhi" value={storeLocation} onChange={(e) => setStoreLocation(e.target.value)} />
+              </div>
+              <div className="space-y-2">
+                <Label>GSTIN (Optional)</Label>
+                <Input
+                  className="font-mono uppercase"
+                  maxLength={15}
+                  placeholder="15 characters"
+                  value={storeGstin}
+                  onChange={(e) => setStoreGstin(e.target.value.toUpperCase())}
+                />
+              </div>
             </div>
           </div>
           <DialogFooter>
@@ -411,7 +529,7 @@ export function StoreManagement({ userRole }: { userRole: string }) {
           <DialogHeader>
             <DialogTitle>Add New Client Vendor Account</DialogTitle>
             <DialogDescription>
-              Creates a new staffing client. Code will be assigned automatically (e.g. 01, 02).
+              Creates a new staffing client. Code will be assigned automatically (e.g. 10, 11).
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
@@ -427,6 +545,22 @@ export function StoreManagement({ userRole }: { userRole: string }) {
               <Label>Contact Email</Label>
               <Input type="email" placeholder="ops@client.com" value={clientEmail} onChange={(e) => setClientEmail(e.target.value)} />
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>Location (City / Region)</Label>
+                <Input placeholder="e.g. New Delhi" value={clientLocation} onChange={(e) => setClientLocation(e.target.value)} />
+              </div>
+              <div className="space-y-2">
+                <Label>GSTIN (Optional)</Label>
+                <Input
+                  className="font-mono uppercase"
+                  maxLength={15}
+                  placeholder="15 characters"
+                  value={clientGstin}
+                  onChange={(e) => setClientGstin(e.target.value.toUpperCase())}
+                />
+              </div>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowClientModal(false)}>
@@ -434,6 +568,45 @@ export function StoreManagement({ userRole }: { userRole: string }) {
             </Button>
             <Button onClick={handleCreateClient} disabled={creatingClient}>
               {creatingClient ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : 'Create Client'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* EDIT DETAILS MODAL (stores + clients) */}
+      <Dialog open={!!editTarget} onOpenChange={(open) => !open && setEditTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit {editTarget?.name}</DialogTitle>
+            <DialogDescription>Leave a field empty to clear it.</DialogDescription>
+          </DialogHeader>
+          {editTarget && (
+            <div className="space-y-4 py-2">
+              {editTarget.kind === 'store' && (
+                <div className="space-y-2">
+                  <Label>Full Address</Label>
+                  <Input value={editTarget.address} onChange={(e) => setEditTarget({ ...editTarget, address: e.target.value })} />
+                </div>
+              )}
+              <div className="space-y-2">
+                <Label>Location (City / Area)</Label>
+                <Input value={editTarget.location} onChange={(e) => setEditTarget({ ...editTarget, location: e.target.value })} />
+              </div>
+              <div className="space-y-2">
+                <Label>GSTIN</Label>
+                <Input
+                  className="font-mono uppercase"
+                  maxLength={15}
+                  value={editTarget.gstin}
+                  onChange={(e) => setEditTarget({ ...editTarget, gstin: e.target.value.toUpperCase() })}
+                />
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)}>Cancel</Button>
+            <Button onClick={handleSaveEdit} disabled={savingEdit}>
+              {savingEdit ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : 'Save'}
             </Button>
           </DialogFooter>
         </DialogContent>

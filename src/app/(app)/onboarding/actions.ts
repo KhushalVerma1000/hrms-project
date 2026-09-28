@@ -3,7 +3,7 @@
 import { auth } from '@/auth';
 import { prisma } from '@/lib/prisma';
 import { can } from '@/lib/auth/can';
-import { generateEmployeeCode } from '@/lib/ecode';
+import { generateEmployeeCode, previewEmployeeCode } from '@/lib/ecode';
 import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import bcrypt from 'bcryptjs';
@@ -75,10 +75,16 @@ export async function getStoreECodePreviewAction(storeId: string) {
 
   if (!store) throw new Error('Store not found');
 
-  const serialPadded = String(store.nextEmployeeSerial).padStart(3, '0');
-  const previewCode = `${store.client.code}${store.warehouseType.code}${store.code}${serialPadded}`;
+  const { code: previewCode, slotsRemaining, nearCapacity } = previewEmployeeCode(store);
 
-  return { previewCode, clientName: store.client.name, storeName: store.name, warehouseType: store.warehouseType.name };
+  return {
+    previewCode,
+    clientName: store.client.name,
+    storeName: store.name,
+    warehouseType: store.warehouseType.name,
+    slotsRemaining,
+    nearCapacity,
+  };
 }
 
 export async function submitOnboardingAction(input: OnboardingSubmitInput) {

@@ -183,6 +183,10 @@ model Client {
   name      String
   shortName String
   email     String?
+  /// City/region, e.g. "New Delhi, India". Free text, display-only.
+  location  String?
+  /// 15-character GST Identification Number for this vendor account, if registered.
+  gstin     String?
 
   /// Per-client Google Form onboarding link override (Section 13.1/13.5).
   /// If null, the app falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
@@ -231,7 +235,9 @@ model Store {
   warehouseType   WarehouseType @relation(fields: [warehouseTypeId], references: [id])
 
   /// Atomic counter for per-store employee serial in e-code generation.
-  nextEmployeeSerial Int @default(1)
+  /// Starts at 100 (not 1) so the 3-digit Serial segment never has a
+  /// leading zero either — see Client.code comment for why that matters.
+  nextEmployeeSerial Int @default(100)
 
   /// BIOMETRIC (default, synced from SmartOffice) or MANUAL (no device —
   /// Manager/SI enter attendance via ManualAttendanceEntry below). Editable
@@ -239,10 +245,16 @@ model Store {
   attendanceMode AttendanceMode @default(MANUAL)
 
   address        String?
+  /// City/area, e.g. "Saket, New Delhi". Shorter than `address` — for
+  /// quick display/filtering, not geofencing (see latitude/longitude below).
+  location       String?
   latitude       Float?
   longitude      Float?
   /// Geofence radius in meters — mirrors SmartOffice AddLocation.Radius.
   geofenceRadius Int?
+  /// 15-character GST Identification Number for this store's registered
+  /// address, if it differs from the parent Client's GSTIN.
+  gstin          String?
 
   devices   Device[]
   employees Employee[]
@@ -323,9 +335,13 @@ model BiometricProviderConfig {
  */
 model Employee {
   id          String         @id @default(cuid())
-  /// System-generated e-code for new hires (Section 11): [Client:2][Brand:2][Store:2][Serial:3],
-  /// 9 digits total, e.g. "101010001". Codes never start with 0 (Client.code starts at "10").
-  /// Legacy records use their original SmartOffice staffCode, flagged with isLegacyCode = true.
+  /// System-generated e-code for new hires (Section 11, v2): [Client:2][Brand:2][Store:2][Serial:3][Check:1],
+  /// 10 digits total, e.g. "1010100109" — the last digit is a Luhn check digit
+  /// over the first 9, so a mistyped/transposed digit is self-detectable
+  /// without a DB lookup (see src/lib/ecode.ts: isValidChecksum/verifyEmployeeCode).
+  /// Codes never start with 0 (Client.code starts at "10").
+  /// Legacy records use their original SmartOffice staffCode (9 digits, no
+  /// check digit), flagged with isLegacyCode = true.
   staffCode   String         @unique
   isLegacyCode Boolean       @default(false)
   name        String
@@ -438,6 +454,10 @@ model AuditLog {
   targetId   String
   metadata   Json?
   createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([targetType, targetId])
 }
 
 /**

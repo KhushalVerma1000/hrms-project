@@ -22,6 +22,7 @@ export default async function AppLayout({
   const canManageDevices = can(session, 'device:manage', { clientId: session.user.clientId });
   const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
   const canViewSyncIssues = can(session, 'syncIssues:view', {});
+  const canViewAuditLog = can(session, 'auditLog:view', {});
 
   const navItems: NavItem[] = [
     { href: '/dashboard', label: 'Dashboard', icon: '📊' },
@@ -36,6 +37,7 @@ export default async function AppLayout({
     ...(canManageDevices ? [{ href: '/devices', label: 'Biometric Devices', icon: '📱' }] : []),
     ...(canManageUsers ? [{ href: '/users', label: 'App Users & Roles', icon: '🛡️' }] : []),
     ...(canViewSyncIssues ? [{ href: '/sync-issues', label: 'SmartOffice Sync Issues', icon: '⚡' }] : []),
+    ...(canViewAuditLog ? [{ href: '/audit-log', label: 'Audit Log', icon: '🧾' }] : []),
   ];
 
   return (
