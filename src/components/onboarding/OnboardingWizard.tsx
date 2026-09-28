@@ -28,7 +28,13 @@ interface StoreOption {
   warehouseType: { name: string; code: string };
 }
 
-export function OnboardingWizard() {
+interface OnboardingWizardProps {
+  /** Only ADMIN sees how the employee code is assembled — everyone else just sees the code. */
+  role?: string;
+}
+
+export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+  const isAdmin = role === 'ADMIN';
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [stores, setStores] = useState<StoreOption[]>([]);
   const [loadingStores, setLoadingStores] = useState(true);
@@ -327,16 +333,18 @@ export function OnboardingWizard() {
             {storeId && (
               <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 dark:bg-slate-900 dark:border-slate-800 flex items-center justify-between">
                 <div>
-                  <div className="text-xs text-gray-500 font-medium">System E-Code Format</div>
+                  <div className="text-xs text-gray-500 font-medium">Employee Code</div>
                   <div className="text-lg font-mono font-bold text-gray-900 dark:text-white">
                     {loadingPreview ? 'Generating...' : previewCode}
                   </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    [Client Code][Brand Code][Store Code][Serial]
-                  </div>
+                  {isAdmin && (
+                    <div className="text-xs text-gray-500 mt-1">
+                      [Client Code][Brand Code][Store Code][Serial]
+                    </div>
+                  )}
                 </div>
                 <Badge variant="secondary" className="font-mono">
-                  10 Digits Auto
+                  Auto-generated
                 </Badge>
               </div>
             )}

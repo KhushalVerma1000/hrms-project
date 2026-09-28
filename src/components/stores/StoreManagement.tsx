@@ -190,9 +190,9 @@ export function StoreManagement({ userRole }: { userRole: string }) {
               <Table>
                 <TableHeader>
                   <TableRow className="bg-gray-50/50 dark:bg-gray-900/50">
-                    <TableHead>Store Code</TableHead>
+                    {userRole === 'ADMIN' && <TableHead>Store Code</TableHead>}
                     <TableHead>Store Name</TableHead>
-                    <TableHead>Client Account</TableHead>
+                    {userRole === 'ADMIN' && <TableHead>Client Account</TableHead>}
                     <TableHead>Warehouse Brand</TableHead>
                     <TableHead>Brand External Code</TableHead>
                     <TableHead>Active Employees</TableHead>
@@ -200,26 +200,38 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {loading ? (
-                    <TableRow>
-                      <TableCell colSpan={7} className="text-center py-8 text-gray-500">
-                        <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" /> Loading stores...
-                      </TableCell>
-                    </TableRow>
-                  ) : stores.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={7} className="text-center py-8 text-gray-500">
-                        No stores registered yet. Click &quot;Add Store&quot; to create one.
-                      </TableCell>
-                    </TableRow>
-                  ) : (
+                  {(() => {
+                    const colCount = userRole === 'ADMIN' ? 7 : 5;
+                    if (loading) {
+                      return (
+                        <TableRow>
+                          <TableCell colSpan={colCount} className="text-center py-8 text-gray-500">
+                            <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" /> Loading stores...
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }
+                    if (stores.length === 0) {
+                      return (
+                        <TableRow>
+                          <TableCell colSpan={colCount} className="text-center py-8 text-gray-500">
+                            No stores registered yet. Click &quot;Add Store&quot; to create one.
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }
+                    return null;
+                  })()}
+                  {!loading && stores.length > 0 && (
                     stores.map((st) => (
                       <TableRow key={st.id}>
-                        <TableCell className="font-mono font-bold text-primary">
-                          <Badge variant="outline" className="font-mono bg-primary/5 text-primary border-primary/20">
-                            {st.code}
-                          </Badge>
-                        </TableCell>
+                        {userRole === 'ADMIN' && (
+                          <TableCell className="font-mono font-bold text-primary">
+                            <Badge variant="outline" className="font-mono bg-primary/5 text-primary border-primary/20">
+                              {st.code}
+                            </Badge>
+                          </TableCell>
+                        )}
                         <TableCell>
                           <div className="font-semibold text-gray-900 dark:text-white">{st.name}</div>
                           {st.address && (
@@ -228,15 +240,18 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                             </div>
                           )}
                         </TableCell>
-                        <TableCell>
-                          <span className="font-medium text-sm">{st.client.name}</span>
-                          <Badge variant="secondary" className="ml-2 font-mono text-[10px]">
-                            Code: {st.client.code}
-                          </Badge>
-                        </TableCell>
+                        {userRole === 'ADMIN' && (
+                          <TableCell>
+                            <span className="font-medium text-sm">{st.client.name}</span>
+                            <Badge variant="secondary" className="ml-2 font-mono text-[10px]">
+                              Code: {st.client.code}
+                            </Badge>
+                          </TableCell>
+                        )}
                         <TableCell>
                           <Badge variant="outline" className="text-xs">
-                            {st.warehouseType.name} (Code: {st.warehouseType.code})
+                            {st.warehouseType.name}
+                            {userRole === 'ADMIN' ? ` (Code: ${st.warehouseType.code})` : ''}
                           </Badge>
                         </TableCell>
                         <TableCell className="font-mono text-sm">

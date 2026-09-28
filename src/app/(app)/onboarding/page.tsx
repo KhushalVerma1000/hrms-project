@@ -10,7 +10,7 @@ export default async function OnboardingPage() {
 
   return (
     <div className="container mx-auto py-6 px-4">
-      <OnboardingWizard />
+      <OnboardingWizard role={session.user.role} />
     </div>
   );
 }
