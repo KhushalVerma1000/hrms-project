@@ -1,0 +1,264 @@
+diff --git a/prisma/migrations/20260929110000_face_attendance_toggle/migration.sql b/prisma/migrations/20260929110000_face_attendance_toggle/migration.sql
+new file mode 100644
+index 0000000..c771d22
+--- /dev/null
++++ b/prisma/migrations/20260929110000_face_attendance_toggle/migration.sql
+@@ -0,0 +1,2 @@
++-- Face attendance is an opt-in module, switched on per store (default off).
++ALTER TABLE "Store" ADD COLUMN "faceAttendanceEnabled" BOOLEAN NOT NULL DEFAULT false;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index fa050b3..1d5fa6c 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -247,6 +247,12 @@ model Store {
+   /// after creation by Admin/Client if the store's hardware situation changes.
+   attendanceMode AttendanceMode @default(MANUAL)
+ 
++  /// Face-scan attendance module (phone camera). Off by default; switched on
++  /// per store by Admin/Client from Stores & Brands. Only meaningful for
++  /// MANUAL-mode stores. Turning it off hides the feature and blocks scans and
++  /// enrolment, but keeps enrolled face data (delete it per employee if needed).
++  faceAttendanceEnabled Boolean @default(false)
++
+   address        String?
+   /// City/area, e.g. "Saket, New Delhi". Shorter than `address` — for
+   /// quick display/filtering, not geofencing (see latitude/longitude below).
+diff --git a/src/app/(app)/face-attendance/actions.ts b/src/app/(app)/face-attendance/actions.ts
+index 3ae794b..bfc775c 100644
+--- a/src/app/(app)/face-attendance/actions.ts
++++ b/src/app/(app)/face-attendance/actions.ts
+@@ -61,7 +61,7 @@ export type SimpleResult = { ok: true } | { ok: false; error: string };
+ 
+ // ─── Shared guards ──────────────────────────────────────────────────────────
+ 
+-type ManualStore = { id: string; name: string; clientId: string; attendanceMode: string };
++type ManualStore = { id: string; name: string; clientId: string; attendanceMode: string; faceAttendanceEnabled: boolean };
+ 
+ async function loadManualStore(
+   session: Session,
+@@ -69,7 +69,7 @@ async function loadManualStore(
+ ): Promise<{ store: ManualStore } | { error: string }> {
+   const store = await prisma.store.findUnique({
+     where: { id: storeId },
+-    select: { id: true, name: true, clientId: true, attendanceMode: true },
++    select: { id: true, name: true, clientId: true, attendanceMode: true, faceAttendanceEnabled: true },
+   });
+   if (!store) return { error: 'Store not found.' };
+   if (session.user.role === 'CLIENT' && session.user.clientId !== store.clientId) {
+@@ -80,6 +80,9 @@ async function loadManualStore(
+       error: `${store.name} uses a biometric device for attendance — face scanning is only for Manual-mode stores.`,
+     };
+   }
++  if (!store.faceAttendanceEnabled) {
++    return { error: `Face attendance is not switched on for ${store.name}. Ask an Admin or Client user to enable it in Stores & Brands.` };
++  }
+   return { store };
+ }
+ 
+diff --git a/src/app/(app)/face-attendance/page.tsx b/src/app/(app)/face-attendance/page.tsx
+index 8e58e60..64148ab 100644
+--- a/src/app/(app)/face-attendance/page.tsx
++++ b/src/app/(app)/face-attendance/page.tsx
+@@ -24,6 +24,7 @@ export default async function FaceAttendancePage() {
+   const stores = await prisma.store.findMany({
+     where: {
+       attendanceMode: 'MANUAL',
++      faceAttendanceEnabled: true,
+       ...(role === 'MANAGER' || role === 'SHIFT_INCHARGE' || role === 'PROCESS_ASSOCIATE'
+         ? { id: session.user.storeId ?? '__none__' }
+         : role === 'CLIENT'
+@@ -37,8 +38,10 @@ export default async function FaceAttendancePage() {
+   if (stores.length === 0) {
+     return (
+       <div className="p-8 text-center text-gray-500">
+-        <p>No stores in your scope are set to Manual attendance mode.</p>
+-        <p className="text-sm mt-1">Face scanning works for Manual-mode stores only.</p>
++        <p>Face attendance isn&apos;t switched on for any store you can access.</p>
++        <p className="text-sm mt-1">
++          An Admin or Client user can enable it per store under Stores &amp; Brands (Manual-mode stores only).
++        </p>
+       </div>
+     );
+   }
+diff --git a/src/app/(app)/layout.tsx b/src/app/(app)/layout.tsx
+index 36e0006..1c43ba5 100644
+--- a/src/app/(app)/layout.tsx
++++ b/src/app/(app)/layout.tsx
+@@ -1,6 +1,7 @@
+ import { auth } from '@/auth';
+ import { redirect } from 'next/navigation';
+ import { can } from '@/lib/auth/can';
++import { prisma } from '@/lib/prisma';
+ import { NavLink, type NavItem } from './nav-link';
+ import { MobileNav } from './mobile-nav';
+ import { LogoutButton } from './logout-button';
+@@ -16,7 +17,22 @@ export default async function AppLayout({
+   const userRole = session.user.role;
+   const canViewAttendance = can(session, 'attendance:view', {});
+   const canManualAttendance = can(session, 'attendance:manualEntry', { storeId: session.user.storeId });
+-  const canFaceAttendance = can(session, 'attendance:facePunch', { storeId: session.user.storeId });
++  // Face attendance is an opt-in module: only show it if at least one store in
++  // the user's scope has it switched on.
++  let canFaceAttendance = false;
++  if (can(session, 'attendance:facePunch', { storeId: session.user.storeId })) {
++    const scope =
++      userRole === 'CLIENT'
++        ? { clientId: session.user.clientId ?? '__none__' }
++        : userRole === 'ADMIN'
++        ? {}
++        : { id: session.user.storeId ?? '__none__' };
++    canFaceAttendance =
++      (await prisma.store.count({
++        where: { attendanceMode: 'MANUAL', faceAttendanceEnabled: true, ...scope },
++        take: 1,
++      })) > 0;
++  }
+   const canCsvUpload = can(session, 'attendance:csvUpload', { storeId: session.user.storeId });
+   const canManageDeadlines = can(session, 'attendance:deadlinePolicy:manage');
+   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
+diff --git a/src/app/(app)/stores/actions.ts b/src/app/(app)/stores/actions.ts
+index 2ee4c41..ca43190 100644
+--- a/src/app/(app)/stores/actions.ts
++++ b/src/app/(app)/stores/actions.ts
+@@ -294,6 +294,41 @@ export async function updateStoreAttendanceModeAction(
+   return { ok: true, store: updated };
+ }
+ 
++/**
++ * Switches the Face Attendance module on or off for one store. Admin/Client.
++ * Only MANUAL-mode stores can turn it on (face scans write manual attendance).
++ * Turning it off keeps enrolled face data; it can be deleted per employee.
++ */
++export async function updateStoreFaceAttendanceAction(storeId: string, enabled: boolean) {
++  const session = await auth();
++  if (!session?.user) throw new Error('Unauthorized');
++
++  const store = await prisma.store.findUnique({
++    where: { id: storeId },
++    select: { clientId: true, name: true, attendanceMode: true },
++  });
++  if (!store) return { ok: false, error: 'Store not found.' };
++
++  if (!can(session, 'store:manage', { clientId: store.clientId })) {
++    return { ok: false, error: 'Permission denied to edit this store.' };
++  }
++  if (enabled && store.attendanceMode !== 'MANUAL') {
++    return { ok: false, error: 'Face attendance is only available for Manual-mode stores.' };
++  }
++
++  await prisma.store.update({ where: { id: storeId }, data: { faceAttendanceEnabled: enabled } });
++
++  await writeAuditLog({
++    userId: session.user.id,
++    action: 'STORE_FACE_ATTENDANCE_CHANGED',
++    targetType: 'Store',
++    targetId: storeId,
++    metadata: { name: store.name, enabled },
++  });
++
++  return { ok: true, enabled };
++}
++
+ /**
+  * Edits a Client's business details (location, GSTIN) after creation — these
+  * are often not known at signup. Admin, or the Client user for their own account.
+diff --git a/src/components/stores/StoreManagement.tsx b/src/components/stores/StoreManagement.tsx
+index a82b61a..8fdd109 100644
+--- a/src/components/stores/StoreManagement.tsx
++++ b/src/components/stores/StoreManagement.tsx
+@@ -8,6 +8,7 @@ import {
+   createStoreAction,
+   updateClientDetailsAction,
+   updateStoreDetailsAction,
++  updateStoreFaceAttendanceAction,
+ } from '@/app/(app)/stores/actions';
+ import { Button } from '@/components/ui/button';
+ import { Input } from '@/components/ui/input';
+@@ -25,7 +26,7 @@ import {
+   DialogHeader,
+   DialogTitle,
+ } from '@/components/ui/dialog';
+-import { Building2, Store, Tag, Plus, Loader2, RefreshCw, MapPin, Pencil } from 'lucide-react';
++import { Building2, Store, Tag, Plus, Loader2, RefreshCw, MapPin, Pencil, ScanFace } from 'lucide-react';
+ import { toast } from 'sonner';
+ 
+ export function StoreManagement({ userRole }: { userRole: string }) {
+@@ -189,7 +190,30 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+     }
+   };
+ 
+-  const colCount = userRole === 'ADMIN' ? 10 : 8;
++  const [faceTogglingId, setFaceTogglingId] = useState<string | null>(null);
++
++  const toggleFaceAttendance = async (st: any) => {
++    const enable = !st.faceAttendanceEnabled;
++    if (
++      enable &&
++      !window.confirm(
++        `Turn on face attendance for ${st.name}? Employees must consent before their face is enrolled.`,
++      )
++    ) {
++      return;
++    }
++    setFaceTogglingId(st.id);
++    const res = await updateStoreFaceAttendanceAction(st.id, enable);
++    setFaceTogglingId(null);
++    if (res.ok) {
++      setStores((prev) => prev.map((x) => (x.id === st.id ? { ...x, faceAttendanceEnabled: enable } : x)));
++      toast.success(`Face attendance ${enable ? 'enabled' : 'disabled'} for ${st.name}`);
++    } else {
++      toast.error(res.error ?? 'Could not update.');
++    }
++  };
++
++  const colCount = userRole === 'ADMIN' ? 11 : 9;
+ 
+   return (
+     <div className="space-y-6">
+@@ -252,6 +276,7 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+                     <TableHead>GSTIN</TableHead>
+                     <TableHead>Active Employees</TableHead>
+                     <TableHead>Biometric Devices</TableHead>
++                    <TableHead>Face Attendance</TableHead>
+                     <TableHead className="w-10" />
+                   </TableRow>
+                 </TableHeader>
+@@ -320,6 +345,26 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+                             {st.devices?.length || 0} Devices
+                           </Badge>
+                         </TableCell>
++                        <TableCell>
++                          {st.attendanceMode === 'MANUAL' ? (
++                            <Button
++                              variant={st.faceAttendanceEnabled ? 'default' : 'outline'}
++                              size="sm"
++                              disabled={faceTogglingId === st.id}
++                              onClick={() => toggleFaceAttendance(st)}
++                              aria-label={`Turn face attendance ${st.faceAttendanceEnabled ? 'off' : 'on'} for ${st.name}`}
++                            >
++                              {faceTogglingId === st.id ? (
++                                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
++                              ) : (
++                                <ScanFace className="w-3.5 h-3.5 mr-1.5" />
++                              )}
++                              {st.faceAttendanceEnabled ? 'On' : 'Off'}
++                            </Button>
++                          ) : (
++                            <span className="text-gray-400 text-xs">Manual stores only</span>
++                          )}
++                        </TableCell>
+                         <TableCell>
+                           <Button
+                             variant="ghost"
+diff --git a/src/lib/audit/catalog.ts b/src/lib/audit/catalog.ts
+index 8087809..6ca2e97 100644
+--- a/src/lib/audit/catalog.ts
++++ b/src/lib/audit/catalog.ts
+@@ -27,6 +27,7 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
+   CLIENT_DETAILS_UPDATE: { label: 'Company details updated', category: 'Stores & Clients', severity: 'info' },
+   STORE_DETAILS_UPDATE: { label: 'Store details updated', category: 'Stores & Clients', severity: 'info' },
+   STORE_CREATE: { label: 'Store created', category: 'Stores & Clients', severity: 'notice' },
++  STORE_FACE_ATTENDANCE_CHANGED: { label: 'Face attendance switched on/off', category: 'Stores & Clients', severity: 'notice' },
+   STORE_ATTENDANCE_MODE_CHANGED: { label: 'Attendance mode changed', category: 'Stores & Clients', severity: 'notice' },
+ 
+   DEVICE_ADD: { label: 'Device added', category: 'Devices', severity: 'notice' },

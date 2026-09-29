@@ -8,6 +8,7 @@ import {
   createStoreAction,
   updateClientDetailsAction,
   updateStoreDetailsAction,
+  updateStoreFaceAttendanceAction,
 } from '@/app/(app)/stores/actions';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -25,7 +26,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Building2, Store, Tag, Plus, Loader2, RefreshCw, MapPin, Pencil } from 'lucide-react';
+import { Building2, Store, Tag, Plus, Loader2, RefreshCw, MapPin, Pencil, ScanFace } from 'lucide-react';
 import { toast } from 'sonner';
 
 export function StoreManagement({ userRole }: { userRole: string }) {
@@ -189,7 +190,30 @@ export function StoreManagement({ userRole }: { userRole: string }) {
     }
   };
 
-  const colCount = userRole === 'ADMIN' ? 10 : 8;
+  const [faceTogglingId, setFaceTogglingId] = useState<string | null>(null);
+
+  const toggleFaceAttendance = async (st: any) => {
+    const enable = !st.faceAttendanceEnabled;
+    if (
+      enable &&
+      !window.confirm(
+        `Turn on face attendance for ${st.name}? Employees must consent before their face is enrolled.`,
+      )
+    ) {
+      return;
+    }
+    setFaceTogglingId(st.id);
+    const res = await updateStoreFaceAttendanceAction(st.id, enable);
+    setFaceTogglingId(null);
+    if (res.ok) {
+      setStores((prev) => prev.map((x) => (x.id === st.id ? { ...x, faceAttendanceEnabled: enable } : x)));
+      toast.success(`Face attendance ${enable ? 'enabled' : 'disabled'} for ${st.name}`);
+    } else {
+      toast.error(res.error ?? 'Could not update.');
+    }
+  };
+
+  const colCount = userRole === 'ADMIN' ? 11 : 9;
 
   return (
     <div className="space-y-6">
@@ -252,6 +276,7 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                     <TableHead>GSTIN</TableHead>
                     <TableHead>Active Employees</TableHead>
                     <TableHead>Biometric Devices</TableHead>
+                    <TableHead>Face Attendance</TableHead>
                     <TableHead className="w-10" />
                   </TableRow>
                 </TableHeader>
@@ -319,6 +344,26 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                           <Badge variant="secondary" className="text-xs">
                             {st.devices?.length || 0} Devices
                           </Badge>
+                        </TableCell>
+                        <TableCell>
+                          {st.attendanceMode === 'MANUAL' ? (
+                            <Button
+                              variant={st.faceAttendanceEnabled ? 'default' : 'outline'}
+                              size="sm"
+                              disabled={faceTogglingId === st.id}
+                              onClick={() => toggleFaceAttendance(st)}
+                              aria-label={`Turn face attendance ${st.faceAttendanceEnabled ? 'off' : 'on'} for ${st.name}`}
+                            >
+                              {faceTogglingId === st.id ? (
+                                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                              ) : (
+                                <ScanFace className="w-3.5 h-3.5 mr-1.5" />
+                              )}
+                              {st.faceAttendanceEnabled ? 'On' : 'Off'}
+                            </Button>
+                          ) : (
+                            <span className="text-gray-400 text-xs">Manual stores only</span>
+                          )}
                         </TableCell>
                         <TableCell>
                           <Button

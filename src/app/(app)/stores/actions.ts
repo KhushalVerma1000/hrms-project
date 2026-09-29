@@ -295,6 +295,41 @@ export async function updateStoreAttendanceModeAction(
 }
 
 /**
+ * Switches the Face Attendance module on or off for one store. Admin/Client.
+ * Only MANUAL-mode stores can turn it on (face scans write manual attendance).
+ * Turning it off keeps enrolled face data; it can be deleted per employee.
+ */
+export async function updateStoreFaceAttendanceAction(storeId: string, enabled: boolean) {
+  const session = await auth();
+  if (!session?.user) throw new Error('Unauthorized');
+
+  const store = await prisma.store.findUnique({
+    where: { id: storeId },
+    select: { clientId: true, name: true, attendanceMode: true },
+  });
+  if (!store) return { ok: false, error: 'Store not found.' };
+
+  if (!can(session, 'store:manage', { clientId: store.clientId })) {
+    return { ok: false, error: 'Permission denied to edit this store.' };
+  }
+  if (enabled && store.attendanceMode !== 'MANUAL') {
+    return { ok: false, error: 'Face attendance is only available for Manual-mode stores.' };
+  }
+
+  await prisma.store.update({ where: { id: storeId }, data: { faceAttendanceEnabled: enabled } });
+
+  await writeAuditLog({
+    userId: session.user.id,
+    action: 'STORE_FACE_ATTENDANCE_CHANGED',
+    targetType: 'Store',
+    targetId: storeId,
+    metadata: { name: store.name, enabled },
+  });
+
+  return { ok: true, enabled };
+}
+
+/**
  * Edits a Client's business details (location, GSTIN) after creation — these
  * are often not known at signup. Admin, or the Client user for their own account.
  * Pass only the fields being changed; an empty string clears a field.

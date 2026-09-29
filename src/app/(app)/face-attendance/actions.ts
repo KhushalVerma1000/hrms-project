@@ -61,7 +61,7 @@ export type SimpleResult = { ok: true } | { ok: false; error: string };
 
 // ─── Shared guards ──────────────────────────────────────────────────────────
 
-type ManualStore = { id: string; name: string; clientId: string; attendanceMode: string };
+type ManualStore = { id: string; name: string; clientId: string; attendanceMode: string; faceAttendanceEnabled: boolean };
 
 async function loadManualStore(
   session: Session,
@@ -69,7 +69,7 @@ async function loadManualStore(
 ): Promise<{ store: ManualStore } | { error: string }> {
   const store = await prisma.store.findUnique({
     where: { id: storeId },
-    select: { id: true, name: true, clientId: true, attendanceMode: true },
+    select: { id: true, name: true, clientId: true, attendanceMode: true, faceAttendanceEnabled: true },
   });
   if (!store) return { error: 'Store not found.' };
   if (session.user.role === 'CLIENT' && session.user.clientId !== store.clientId) {
@@ -79,6 +79,9 @@ async function loadManualStore(
     return {
       error: `${store.name} uses a biometric device for attendance — face scanning is only for Manual-mode stores.`,
     };
+  }
+  if (!store.faceAttendanceEnabled) {
+    return { error: `Face attendance is not switched on for ${store.name}. Ask an Admin or Client user to enable it in Stores & Brands.` };
   }
   return { store };
 }

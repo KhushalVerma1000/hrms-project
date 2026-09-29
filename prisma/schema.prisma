@@ -247,6 +247,12 @@ model Store {
   /// after creation by Admin/Client if the store's hardware situation changes.
   attendanceMode AttendanceMode @default(MANUAL)
 
+  /// Face-scan attendance module (phone camera). Off by default; switched on
+  /// per store by Admin/Client from Stores & Brands. Only meaningful for
+  /// MANUAL-mode stores. Turning it off hides the feature and blocks scans and
+  /// enrolment, but keeps enrolled face data (delete it per employee if needed).
+  faceAttendanceEnabled Boolean @default(false)
+
   address        String?
   /// City/area, e.g. "Saket, New Delhi". Shorter than `address` — for
   /// quick display/filtering, not geofencing (see latitude/longitude below).

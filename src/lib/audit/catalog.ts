@@ -27,6 +27,7 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
   CLIENT_DETAILS_UPDATE: { label: 'Company details updated', category: 'Stores & Clients', severity: 'info' },
   STORE_DETAILS_UPDATE: { label: 'Store details updated', category: 'Stores & Clients', severity: 'info' },
   STORE_CREATE: { label: 'Store created', category: 'Stores & Clients', severity: 'notice' },
+  STORE_FACE_ATTENDANCE_CHANGED: { label: 'Face attendance switched on/off', category: 'Stores & Clients', severity: 'notice' },
   STORE_ATTENDANCE_MODE_CHANGED: { label: 'Attendance mode changed', category: 'Stores & Clients', severity: 'notice' },
 
   DEVICE_ADD: { label: 'Device added', category: 'Devices', severity: 'notice' },

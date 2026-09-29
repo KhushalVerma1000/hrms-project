@@ -1,6 +1,7 @@
 import { auth } from '@/auth';
 import { redirect } from 'next/navigation';
 import { can } from '@/lib/auth/can';
+import { prisma } from '@/lib/prisma';
 import { NavLink, type NavItem } from './nav-link';
 import { MobileNav } from './mobile-nav';
 import { LogoutButton } from './logout-button';
@@ -16,7 +17,22 @@ export default async function AppLayout({
   const userRole = session.user.role;
   const canViewAttendance = can(session, 'attendance:view', {});
   const canManualAttendance = can(session, 'attendance:manualEntry', { storeId: session.user.storeId });
-  const canFaceAttendance = can(session, 'attendance:facePunch', { storeId: session.user.storeId });
+  // Face attendance is an opt-in module: only show it if at least one store in
+  // the user's scope has it switched on.
+  let canFaceAttendance = false;
+  if (can(session, 'attendance:facePunch', { storeId: session.user.storeId })) {
+    const scope =
+      userRole === 'CLIENT'
+        ? { clientId: session.user.clientId ?? '__none__' }
+        : userRole === 'ADMIN'
+        ? {}
+        : { id: session.user.storeId ?? '__none__' };
+    canFaceAttendance =
+      (await prisma.store.count({
+        where: { attendanceMode: 'MANUAL', faceAttendanceEnabled: true, ...scope },
+        take: 1,
+      })) > 0;
+  }
   const canCsvUpload = can(session, 'attendance:csvUpload', { storeId: session.user.storeId });
   const canManageDeadlines = can(session, 'attendance:deadlinePolicy:manage');
   const canManageStores = userRole === 'ADMIN' || userRole === 'CLIENT';
