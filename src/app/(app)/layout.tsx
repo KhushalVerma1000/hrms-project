@@ -29,7 +29,7 @@ export default async function AppLayout({
         : { id: session.user.storeId ?? '__none__' };
     canFaceAttendance =
       (await prisma.store.count({
-        where: { attendanceMode: 'MANUAL', faceAttendanceEnabled: true, ...scope },
+        where: { faceAttendanceEnabled: true, ...scope },
         take: 1,
       })) > 0;
   }

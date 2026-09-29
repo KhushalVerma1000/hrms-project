@@ -296,7 +296,7 @@ export async function updateStoreAttendanceModeAction(
 
 /**
  * Switches the Face Attendance module on or off for one store. Admin/Client.
- * Only MANUAL-mode stores can turn it on (face scans write manual attendance).
+ * Works for both MANUAL and BIOMETRIC stores.
  * Turning it off keeps enrolled face data; it can be deleted per employee.
  */
 export async function updateStoreFaceAttendanceAction(storeId: string, enabled: boolean) {
@@ -305,15 +305,12 @@ export async function updateStoreFaceAttendanceAction(storeId: string, enabled: 
 
   const store = await prisma.store.findUnique({
     where: { id: storeId },
-    select: { clientId: true, name: true, attendanceMode: true },
+    select: { clientId: true, name: true },
   });
   if (!store) return { ok: false, error: 'Store not found.' };
 
   if (!can(session, 'store:manage', { clientId: store.clientId })) {
     return { ok: false, error: 'Permission denied to edit this store.' };
-  }
-  if (enabled && store.attendanceMode !== 'MANUAL') {
-    return { ok: false, error: 'Face attendance is only available for Manual-mode stores.' };
   }
 
   await prisma.store.update({ where: { id: storeId }, data: { faceAttendanceEnabled: enabled } });

@@ -1,6 +1,6 @@
 'use server';
 
-import { formatInTimeZone } from 'date-fns-tz';
+import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
 import { requireAuth } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
@@ -11,6 +11,7 @@ import {
   DUPLICATE_THRESHOLD,
   ENROLL_MAX_SAMPLES,
   ENROLL_MIN_SAMPLES,
+  MIN_GAP_MS,
   decidePunch,
   distance,
   findBestMatch,
@@ -23,10 +24,19 @@ import type { Session } from 'next-auth';
  * Face-scan attendance (phone-based, free tier: all face maths runs in the
  * user's browser via face-api; the server only compares 128-number vectors).
  *
- * Writes into ManualAttendanceEntry (source FACE_SCAN), so period deadlines,
- * monthly overtime and the Daily Register all keep working unchanged. Only
- * MANUAL-mode stores are supported, same rule as manual entry.
+ * Works for EVERY store, whatever its attendance mode (once switched on for the store):
+ *  - MANUAL stores    → writes ManualAttendanceEntry (source FACE_SCAN), so period
+ *                       deadlines, monthly overtime and the Daily Register keep
+ *                       working unchanged.
+ *  - BIOMETRIC stores → writes an AttendanceLog row against a virtual device
+ *                       serial (FACE-<storeId>), so the phone scan shows up in the
+ *                       same Attendance Logs screen and OT maths as device punches.
+ *                       The device sync never touches this serial, so it is never
+ *                       overwritten.
  */
+
+/** Virtual "device" serial that phone face-scans are logged under for BIOMETRIC stores. */
+const faceSerialFor = (storeId: string) => `FACE-${storeId}`;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -63,7 +73,7 @@ export type SimpleResult = { ok: true } | { ok: false; error: string };
 
 type ManualStore = { id: string; name: string; clientId: string; attendanceMode: string; faceAttendanceEnabled: boolean };
 
-async function loadManualStore(
+async function loadFaceStore(
   session: Session,
   storeId: string,
 ): Promise<{ store: ManualStore } | { error: string }> {
@@ -74,11 +84,6 @@ async function loadManualStore(
   if (!store) return { error: 'Store not found.' };
   if (session.user.role === 'CLIENT' && session.user.clientId !== store.clientId) {
     return { error: 'Not authorized for this store.' };
-  }
-  if (store.attendanceMode !== 'MANUAL') {
-    return {
-      error: `${store.name} uses a biometric device for attendance — face scanning is only for Manual-mode stores.`,
-    };
   }
   if (!store.faceAttendanceEnabled) {
     return { error: `Face attendance is not switched on for ${store.name}. Ask an Admin or Client user to enable it in Stores & Brands.` };
@@ -98,7 +103,7 @@ export async function getFaceContext(
 ): Promise<{ ok: true; data: FaceContext } | { ok: false; error: string }> {
   try {
     const session = await requireAuth('attendance:facePunch', { storeId });
-    const loaded = await loadManualStore(session, storeId);
+    const loaded = await loadFaceStore(session, storeId);
     if ('error' in loaded) return { ok: false, error: loaded.error };
 
     const employees = await prisma.employee.findMany({
@@ -136,18 +141,23 @@ export async function recordFacePunch(storeId: string, rawDescriptor: unknown): 
     const descriptor = parseDescriptor(rawDescriptor);
     if (!descriptor) return { ok: false, code: 'ERROR', error: 'Scan data was invalid. Please try again.' };
 
-    const loaded = await loadManualStore(session, storeId);
+    const loaded = await loadFaceStore(session, storeId);
     if ('error' in loaded) return { ok: false, code: 'ERROR', error: loaded.error };
 
     // "Today" is the store's local calendar day, not the server's (Vercel runs in UTC).
     const now = new Date();
     const dateStr = formatInTimeZone(now, SMARTOFFICE_TIMEZONE, 'yyyy-MM-dd');
     const date = new Date(dateStr); // UTC midnight — same convention as the Daily Register
+    const isBiometricStore = loaded.store.attendanceMode !== 'MANUAL';
 
-    const period = await getOrCreatePeriod(storeId, date.getFullYear(), date.getMonth() + 1);
-    if (session.user.role !== 'ADMIN') {
-      const blocked = writeBlockedReason(period.status);
-      if (blocked) return { ok: false, code: 'CLOSED', error: blocked };
+    // Period deadlines only govern manually-entered attendance; device-style
+    // punches are never blocked by them (the device sync isn't either).
+    if (!isBiometricStore) {
+      const period = await getOrCreatePeriod(storeId, date.getFullYear(), date.getMonth() + 1);
+      if (session.user.role !== 'ADMIN') {
+        const blocked = writeBlockedReason(period.status);
+        if (blocked) return { ok: false, code: 'CLOSED', error: blocked };
+      }
     }
 
     const templates = await prisma.faceTemplate.findMany({
@@ -172,9 +182,36 @@ export async function recordFacePunch(storeId: string, rawDescriptor: unknown): 
 
     const employee = await prisma.employee.findUnique({
       where: { id: match.employeeId },
-      select: { id: true, name: true, designation: true },
+      select: { id: true, name: true, designation: true, staffCode: true },
     });
     if (!employee) return { ok: false, code: 'ERROR', error: 'Employee not found.' };
+    const person = { id: employee.id, name: employee.name, designation: employee.designation };
+
+    // ── BIOMETRIC store: log the scan like a device punch ───────────────────
+    if (isBiometricStore) {
+      const dayStart = fromZonedTime(`${dateStr} 00:00:00`, SMARTOFFICE_TIMEZONE);
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+      const todays = await prisma.attendanceLog.findMany({
+        where: { employeeCode: employee.staffCode, logDate: { gte: dayStart, lt: dayEnd } },
+        orderBy: { logDate: 'desc' },
+        select: { logDate: true },
+        take: 1,
+      });
+      const last = todays[0]?.logDate;
+      if (last && now.getTime() - last.getTime() < MIN_GAP_MS) {
+        return { ok: true, outcome: 'ALREADY_RECORDED', employee: person, at: last.toISOString() };
+      }
+      const isFirst = !last;
+      await prisma.attendanceLog.create({
+        data: {
+          employeeCode: employee.staffCode,
+          logDate: now,
+          serialNumber: faceSerialFor(storeId),
+          punchDirection: isFirst ? 'IN' : 'OUT',
+        },
+      });
+      return { ok: true, outcome: isFirst ? 'CHECKED_IN' : 'CHECKED_OUT', employee: person, at: now.toISOString() };
+    }
 
     const existing = await prisma.manualAttendanceEntry.findUnique({
       where: { employeeId_date: { employeeId: employee.id, date } },
@@ -193,7 +230,7 @@ export async function recordFacePunch(storeId: string, rawDescriptor: unknown): 
         };
 
       case 'TOO_SOON':
-        return { ok: true, outcome: 'ALREADY_RECORDED', employee, at: decision.lastPunch.toISOString() };
+        return { ok: true, outcome: 'ALREADY_RECORDED', employee: person, at: decision.lastPunch.toISOString() };
 
       case 'CREATE_CHECK_IN':
         await prisma.manualAttendanceEntry.create({
@@ -206,7 +243,7 @@ export async function recordFacePunch(storeId: string, rawDescriptor: unknown): 
             enteredByUserId: session.user.id,
           },
         });
-        return { ok: true, outcome: 'CHECKED_IN', employee, at: now.toISOString() };
+        return { ok: true, outcome: 'CHECKED_IN', employee: person, at: now.toISOString() };
 
       case 'SET_CHECK_IN':
         await prisma.manualAttendanceEntry.update({
@@ -222,7 +259,7 @@ export async function recordFacePunch(storeId: string, rawDescriptor: unknown): 
                 enteredByUserId: session.user.id,
               },
         });
-        return { ok: true, outcome: 'CHECKED_IN', employee, at: now.toISOString() };
+        return { ok: true, outcome: 'CHECKED_IN', employee: person, at: now.toISOString() };
 
       case 'SET_CHECK_OUT':
         await prisma.manualAttendanceEntry.update({
@@ -232,7 +269,7 @@ export async function recordFacePunch(storeId: string, rawDescriptor: unknown): 
         return {
           ok: true,
           outcome: decision.isUpdate ? 'CHECK_OUT_UPDATED' : 'CHECKED_OUT',
-          employee,
+          employee: person,
           at: now.toISOString(),
         };
     }
@@ -270,7 +307,7 @@ export async function enrollFace(
     if (!employee) return { ok: false, error: 'Employee not found.' };
 
     const session = await requireAuth('attendance:faceEnroll', { storeId: employee.storeId });
-    const loaded = await loadManualStore(session, employee.storeId);
+    const loaded = await loadFaceStore(session, employee.storeId);
     if ('error' in loaded) return { ok: false, error: loaded.error };
     if (employee.status !== 'ACTIVE') return { ok: false, error: 'Only active employees can be enrolled.' };
 

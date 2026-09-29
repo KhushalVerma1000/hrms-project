@@ -20,10 +20,10 @@ export default async function FaceAttendancePage() {
 
   const role = session.user.role;
 
-  // Only MANUAL-mode stores in the caller's scope — face scans write manual attendance rows.
+  // Every store in the caller's scope with the module switched on — MANUAL stores get
+  // manual attendance rows, BIOMETRIC stores get an AttendanceLog row.
   const stores = await prisma.store.findMany({
     where: {
-      attendanceMode: 'MANUAL',
       faceAttendanceEnabled: true,
       ...(role === 'MANAGER' || role === 'SHIFT_INCHARGE' || role === 'PROCESS_ASSOCIATE'
         ? { id: session.user.storeId ?? '__none__' }
@@ -40,7 +40,7 @@ export default async function FaceAttendancePage() {
       <div className="p-8 text-center text-gray-500">
         <p>Face attendance isn&apos;t switched on for any store you can access.</p>
         <p className="text-sm mt-1">
-          An Admin or Client user can enable it per store under Stores &amp; Brands (Manual-mode stores only).
+          An Admin or Client user can enable it per store under Stores &amp; Brands.
         </p>
       </div>
     );

@@ -346,24 +346,20 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                           </Badge>
                         </TableCell>
                         <TableCell>
-                          {st.attendanceMode === 'MANUAL' ? (
-                            <Button
-                              variant={st.faceAttendanceEnabled ? 'default' : 'outline'}
-                              size="sm"
-                              disabled={faceTogglingId === st.id}
-                              onClick={() => toggleFaceAttendance(st)}
-                              aria-label={`Turn face attendance ${st.faceAttendanceEnabled ? 'off' : 'on'} for ${st.name}`}
-                            >
-                              {faceTogglingId === st.id ? (
-                                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                              ) : (
-                                <ScanFace className="w-3.5 h-3.5 mr-1.5" />
-                              )}
-                              {st.faceAttendanceEnabled ? 'On' : 'Off'}
-                            </Button>
-                          ) : (
-                            <span className="text-gray-400 text-xs">Manual stores only</span>
-                          )}
+                          <Button
+                            variant={st.faceAttendanceEnabled ? 'default' : 'outline'}
+                            size="sm"
+                            disabled={faceTogglingId === st.id}
+                            onClick={() => toggleFaceAttendance(st)}
+                            aria-label={`Turn face attendance ${st.faceAttendanceEnabled ? 'off' : 'on'} for ${st.name}`}
+                          >
+                            {faceTogglingId === st.id ? (
+                              <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                            ) : (
+                              <ScanFace className="w-3.5 h-3.5 mr-1.5" />
+                            )}
+                            {st.faceAttendanceEnabled ? 'On' : 'Off'}
+                          </Button>
                         </TableCell>
                         <TableCell>
                           <Button
