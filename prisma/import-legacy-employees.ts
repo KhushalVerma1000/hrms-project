@@ -327,6 +327,7 @@ function mapCategoryToDesignation(category: string): Designation {
   if (c.includes('shift') && c.includes('incharge')) return Designation.SHIFT_INCHARGE;
   if (c.includes('process')) return Designation.PROCESS_ASSOCIATE;
   if (c.includes('quality')) return Designation.QUALITY_ASSOCIATE;
+  if (c.includes('house')) return Designation.HOUSEKEEPING;
   if (c.includes('associate')) return Designation.ASSOCIATE;
   return Designation.ASSOCIATE; // safe default — reclassify manually in the app if wrong
 }

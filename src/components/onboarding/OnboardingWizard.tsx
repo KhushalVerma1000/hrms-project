@@ -49,7 +49,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   const [team, setTeam] = useState('');
   const [cardNumber, setCardNumber] = useState('');
 
-  // App login fields (PA/SI only)
+  // App login fields (PA/SI/Store Manager only)
   const [createAppLogin, setCreateAppLogin] = useState(false);
   const [email, setEmail] = useState('');
   const [tempPassword, setTempPassword] = useState('');
@@ -103,7 +103,9 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   }, [storeId]);
 
   const isAppRoleDesignation =
-    designation === Designation.PROCESS_ASSOCIATE || designation === Designation.SHIFT_INCHARGE;
+    designation === Designation.PROCESS_ASSOCIATE ||
+    designation === Designation.SHIFT_INCHARGE ||
+    designation === Designation.STORE_MANAGER;
 
   const handleStep1Next = () => {
     if (!name.trim()) {
@@ -306,11 +308,17 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                     <SelectItem value={Designation.QUALITY_ASSOCIATE}>
                       Quality Associate (No App Login)
                     </SelectItem>
+                    <SelectItem value={Designation.HOUSEKEEPING}>
+                      Housekeeping (No App Login)
+                    </SelectItem>
                     <SelectItem value={Designation.PROCESS_ASSOCIATE}>
                       Process Associate (Grants App Login)
                     </SelectItem>
                     <SelectItem value={Designation.SHIFT_INCHARGE}>
                       Shift Incharge (Grants App Login)
+                    </SelectItem>
+                    <SelectItem value={Designation.STORE_MANAGER}>
+                      Store Manager (Grants App Login)
                     </SelectItem>
                   </SelectContent>
                 </Select>
@@ -364,7 +372,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
               </p>
             )}
 
-            {/* Conditional App Login Sub-step for PA / SI */}
+            {/* Conditional App Login Sub-step for PA / SI / Store Manager */}
             {isAppRoleDesignation && (
               <div className="p-4 rounded-lg border border-indigo-200 bg-indigo-50/50 dark:bg-indigo-950/20 dark:border-indigo-900 space-y-3">
                 <div className="flex items-center justify-between">

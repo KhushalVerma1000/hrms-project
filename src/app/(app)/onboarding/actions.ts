@@ -104,7 +104,8 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
 
   const isAppRoleDesignation =
     input.designation === Designation.PROCESS_ASSOCIATE ||
-    input.designation === Designation.SHIFT_INCHARGE;
+    input.designation === Designation.SHIFT_INCHARGE ||
+    input.designation === Designation.STORE_MANAGER;
 
   if (isAppRoleDesignation && input.createAppLogin) {
     if (!input.email || !input.email.includes('@')) {
@@ -159,7 +160,12 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
             email: input.email.trim(),
             passwordHash,
             name: input.name.trim(),
-            role: input.designation === Designation.PROCESS_ASSOCIATE ? 'PROCESS_ASSOCIATE' : 'SHIFT_INCHARGE',
+            role:
+              input.designation === Designation.STORE_MANAGER
+                ? 'MANAGER'
+                : input.designation === Designation.PROCESS_ASSOCIATE
+                  ? 'PROCESS_ASSOCIATE'
+                  : 'SHIFT_INCHARGE',
             clientId: store?.clientId,
             storeId: input.storeId,
             employeeId: employee.id,

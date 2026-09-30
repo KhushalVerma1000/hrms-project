@@ -1,0 +1,166 @@
+diff --git a/prisma/import-legacy-employees.ts b/prisma/import-legacy-employees.ts
+index b3d7ab7..5b6ac9f 100644
+--- a/prisma/import-legacy-employees.ts
++++ b/prisma/import-legacy-employees.ts
+@@ -327,6 +327,7 @@ function mapCategoryToDesignation(category: string): Designation {
+   if (c.includes('shift') && c.includes('incharge')) return Designation.SHIFT_INCHARGE;
+   if (c.includes('process')) return Designation.PROCESS_ASSOCIATE;
+   if (c.includes('quality')) return Designation.QUALITY_ASSOCIATE;
++  if (c.includes('house')) return Designation.HOUSEKEEPING;
+   if (c.includes('associate')) return Designation.ASSOCIATE;
+   return Designation.ASSOCIATE; // safe default — reclassify manually in the app if wrong
+ }
+diff --git a/prisma/migrations/20260930100000_store_manager_designation/migration.sql b/prisma/migrations/20260930100000_store_manager_designation/migration.sql
+new file mode 100644
+index 0000000..46ccdd8
+--- /dev/null
++++ b/prisma/migrations/20260930100000_store_manager_designation/migration.sql
+@@ -0,0 +1,3 @@
++-- Store Managers can now be enrolled as Employee records (with a linked
++-- MANAGER login) like Process Associates / Shift Incharges.
++ALTER TYPE "Designation" ADD VALUE IF NOT EXISTS 'STORE_MANAGER';
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 1d5fa6c..d22db3b 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -27,10 +27,13 @@ enum Role {
+ 
+ /**
+  * Staff designations — applies to Employee records only (biometric enrollment,
+- * attendance tracking). Only PROCESS_ASSOCIATE and SHIFT_INCHARGE designations
+- * additionally get a linked User record for app access.
+- * MANAGER is NOT a designation — Managers are created via User & Role
+- * Management and have no Employee record (no biometric enrollment).
++ * attendance tracking). STORE_MANAGER, PROCESS_ASSOCIATE and SHIFT_INCHARGE
++ * designations additionally get a linked User record for app access
++ * (STORE_MANAGER -> Role.MANAGER). ASSOCIATE, QUALITY_ASSOCIATE and
++ * HOUSEKEEPING never get app access.
++ * A Manager can ALSO still be created directly via User & Role Management
++ * without an Employee record (no biometric enrollment) — enrolling them as a
++ * STORE_MANAGER employee is the route for managers who need attendance tracking.
+  */
+ enum Designation {
+   ASSOCIATE          /// No app access. Employee record only.
+@@ -38,6 +41,7 @@ enum Designation {
+   QUALITY_ASSOCIATE  /// No app access. Employee record only.
+   SHIFT_INCHARGE     /// Has app access. Linked User record created at onboarding.
+   HOUSEKEEPING       /// No app access. Employee record only — attendance-tracked like Associate/QA.
++  STORE_MANAGER      /// Has app access (Role.MANAGER). Enrolled like any employee; linked User created at onboarding.
+   OTHER              /// Catchall for non-standard designations.
+ }
+ 
+@@ -360,7 +364,7 @@ model Employee {
+   storeId String
+   store   Store  @relation(fields: [storeId], references: [id])
+ 
+-  /// Drives whether this person gets a linked User login (PA/SI only).
++  /// Drives whether this person gets a linked User login (PA/SI/Store Manager only).
+   designation Designation @default(ASSOCIATE)
+   grade       String?
+   team        String?
+@@ -416,8 +420,10 @@ model User {
+   storeId String?
+   store   Store?  @relation(fields: [storeId], references: [id])
+ 
+-  /// Set ONLY for PROCESS_ASSOCIATE / SHIFT_INCHARGE — links their app login
+-  /// to their own attendance-tracked Employee record. NULL for ADMIN/CLIENT/MANAGER.
++  /// Set ONLY for PROCESS_ASSOCIATE / SHIFT_INCHARGE / MANAGER enrolled as a
++  /// STORE_MANAGER employee — links their app login to their own
++  /// attendance-tracked Employee record. NULL for ADMIN/CLIENT and for
++  /// managers created directly via User & Role Management.
+   employeeId String?   @unique
+   employee   Employee? @relation(fields: [employeeId], references: [id])
+ 
+diff --git a/src/app/(app)/onboarding/actions.ts b/src/app/(app)/onboarding/actions.ts
+index 70113ca..b65e052 100644
+--- a/src/app/(app)/onboarding/actions.ts
++++ b/src/app/(app)/onboarding/actions.ts
+@@ -104,7 +104,8 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+ 
+   const isAppRoleDesignation =
+     input.designation === Designation.PROCESS_ASSOCIATE ||
+-    input.designation === Designation.SHIFT_INCHARGE;
++    input.designation === Designation.SHIFT_INCHARGE ||
++    input.designation === Designation.STORE_MANAGER;
+ 
+   if (isAppRoleDesignation && input.createAppLogin) {
+     if (!input.email || !input.email.includes('@')) {
+@@ -159,7 +160,12 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+             email: input.email.trim(),
+             passwordHash,
+             name: input.name.trim(),
+-            role: input.designation === Designation.PROCESS_ASSOCIATE ? 'PROCESS_ASSOCIATE' : 'SHIFT_INCHARGE',
++            role:
++              input.designation === Designation.STORE_MANAGER
++                ? 'MANAGER'
++                : input.designation === Designation.PROCESS_ASSOCIATE
++                  ? 'PROCESS_ASSOCIATE'
++                  : 'SHIFT_INCHARGE',
+             clientId: store?.clientId,
+             storeId: input.storeId,
+             employeeId: employee.id,
+diff --git a/src/components/employees/EmployeeDirectory.tsx b/src/components/employees/EmployeeDirectory.tsx
+index 77a2d9d..30d11c3 100644
+--- a/src/components/employees/EmployeeDirectory.tsx
++++ b/src/components/employees/EmployeeDirectory.tsx
+@@ -215,6 +215,8 @@ export function EmployeeDirectory({ userRole }: { userRole: string }) {
+                 <SelectItem value="PROCESS_ASSOCIATE">Process Associate</SelectItem>
+                 <SelectItem value="QUALITY_ASSOCIATE">Quality Associate</SelectItem>
+                 <SelectItem value="SHIFT_INCHARGE">Shift Incharge</SelectItem>
++                <SelectItem value="STORE_MANAGER">Store Manager</SelectItem>
++                <SelectItem value="HOUSEKEEPING">Housekeeping</SelectItem>
+               </SelectContent>
+             </Select>
+ 
+diff --git a/src/components/onboarding/OnboardingWizard.tsx b/src/components/onboarding/OnboardingWizard.tsx
+index cd10341..01ed138 100644
+--- a/src/components/onboarding/OnboardingWizard.tsx
++++ b/src/components/onboarding/OnboardingWizard.tsx
+@@ -49,7 +49,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+   const [team, setTeam] = useState('');
+   const [cardNumber, setCardNumber] = useState('');
+ 
+-  // App login fields (PA/SI only)
++  // App login fields (PA/SI/Store Manager only)
+   const [createAppLogin, setCreateAppLogin] = useState(false);
+   const [email, setEmail] = useState('');
+   const [tempPassword, setTempPassword] = useState('');
+@@ -103,7 +103,9 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+   }, [storeId]);
+ 
+   const isAppRoleDesignation =
+-    designation === Designation.PROCESS_ASSOCIATE || designation === Designation.SHIFT_INCHARGE;
++    designation === Designation.PROCESS_ASSOCIATE ||
++    designation === Designation.SHIFT_INCHARGE ||
++    designation === Designation.STORE_MANAGER;
+ 
+   const handleStep1Next = () => {
+     if (!name.trim()) {
+@@ -306,12 +308,18 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                     <SelectItem value={Designation.QUALITY_ASSOCIATE}>
+                       Quality Associate (No App Login)
+                     </SelectItem>
++                    <SelectItem value={Designation.HOUSEKEEPING}>
++                      Housekeeping (No App Login)
++                    </SelectItem>
+                     <SelectItem value={Designation.PROCESS_ASSOCIATE}>
+                       Process Associate (Grants App Login)
+                     </SelectItem>
+                     <SelectItem value={Designation.SHIFT_INCHARGE}>
+                       Shift Incharge (Grants App Login)
+                     </SelectItem>
++                    <SelectItem value={Designation.STORE_MANAGER}>
++                      Store Manager (Grants App Login)
++                    </SelectItem>
+                   </SelectContent>
+                 </Select>
+               </div>
+@@ -364,7 +372,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+               </p>
+             )}
+ 
+-            {/* Conditional App Login Sub-step for PA / SI */}
++            {/* Conditional App Login Sub-step for PA / SI / Store Manager */}
+             {isAppRoleDesignation && (
+               <div className="p-4 rounded-lg border border-indigo-200 bg-indigo-50/50 dark:bg-indigo-950/20 dark:border-indigo-900 space-y-3">
+                 <div className="flex items-center justify-between">

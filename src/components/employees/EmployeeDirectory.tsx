@@ -215,6 +215,8 @@ export function EmployeeDirectory({ userRole }: { userRole: string }) {
                 <SelectItem value="PROCESS_ASSOCIATE">Process Associate</SelectItem>
                 <SelectItem value="QUALITY_ASSOCIATE">Quality Associate</SelectItem>
                 <SelectItem value="SHIFT_INCHARGE">Shift Incharge</SelectItem>
+                <SelectItem value="STORE_MANAGER">Store Manager</SelectItem>
+                <SelectItem value="HOUSEKEEPING">Housekeeping</SelectItem>
               </SelectContent>
             </Select>
 
