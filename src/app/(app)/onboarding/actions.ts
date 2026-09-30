@@ -9,6 +9,7 @@ import { writeAuditLog } from '@/lib/smartoffice/audit';
 import bcrypt from 'bcryptjs';
 import { Designation, EmployeeStatus } from '@prisma/client';
 import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
+import { normalizeMobile, whatsAppFormLink } from '@/lib/whatsapp';
 
 export interface OnboardingSubmitInput {
   name: string;
@@ -19,6 +20,8 @@ export interface OnboardingSubmitInput {
   grade?: string;
   team?: string;
   cardNumber?: string;
+  /** Candidate's mobile number (any common format; normalised server-side). */
+  mobileNumber?: string;
 
   // App login fields (only for PROCESS_ASSOCIATE and SHIFT_INCHARGE)
   createAppLogin?: boolean;
@@ -101,6 +104,10 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
   // Input validation
   if (!input.name.trim()) return { ok: false, error: 'Employee name is required.' };
   if (!input.storeId) return { ok: false, error: 'Store selection is required.' };
+  const mobileNumber = normalizeMobile(input.mobileNumber);
+  if (!mobileNumber) {
+    return { ok: false, error: 'A valid mobile number is required (10 digits, or with country code).' };
+  }
 
   const isAppRoleDesignation =
     input.designation === Designation.PROCESS_ASSOCIATE ||
@@ -142,6 +149,7 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
           grade: input.grade,
           team: input.team,
           cardNumber: input.cardNumber,
+          mobileNumber,
           status: EmployeeStatus.ACTIVE,
           onboardingStep: 'COMPLETED',
         },
@@ -269,12 +277,19 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
       select: ONBOARDING_FORM_STORE_SELECT,
     });
     const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store);
+    const whatsappUrl = whatsAppFormLink({
+      mobile: mobileNumber,
+      name: input.name,
+      clientName: store?.client.name,
+      formUrl: googleFormUrl,
+    });
 
     return {
       ok: true,
       employeeId: result.employee.id,
       staffCode: result.staffCode,
       googleFormUrl,
+      whatsappUrl,
       // null for MANUAL-mode stores — no biometric command was enqueued, so
       // there's nothing for getCommandStatusAction to poll. Callers should
       // treat a null commandId as "onboarding complete, no sync needed"

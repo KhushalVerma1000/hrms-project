@@ -3,13 +3,14 @@
 import { requireAuth } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
 import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
+import { whatsAppFormLink } from '@/lib/whatsapp';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 
 /**
  * Marks a form as sent (NOT_SENT → PENDING) and logs the action.
  * Returns the prefilled form URL for sharing.
  */
-export async function markFormSent(employeeId: string): Promise<{ ok: boolean; formLink?: string }> {
+export async function markFormSent(employeeId: string): Promise<{ ok: boolean; formLink?: string; whatsappUrl?: string }> {
   const session = await requireAuth('formTracking:remind');
 
   const employee = await prisma.employee.findUnique({
@@ -17,6 +18,8 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
     select: {
       staffCode: true,
       storeId: true,
+      mobileNumber: true,
+      name: true,
       store: { select: ONBOARDING_FORM_STORE_SELECT },
     },
   });
@@ -40,7 +43,13 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
   });
 
   const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
-  return { ok: true, formLink };
+  const whatsappUrl = whatsAppFormLink({
+    mobile: employee.mobileNumber,
+    name: employee.name,
+    clientName: employee.store.client.name,
+    formUrl: formLink,
+  });
+  return { ok: true, formLink, whatsappUrl };
 }
 
 /**
@@ -50,7 +59,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
  */
 export async function sendFormReminder(
   employeeId: string,
-): Promise<{ ok: boolean; formLink?: string }> {
+): Promise<{ ok: boolean; formLink?: string; whatsappUrl?: string }> {
   const session = await requireAuth('formTracking:remind');
 
   const employee = await prisma.employee.findUnique({
@@ -58,6 +67,7 @@ export async function sendFormReminder(
     select: {
       staffCode: true,
       storeId: true,
+      mobileNumber: true,
       name: true,
       store: { select: ONBOARDING_FORM_STORE_SELECT },
     },
@@ -93,5 +103,11 @@ export async function sendFormReminder(
   });
 
   const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
-  return { ok: true, formLink };
+  const whatsappUrl = whatsAppFormLink({
+    mobile: employee.mobileNumber,
+    name: employee.name,
+    clientName: employee.store.client.name,
+    formUrl: formLink,
+  });
+  return { ok: true, formLink, whatsappUrl };
 }

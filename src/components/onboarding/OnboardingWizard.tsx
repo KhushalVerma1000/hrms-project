@@ -17,7 +17,8 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { CheckCircle2, AlertTriangle, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode } from 'lucide-react';
+import { normalizeMobile, formatMobile } from '@/lib/whatsapp';
+import { CheckCircle2, AlertTriangle, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface StoreOption {
@@ -48,6 +49,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   const [grade, setGrade] = useState('');
   const [team, setTeam] = useState('');
   const [cardNumber, setCardNumber] = useState('');
+  const [mobileNumber, setMobileNumber] = useState('');
 
   // App login fields (PA/SI/Store Manager only)
   const [createAppLogin, setCreateAppLogin] = useState(false);
@@ -67,6 +69,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   const [onboardResult, setOnboardResult] = useState<{
     staffCode: string;
     googleFormUrl: string;
+    whatsappUrl: string;
     commandId: string;
   } | null>(null);
   const [cmdStatus, setCmdStatus] = useState<string>('PENDING');
@@ -116,6 +119,10 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
       toast.error('Please select a store');
       return;
     }
+    if (normalizeMobile(mobileNumber) === null) {
+      toast.error('Please enter a valid mobile number (10 digits, or with country code)');
+      return;
+    }
     if (isAppRoleDesignation && createAppLogin && (!email || !email.includes('@'))) {
       toast.error('Please enter a valid email for app login');
       return;
@@ -139,6 +146,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
         grade: grade || undefined,
         team: team || undefined,
         cardNumber: cardNumber || undefined,
+        mobileNumber,
         createAppLogin: isAppRoleDesignation ? createAppLogin : false,
         email: isAppRoleDesignation && createAppLogin ? email : undefined,
         password: isAppRoleDesignation && createAppLogin && tempPassword ? tempPassword : undefined,
@@ -154,6 +162,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
       setOnboardResult({
         staffCode: res.staffCode!,
         googleFormUrl: res.googleFormUrl!,
+        whatsappUrl: res.whatsappUrl!,
         commandId: res.commandId!,
       });
       toast.success(`Associate ${res.staffCode} onboarded successfully!`);
@@ -258,6 +267,20 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                     <SelectItem value="Other">Other</SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="mobile">Mobile Number (WhatsApp) *</Label>
+                <Input
+                  id="mobile"
+                  type="tel"
+                  inputMode="tel"
+                  autoComplete="off"
+                  placeholder="e.g. 98765 43210"
+                  value={mobileNumber}
+                  onChange={(e) => setMobileNumber(e.target.value)}
+                />
+                <p className="text-xs text-gray-500">The onboarding form link is sent to this number on WhatsApp.</p>
               </div>
 
               <div className="space-y-2">
@@ -536,6 +559,10 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                 <span>{dateOfBirth || '-'}</span>
               </div>
               <div>
+                <span className="text-gray-500 block text-xs">Mobile</span>
+                <span>{formatMobile(normalizeMobile(mobileNumber)) || '-'}</span>
+              </div>
+              <div>
                 <span className="text-gray-500 block text-xs">Card Number</span>
                 <span>{cardNumber || 'None'}</span>
               </div>
@@ -650,6 +677,17 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   </a>
                 </Button>
               </div>
+              {onboardResult.whatsappUrl ? (
+                <Button className="w-full bg-green-600 hover:bg-green-700 text-white" asChild>
+                  <a href={onboardResult.whatsappUrl} target="_blank" rel="noreferrer">
+                    <MessageCircle className="w-4 h-4 mr-2" /> Send form link on WhatsApp
+                  </a>
+                </Button>
+              ) : (
+                <p className="text-xs text-amber-600">
+                  No onboarding form is configured for this store, so there is no link to send yet.
+                </p>
+              )}
             </div>
           </CardContent>
           <CardFooter className="flex justify-between">
@@ -659,6 +697,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                 setStep(1);
                 setName('');
                 setCardNumber('');
+                setMobileNumber('');
                 setPreviewCode(null);
                 setOnboardResult(null);
               }}

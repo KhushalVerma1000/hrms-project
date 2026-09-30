@@ -107,13 +107,13 @@ export const GOOGLE_FORM_ECODE_FIELD_ID: string =
 type FormPair = { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null };
 
 /** A store row (with its client) as needed to resolve the onboarding form. */
-export type OnboardingFormSource = FormPair & { client?: FormPair | null };
+export type OnboardingFormSource = FormPair & { client?: (FormPair & { name?: string }) | null };
 
 /** Prisma `select` that loads everything resolveOnboardingForm() needs. */
 export const ONBOARDING_FORM_STORE_SELECT = {
   googleFormBaseUrl: true,
   googleFormECodeFieldId: true,
-  client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } },
+  client: { select: { name: true, googleFormBaseUrl: true, googleFormECodeFieldId: true } },
 } as const;
 
 /**

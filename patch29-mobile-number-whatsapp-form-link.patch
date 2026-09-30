@@ -1,0 +1,454 @@
+diff --git a/prisma/migrations/20260930120000_employee_mobile_number/migration.sql b/prisma/migrations/20260930120000_employee_mobile_number/migration.sql
+new file mode 100644
+index 0000000..8c446db
+--- /dev/null
++++ b/prisma/migrations/20260930120000_employee_mobile_number/migration.sql
+@@ -0,0 +1,2 @@
++-- Mobile number (digits with country code) for WhatsApp onboarding-form links.
++ALTER TABLE "Employee" ADD COLUMN "mobileNumber" TEXT;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index ed7d348..cb89b21 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -383,6 +383,11 @@ model Employee {
+   dateOfRelieving    DateTime?
+   cardNumber         String?
+ 
++  /// Mobile number, digits only WITH country code (e.g. "919876543210") so it
++  /// drops straight into a wa.me link. Normalised by normalizeMobile() in
++  /// src/lib/whatsapp.ts. Null for legacy employees imported without one.
++  mobileNumber       String?
++
+   /// Tracks progress through the multi-step onboarding wizard (resumable).
+   onboardingStep String?
+ 
+diff --git a/src/app/(app)/onboarding/actions.ts b/src/app/(app)/onboarding/actions.ts
+index 3f6c936..e5fceec 100644
+--- a/src/app/(app)/onboarding/actions.ts
++++ b/src/app/(app)/onboarding/actions.ts
+@@ -9,6 +9,7 @@ import { writeAuditLog } from '@/lib/smartoffice/audit';
+ import bcrypt from 'bcryptjs';
+ import { Designation, EmployeeStatus } from '@prisma/client';
+ import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
++import { normalizeMobile, whatsAppFormLink } from '@/lib/whatsapp';
+ 
+ export interface OnboardingSubmitInput {
+   name: string;
+@@ -19,6 +20,8 @@ export interface OnboardingSubmitInput {
+   grade?: string;
+   team?: string;
+   cardNumber?: string;
++  /** Candidate's mobile number (any common format; normalised server-side). */
++  mobileNumber?: string;
+ 
+   // App login fields (only for PROCESS_ASSOCIATE and SHIFT_INCHARGE)
+   createAppLogin?: boolean;
+@@ -101,6 +104,10 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+   // Input validation
+   if (!input.name.trim()) return { ok: false, error: 'Employee name is required.' };
+   if (!input.storeId) return { ok: false, error: 'Store selection is required.' };
++  const mobileNumber = normalizeMobile(input.mobileNumber);
++  if (!mobileNumber) {
++    return { ok: false, error: 'A valid mobile number is required (10 digits, or with country code).' };
++  }
+ 
+   const isAppRoleDesignation =
+     input.designation === Designation.PROCESS_ASSOCIATE ||
+@@ -142,6 +149,7 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+           grade: input.grade,
+           team: input.team,
+           cardNumber: input.cardNumber,
++          mobileNumber,
+           status: EmployeeStatus.ACTIVE,
+           onboardingStep: 'COMPLETED',
+         },
+@@ -269,12 +277,19 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+       select: ONBOARDING_FORM_STORE_SELECT,
+     });
+     const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store);
++    const whatsappUrl = whatsAppFormLink({
++      mobile: mobileNumber,
++      name: input.name,
++      clientName: store?.client.name,
++      formUrl: googleFormUrl,
++    });
+ 
+     return {
+       ok: true,
+       employeeId: result.employee.id,
+       staffCode: result.staffCode,
+       googleFormUrl,
++      whatsappUrl,
+       // null for MANUAL-mode stores — no biometric command was enqueued, so
+       // there's nothing for getCommandStatusAction to poll. Callers should
+       // treat a null commandId as "onboarding complete, no sync needed"
+diff --git a/src/app/(app)/onboarding/pending-forms/actions.ts b/src/app/(app)/onboarding/pending-forms/actions.ts
+index 3b51b17..bec3c79 100644
+--- a/src/app/(app)/onboarding/pending-forms/actions.ts
++++ b/src/app/(app)/onboarding/pending-forms/actions.ts
+@@ -3,13 +3,14 @@
+ import { requireAuth } from '@/lib/auth/session';
+ import { prisma } from '@/lib/prisma';
+ import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
++import { whatsAppFormLink } from '@/lib/whatsapp';
+ import { writeAuditLog } from '@/lib/smartoffice/audit';
+ 
+ /**
+  * Marks a form as sent (NOT_SENT → PENDING) and logs the action.
+  * Returns the prefilled form URL for sharing.
+  */
+-export async function markFormSent(employeeId: string): Promise<{ ok: boolean; formLink?: string }> {
++export async function markFormSent(employeeId: string): Promise<{ ok: boolean; formLink?: string; whatsappUrl?: string }> {
+   const session = await requireAuth('formTracking:remind');
+ 
+   const employee = await prisma.employee.findUnique({
+@@ -17,6 +18,8 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
+     select: {
+       staffCode: true,
+       storeId: true,
++      mobileNumber: true,
++      name: true,
+       store: { select: ONBOARDING_FORM_STORE_SELECT },
+     },
+   });
+@@ -40,7 +43,13 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
+   });
+ 
+   const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
+-  return { ok: true, formLink };
++  const whatsappUrl = whatsAppFormLink({
++    mobile: employee.mobileNumber,
++    name: employee.name,
++    clientName: employee.store.client.name,
++    formUrl: formLink,
++  });
++  return { ok: true, formLink, whatsappUrl };
+ }
+ 
+ /**
+@@ -50,7 +59,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
+  */
+ export async function sendFormReminder(
+   employeeId: string,
+-): Promise<{ ok: boolean; formLink?: string }> {
++): Promise<{ ok: boolean; formLink?: string; whatsappUrl?: string }> {
+   const session = await requireAuth('formTracking:remind');
+ 
+   const employee = await prisma.employee.findUnique({
+@@ -58,6 +67,7 @@ export async function sendFormReminder(
+     select: {
+       staffCode: true,
+       storeId: true,
++      mobileNumber: true,
+       name: true,
+       store: { select: ONBOARDING_FORM_STORE_SELECT },
+     },
+@@ -93,5 +103,11 @@ export async function sendFormReminder(
+   });
+ 
+   const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
+-  return { ok: true, formLink };
++  const whatsappUrl = whatsAppFormLink({
++    mobile: employee.mobileNumber,
++    name: employee.name,
++    clientName: employee.store.client.name,
++    formUrl: formLink,
++  });
++  return { ok: true, formLink, whatsappUrl };
+ }
+diff --git a/src/app/(app)/onboarding/pending-forms/page.tsx b/src/app/(app)/onboarding/pending-forms/page.tsx
+index af9633e..d430bda 100644
+--- a/src/app/(app)/onboarding/pending-forms/page.tsx
++++ b/src/app/(app)/onboarding/pending-forms/page.tsx
+@@ -37,6 +37,7 @@ export default async function PendingFormsPage() {
+       staffCode: true,
+       name: true,
+       designation: true,
++      mobileNumber: true,
+       dateOfJoining: true,
+       onboardingFormStatus: true,
+       onboardingFormSentAt: true,
+diff --git a/src/components/onboarding/OnboardingWizard.tsx b/src/components/onboarding/OnboardingWizard.tsx
+index 01ed138..bd261b6 100644
+--- a/src/components/onboarding/OnboardingWizard.tsx
++++ b/src/components/onboarding/OnboardingWizard.tsx
+@@ -17,7 +17,8 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
+ import { Badge } from '@/components/ui/badge';
+ import { Checkbox } from '@/components/ui/checkbox';
+ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+-import { CheckCircle2, AlertTriangle, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode } from 'lucide-react';
++import { normalizeMobile, formatMobile } from '@/lib/whatsapp';
++import { CheckCircle2, AlertTriangle, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle } from 'lucide-react';
+ import { toast } from 'sonner';
+ 
+ interface StoreOption {
+@@ -48,6 +49,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+   const [grade, setGrade] = useState('');
+   const [team, setTeam] = useState('');
+   const [cardNumber, setCardNumber] = useState('');
++  const [mobileNumber, setMobileNumber] = useState('');
+ 
+   // App login fields (PA/SI/Store Manager only)
+   const [createAppLogin, setCreateAppLogin] = useState(false);
+@@ -67,6 +69,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+   const [onboardResult, setOnboardResult] = useState<{
+     staffCode: string;
+     googleFormUrl: string;
++    whatsappUrl: string;
+     commandId: string;
+   } | null>(null);
+   const [cmdStatus, setCmdStatus] = useState<string>('PENDING');
+@@ -116,6 +119,10 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+       toast.error('Please select a store');
+       return;
+     }
++    if (normalizeMobile(mobileNumber) === null) {
++      toast.error('Please enter a valid mobile number (10 digits, or with country code)');
++      return;
++    }
+     if (isAppRoleDesignation && createAppLogin && (!email || !email.includes('@'))) {
+       toast.error('Please enter a valid email for app login');
+       return;
+@@ -139,6 +146,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+         grade: grade || undefined,
+         team: team || undefined,
+         cardNumber: cardNumber || undefined,
++        mobileNumber,
+         createAppLogin: isAppRoleDesignation ? createAppLogin : false,
+         email: isAppRoleDesignation && createAppLogin ? email : undefined,
+         password: isAppRoleDesignation && createAppLogin && tempPassword ? tempPassword : undefined,
+@@ -154,6 +162,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+       setOnboardResult({
+         staffCode: res.staffCode!,
+         googleFormUrl: res.googleFormUrl!,
++        whatsappUrl: res.whatsappUrl!,
+         commandId: res.commandId!,
+       });
+       toast.success(`Associate ${res.staffCode} onboarded successfully!`);
+@@ -260,6 +269,20 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                 </Select>
+               </div>
+ 
++              <div className="space-y-2">
++                <Label htmlFor="mobile">Mobile Number (WhatsApp) *</Label>
++                <Input
++                  id="mobile"
++                  type="tel"
++                  inputMode="tel"
++                  autoComplete="off"
++                  placeholder="e.g. 98765 43210"
++                  value={mobileNumber}
++                  onChange={(e) => setMobileNumber(e.target.value)}
++                />
++                <p className="text-xs text-gray-500">The onboarding form link is sent to this number on WhatsApp.</p>
++              </div>
++
+               <div className="space-y-2">
+                 <Label htmlFor="dob">Date of Birth</Label>
+                 <Input
+@@ -535,6 +558,10 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                 <span className="text-gray-500 block text-xs">Date of Birth</span>
+                 <span>{dateOfBirth || '-'}</span>
+               </div>
++              <div>
++                <span className="text-gray-500 block text-xs">Mobile</span>
++                <span>{formatMobile(normalizeMobile(mobileNumber)) || '-'}</span>
++              </div>
+               <div>
+                 <span className="text-gray-500 block text-xs">Card Number</span>
+                 <span>{cardNumber || 'None'}</span>
+@@ -650,6 +677,17 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                   </a>
+                 </Button>
+               </div>
++              {onboardResult.whatsappUrl ? (
++                <Button className="w-full bg-green-600 hover:bg-green-700 text-white" asChild>
++                  <a href={onboardResult.whatsappUrl} target="_blank" rel="noreferrer">
++                    <MessageCircle className="w-4 h-4 mr-2" /> Send form link on WhatsApp
++                  </a>
++                </Button>
++              ) : (
++                <p className="text-xs text-amber-600">
++                  No onboarding form is configured for this store, so there is no link to send yet.
++                </p>
++              )}
+             </div>
+           </CardContent>
+           <CardFooter className="flex justify-between">
+@@ -659,6 +697,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                 setStep(1);
+                 setName('');
+                 setCardNumber('');
++                setMobileNumber('');
+                 setPreviewCode(null);
+                 setOnboardResult(null);
+               }}
+diff --git a/src/components/onboarding/PendingFormsPanel.tsx b/src/components/onboarding/PendingFormsPanel.tsx
+index 1bbb004..4d4110d 100644
+--- a/src/components/onboarding/PendingFormsPanel.tsx
++++ b/src/components/onboarding/PendingFormsPanel.tsx
+@@ -1,7 +1,7 @@
+ 'use client';
+ 
+ import { useState, useTransition } from 'react';
+-import { ClipboardList, Send, Clock, AlertCircle, CheckCircle, Copy, Check } from 'lucide-react';
++import { ClipboardList, Send, Clock, AlertCircle, CheckCircle, Copy, Check, MessageCircle } from 'lucide-react';
+ import { markFormSent, sendFormReminder } from '@/app/(app)/onboarding/pending-forms/actions';
+ 
+ interface Employee {
+@@ -9,6 +9,7 @@ interface Employee {
+   staffCode: string;
+   name: string;
+   designation: string;
++  mobileNumber: string | null;
+   dateOfJoining: Date | null;
+   onboardingFormStatus: string;
+   onboardingFormSentAt: Date | null;
+@@ -76,6 +77,7 @@ function CopyLinkButton({ formLink }: { formLink: string }) {
+ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: boolean }) {
+   const [isPending, startTransition] = useTransition();
+   const [formLink, setFormLink] = useState<string | null>(null);
++  const [whatsappUrl, setWhatsappUrl] = useState<string | null>(null);
+   const [reminded, setReminded] = useState(false);
+ 
+   async function handleRemind() {
+@@ -83,6 +85,7 @@ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: b
+       const result = await sendFormReminder(employee.id);
+       if (result.ok && result.formLink) {
+         setFormLink(result.formLink);
++        setWhatsappUrl(result.whatsappUrl || null);
+         setReminded(true);
+       }
+     });
+@@ -94,6 +97,25 @@ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: b
+     });
+   }
+ 
++  // "Send on WhatsApp": record the send/reminder, then open the pre-written chat.
++  function handleWhatsApp() {
++    // Open synchronously (inside the click) so popup blockers allow it.
++    const win = window.open('', '_blank');
++    startTransition(async () => {
++      const result =
++        employee.onboardingFormStatus === 'NOT_SENT'
++          ? await markFormSent(employee.id)
++          : await sendFormReminder(employee.id);
++      if (result.ok && result.formLink) setFormLink(result.formLink);
++      if (result.ok && result.whatsappUrl && win) {
++        win.location.href = result.whatsappUrl;
++        setReminded(true);
++      } else {
++        win?.close();
++      }
++    });
++  }
++
+   const daysSinceJoining = employee.dateOfJoining
+     ? Math.floor((Date.now() - new Date(employee.dateOfJoining).getTime()) / (1000 * 60 * 60 * 24))
+     : null;
+@@ -126,6 +148,18 @@ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: b
+       <td className="px-4 py-3">
+         {canRemind && (
+           <div className="flex items-center gap-2">
++            {employee.mobileNumber ? (
++              <button
++                onClick={handleWhatsApp}
++                disabled={isPending}
++                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white transition-colors"
++              >
++                <MessageCircle className="w-3 h-3" />
++                WhatsApp
++              </button>
++            ) : (
++              <span className="text-xs text-slate-400" title="No mobile number on file">No mobile</span>
++            )}
+             {formLink ? (
+               <CopyLinkButton formLink={formLink} />
+             ) : (
+diff --git a/src/lib/config.ts b/src/lib/config.ts
+index 8b36504..9034ac6 100644
+--- a/src/lib/config.ts
++++ b/src/lib/config.ts
+@@ -107,13 +107,13 @@ export const GOOGLE_FORM_ECODE_FIELD_ID: string =
+ type FormPair = { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null };
+ 
+ /** A store row (with its client) as needed to resolve the onboarding form. */
+-export type OnboardingFormSource = FormPair & { client?: FormPair | null };
++export type OnboardingFormSource = FormPair & { client?: (FormPair & { name?: string }) | null };
+ 
+ /** Prisma `select` that loads everything resolveOnboardingForm() needs. */
+ export const ONBOARDING_FORM_STORE_SELECT = {
+   googleFormBaseUrl: true,
+   googleFormECodeFieldId: true,
+-  client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } },
++  client: { select: { name: true, googleFormBaseUrl: true, googleFormECodeFieldId: true } },
+ } as const;
+ 
+ /**
+diff --git a/src/lib/whatsapp.ts b/src/lib/whatsapp.ts
+new file mode 100644
+index 0000000..3da70c3
+--- /dev/null
++++ b/src/lib/whatsapp.ts
+@@ -0,0 +1,61 @@
++/**
++ * WhatsApp helpers. Uses wa.me click-to-chat links: the sender's own WhatsApp
++ * opens with the message pre-written and they press Send. No WhatsApp Business
++ * API account or credentials are needed.
++ */
++
++/** Country code prepended to bare 10-digit numbers (India). Constant, not an env var, because this file is also used in the browser. */
++export const DEFAULT_PHONE_COUNTRY_CODE = '91';
++
++/**
++ * Normalises a typed mobile number to digits with country code, or null if it
++ * is not plausible. Accepts "98765 43210", "+91 98765-43210", "09876543210",
++ * "919876543210". A bare 10-digit number gets DEFAULT_PHONE_COUNTRY_CODE.
++ */
++export function normalizeMobile(raw: string | null | undefined): string | null {
++  let digits = (raw ?? '').replace(/\D/g, '');
++  if (!digits) return null;
++  if (digits.startsWith('00')) digits = digits.slice(2);
++  else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
++  if (digits.length === 10) digits = DEFAULT_PHONE_COUNTRY_CODE + digits;
++  return digits.length >= 11 && digits.length <= 15 ? digits : null;
++}
++
++/** "+91 98765 43210"-style display for a stored number. */
++export function formatMobile(stored: string | null | undefined): string {
++  if (!stored) return '';
++  const cc = DEFAULT_PHONE_COUNTRY_CODE;
++  return stored.startsWith(cc) && stored.length === cc.length + 10
++    ? `+${cc} ${stored.slice(cc.length, cc.length + 5)} ${stored.slice(cc.length + 5)}`
++    : `+${stored}`;
++}
++
++/** The default message sent with the onboarding form link. */
++export function buildOnboardingFormMessage(p: {
++  name: string;
++  clientName?: string | null;
++  formUrl: string;
++}): string {
++  const first = p.name.trim().split(/\s+/)[0] || 'there';
++  const org = p.clientName ? ` at ${p.clientName}` : '';
++  return (
++    `Hello ${first}, welcome${org}! Please fill in your onboarding form using this link:\n\n` +
++    `${p.formUrl}\n\nThank you.`
++  );
++}
++
++/** https://wa.me link that opens a chat with `mobile` and the message ready to send. */
++export function buildWhatsAppUrl(mobile: string, message: string): string {
++  return `https://wa.me/${mobile}?text=${encodeURIComponent(message)}`;
++}
++
++/** Convenience: returns '' when there is no number or no form URL. */
++export function whatsAppFormLink(p: {
++  mobile: string | null | undefined;
++  name: string;
++  clientName?: string | null;
++  formUrl: string;
++}): string {
++  if (!p.mobile || !p.formUrl) return '';
++  return buildWhatsAppUrl(p.mobile, buildOnboardingFormMessage(p));
++}

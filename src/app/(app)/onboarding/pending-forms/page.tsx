@@ -37,6 +37,7 @@ export default async function PendingFormsPage() {
       staffCode: true,
       name: true,
       designation: true,
+      mobileNumber: true,
       dateOfJoining: true,
       onboardingFormStatus: true,
       onboardingFormSentAt: true,

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useTransition } from 'react';
-import { ClipboardList, Send, Clock, AlertCircle, CheckCircle, Copy, Check } from 'lucide-react';
+import { ClipboardList, Send, Clock, AlertCircle, CheckCircle, Copy, Check, MessageCircle } from 'lucide-react';
 import { markFormSent, sendFormReminder } from '@/app/(app)/onboarding/pending-forms/actions';
 
 interface Employee {
@@ -9,6 +9,7 @@ interface Employee {
   staffCode: string;
   name: string;
   designation: string;
+  mobileNumber: string | null;
   dateOfJoining: Date | null;
   onboardingFormStatus: string;
   onboardingFormSentAt: Date | null;
@@ -76,6 +77,7 @@ function CopyLinkButton({ formLink }: { formLink: string }) {
 function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: boolean }) {
   const [isPending, startTransition] = useTransition();
   const [formLink, setFormLink] = useState<string | null>(null);
+  const [whatsappUrl, setWhatsappUrl] = useState<string | null>(null);
   const [reminded, setReminded] = useState(false);
 
   async function handleRemind() {
@@ -83,6 +85,7 @@ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: b
       const result = await sendFormReminder(employee.id);
       if (result.ok && result.formLink) {
         setFormLink(result.formLink);
+        setWhatsappUrl(result.whatsappUrl || null);
         setReminded(true);
       }
     });
@@ -91,6 +94,25 @@ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: b
   async function handleMarkSent() {
     startTransition(async () => {
       await markFormSent(employee.id);
+    });
+  }
+
+  // "Send on WhatsApp": record the send/reminder, then open the pre-written chat.
+  function handleWhatsApp() {
+    // Open synchronously (inside the click) so popup blockers allow it.
+    const win = window.open('', '_blank');
+    startTransition(async () => {
+      const result =
+        employee.onboardingFormStatus === 'NOT_SENT'
+          ? await markFormSent(employee.id)
+          : await sendFormReminder(employee.id);
+      if (result.ok && result.formLink) setFormLink(result.formLink);
+      if (result.ok && result.whatsappUrl && win) {
+        win.location.href = result.whatsappUrl;
+        setReminded(true);
+      } else {
+        win?.close();
+      }
     });
   }
 
@@ -126,6 +148,18 @@ function EmployeeRow({ employee, canRemind }: { employee: Employee; canRemind: b
       <td className="px-4 py-3">
         {canRemind && (
           <div className="flex items-center gap-2">
+            {employee.mobileNumber ? (
+              <button
+                onClick={handleWhatsApp}
+                disabled={isPending}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white transition-colors"
+              >
+                <MessageCircle className="w-3 h-3" />
+                WhatsApp
+              </button>
+            ) : (
+              <span className="text-xs text-slate-400" title="No mobile number on file">No mobile</span>
+            )}
             {formLink ? (
               <CopyLinkButton formLink={formLink} />
             ) : (
