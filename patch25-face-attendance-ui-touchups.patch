@@ -1,0 +1,1040 @@
+diff --git a/src/components/attendance/FaceAttendance.tsx b/src/components/attendance/FaceAttendance.tsx
+index 1325f61..16eb1b3 100644
+--- a/src/components/attendance/FaceAttendance.tsx
++++ b/src/components/attendance/FaceAttendance.tsx
+@@ -1,6 +1,6 @@
+ 'use client';
+ 
+-import { useCallback, useEffect, useRef, useState } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import {
+   getFaceContext,
+   recordFacePunch,
+@@ -17,6 +17,7 @@ import {
+   pickDirection,
+   startChallenge,
+   stepChallenge,
++  type ChallengePhase,
+   type ChallengeState,
+   type TurnDirection,
+ } from '@/lib/face/liveness';
+@@ -24,15 +25,33 @@ import { ENROLL_MAX_SAMPLES, ENROLL_MIN_SAMPLES, distance } from '@/lib/face/mat
+ import { Button } from '@/components/ui/button';
+ import { Badge } from '@/components/ui/badge';
+ import { Checkbox } from '@/components/ui/checkbox';
++import { Input } from '@/components/ui/input';
+ import { Label } from '@/components/ui/label';
+ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+-import { Camera, CameraOff, Loader2, RefreshCw, SwitchCamera, Trash2 } from 'lucide-react';
++import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
++import {
++  ArrowLeft,
++  ArrowRight,
++  Camera,
++  CameraOff,
++  Keyboard,
++  Loader2,
++  Maximize2,
++  Minimize2,
++  Pause,
++  Play,
++  RefreshCw,
++  SwitchCamera,
++  Trash2,
++} from 'lucide-react';
+ 
+ type Facing = 'environment' | 'user';
+ type CamState = 'off' | 'starting' | 'on' | 'error';
+ type EngineState = 'idle' | 'loading' | 'ready' | 'error';
++/** Colour of the on-camera face guide. */
++type GuideTone = 'idle' | 'progress' | 'good' | 'warn' | 'bad';
+ 
+ interface Props {
+   stores: { id: string; name: string; client: { shortName: string } }[];
+@@ -51,6 +70,7 @@ const STEADY_DISTANCE = 0.35;
+ const TICK_MS = 500;
+ const PAUSE_AFTER_RESULT_MS = 3000;
+ const PAUSE_AFTER_LIVENESS_FAIL_MS = 1500;
++const FACING_KEY = 'hrms.face.facing';
+ 
+ /**
+  * Escape hatch for rollout: set NEXT_PUBLIC_FACE_LIVENESS=off to skip the
+@@ -65,6 +85,26 @@ const HINTS: Record<Exclude<FrameResult['status'], 'OK'>, string> = {
+   TOO_FAR: 'Move closer',
+ };
+ 
++const ENROLL_STEPS = [
++  'Look straight at the camera',
++  'Turn your head slightly to the left',
++  'Turn your head slightly to the right',
++  'Any small tilt or angle',
++  'One last straight-on shot',
++];
++
++const SHORTCUTS: { keys: string[]; label: string }[] = [
++  { keys: ['Space'], label: 'Start camera · pause / resume scanning · capture a sample (Enroll tab)' },
++  { keys: ['Esc'], label: 'Stop the camera' },
++  { keys: ['C'], label: 'Switch camera (front / back)' },
++  { keys: ['F'], label: 'Full screen' },
++  { keys: ['1'], label: 'Scan tab' },
++  { keys: ['2'], label: 'Enroll tab' },
++  { keys: ['R'], label: 'Clear captured samples (Enroll tab)' },
++  { keys: ['Enter'], label: 'Save enrollment (Enroll tab, when ready)' },
++  { keys: ['?'], label: 'Show this list' },
++];
++
+ function fmtTime(iso: string): string {
+   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+ }
+@@ -87,46 +127,117 @@ const TONE_CLASS: Record<RecentPunch['tone'], string> = {
+   bad: 'bg-red-50 border-red-200 text-red-800',
+ };
+ 
++/** Solid version shown over the camera preview so the result is readable at arm's length. */
++const OVERLAY_CLASS: Record<RecentPunch['tone'], string> = {
++  good: 'bg-green-600/95 border-green-300 text-white',
++  info: 'bg-blue-600/95 border-blue-300 text-white',
++  warn: 'bg-amber-400/95 border-amber-200 text-amber-950',
++  bad: 'bg-red-600/95 border-red-300 text-white',
++};
++
++const DOT_CLASS: Record<RecentPunch['tone'], string> = {
++  good: 'bg-green-500',
++  info: 'bg-blue-500',
++  warn: 'bg-amber-500',
++  bad: 'bg-red-500',
++};
++
++const GUIDE_CLASS: Record<GuideTone, string> = {
++  idle: 'border-white/60',
++  progress: 'border-blue-400',
++  good: 'border-green-400',
++  warn: 'border-amber-300',
++  bad: 'border-red-400',
++};
++
++function buzz(pattern: number | number[]) {
++  try { navigator.vibrate?.(pattern); } catch { /* vibration is optional */ }
++}
++
++/** Decides whether a key press belongs to the page or to whatever the user is focused on. */
++function targetKind(t: EventTarget | null): 'free' | 'button' | 'blocked' {
++  if (!(t instanceof HTMLElement)) return 'free';
++  if (t.closest('input, textarea, select, [contenteditable="true"], [role="combobox"], [role="listbox"], [role="option"], [role="dialog"], [role="checkbox"]')) {
++    return 'blocked';
++  }
++  if (t.closest('button, a')) return 'button';
++  return 'free';
++}
++
++function Kbd({ children }: { children: React.ReactNode }) {
++  return (
++    <kbd className="ml-2 rounded border border-current/30 bg-black/10 px-1.5 py-0.5 text-[10px] font-mono leading-none">
++      {children}
++    </kbd>
++  );
++}
++
+ export function FaceAttendance({ stores }: Props) {
+   const [storeId, setStoreId] = useState(stores[0]!.id);
+   const [ctx, setCtx] = useState<FaceContext | null>(null);
+   const [ctxError, setCtxError] = useState<string | null>(null);
+ 
+   const [tab, setTab] = useState<'scan' | 'enroll'>('scan');
+-  const [facing, setFacing] = useState<Facing>('environment');
++  const [facing, setFacing] = useState<Facing>(() => {
++    try {
++      const v = localStorage.getItem(FACING_KEY);
++      return v === 'user' || v === 'environment' ? v : 'environment';
++    } catch { return 'environment'; }
++  });
+   const [cam, setCam] = useState<CamState>('off');
+   const [camError, setCamError] = useState<string | null>(null);
+   const [engine, setEngine] = useState<EngineState>('idle');
+   const [hint, setHint] = useState('Start the camera to begin');
++  const [guide, setGuide] = useState<GuideTone>('idle');
++  const [paused, setPaused] = useState(false);
++  const [challengeUi, setChallengeUi] = useState<{ direction: TurnDirection; phase: ChallengePhase } | null>(null);
+ 
+   const [result, setResult] = useState<RecentPunch | null>(null);
++  const [overlay, setOverlay] = useState<RecentPunch | null>(null);
+   const [recent, setRecent] = useState<RecentPunch[]>([]);
+ 
+   const [enrollEmployeeId, setEnrollEmployeeId] = useState('');
++  const [rosterQuery, setRosterQuery] = useState('');
+   const [samples, setSamples] = useState<number[][]>([]);
+   const [consent, setConsent] = useState(false);
+   const [saving, setSaving] = useState(false);
+   const [enrollMsg, setEnrollMsg] = useState<{ ok: boolean; text: string } | null>(null);
++  const [flash, setFlash] = useState(false);
++
++  const [helpOpen, setHelpOpen] = useState(false);
++  const [isFullscreen, setIsFullscreen] = useState(false);
++  const [canFullscreen] = useState(() => typeof document !== 'undefined' && !!document.fullscreenEnabled);
++  const [isTouch] = useState(() => typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches);
+ 
+   // Refs let the scan loop read fresh values without restarting on every render.
+   const videoRef = useRef<HTMLVideoElement | null>(null);
++  const wrapRef = useRef<HTMLDivElement | null>(null);
+   const streamRef = useRef<MediaStream | null>(null);
+   const engineRef = useRef<Awaited<ReturnType<typeof loadFaceEngine>> | null>(null);
+   const tabRef = useRef(tab);
+   const storeIdRef = useRef(storeId);
+   const busyRef = useRef(false);
++  const pausedRef = useRef(false);
+   const pausedUntilRef = useRef(0);
+   const lastGoodRef = useRef<number[] | null>(null);
+   const latestForEnrollRef = useRef<{ descriptor: number[]; at: number } | null>(null);
+   const keyRef = useRef(0);
+   const facingRef = useRef<Facing>(facing);
++  const touchRef = useRef(isTouch);
+   const challengeRef = useRef<{ state: ChallengeState; startDescriptor: number[] } | null>(null);
+   const lastDirectionRef = useRef<TurnDirection | null>(null);
++  const overlayTimerRef = useRef<number | undefined>(undefined);
++  const swallowSpaceUpRef = useRef(false);
+ 
+-  useEffect(() => { tabRef.current = tab; challengeRef.current = null; }, [tab]);
++  useEffect(() => { tabRef.current = tab; challengeRef.current = null; setChallengeUi(null); }, [tab]);
+   useEffect(() => { storeIdRef.current = storeId; }, [storeId]);
+   useEffect(() => { facingRef.current = facing; }, [facing]);
+ 
++  const say = useCallback((text: string, tone: GuideTone = 'idle') => {
++    setHint(text);
++    setGuide(tone);
++  }, []);
++
+   // ─── Store context (roster + enrolment status) ───────────────────────────
+   const loadContext = useCallback(async (id: string) => {
+     setCtxError(null);
+@@ -138,9 +249,12 @@ export function FaceAttendance({ stores }: Props) {
+   useEffect(() => {
+     setSamples([]);
+     setEnrollEmployeeId('');
++    setRosterQuery('');
+     setEnrollMsg(null);
+     setResult(null);
++    setOverlay(null);
+     challengeRef.current = null;
++    setChallengeUi(null);
+     void loadContext(storeId);
+   }, [storeId, loadContext]);
+ 
+@@ -149,6 +263,11 @@ export function FaceAttendance({ stores }: Props) {
+     streamRef.current?.getTracks().forEach((t) => t.stop());
+     streamRef.current = null;
+     if (videoRef.current) videoRef.current.srcObject = null;
++    pausedRef.current = false;
++    setPaused(false);
++    challengeRef.current = null;
++    setChallengeUi(null);
++    setGuide('idle');
+     setCam('off');
+   }, []);
+ 
+@@ -170,7 +289,7 @@ export function FaceAttendance({ stores }: Props) {
+       video.srcObject = stream;
+       await video.play();
+       setCam('on');
+-      setHint('Point the camera at a face');
++      say('Point the camera at a face');
+     } catch (err) {
+       setCam('error');
+       const name = err instanceof DOMException ? err.name : '';
+@@ -180,9 +299,11 @@ export function FaceAttendance({ stores }: Props) {
+           : err instanceof Error ? err.message : 'Could not start the camera.',
+       );
+     }
+-  }, []);
++  }, [say]);
+ 
+   const startAll = useCallback(async () => {
++    pausedRef.current = false;
++    setPaused(false);
+     if (engine !== 'ready') {
+       setEngine('loading');
+       loadFaceEngine()
+@@ -195,13 +316,73 @@ export function FaceAttendance({ stores }: Props) {
+   const flipCamera = useCallback(async () => {
+     const next: Facing = facing === 'environment' ? 'user' : 'environment';
+     challengeRef.current = null; // the left/right mapping changes with the camera
++    setChallengeUi(null);
+     facingRef.current = next;
+     setFacing(next);
++    try { localStorage.setItem(FACING_KEY, next); } catch { /* remembering the choice is optional */ }
+     await startCamera(next);
+   }, [facing, startCamera]);
+ 
++  const togglePause = useCallback(() => {
++    const next = !pausedRef.current;
++    pausedRef.current = next;
++    setPaused(next);
++    challengeRef.current = null;
++    lastGoodRef.current = null;
++    setChallengeUi(null);
++    say(next ? 'Scanning paused' : 'Point the camera at a face');
++  }, [say]);
++
++  const toggleFullscreen = useCallback(async () => {
++    try {
++      if (document.fullscreenElement) await document.exitFullscreen();
++      else await wrapRef.current?.requestFullscreen();
++    } catch { /* not supported / denied */ }
++  }, []);
++
++  useEffect(() => {
++    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
++    document.addEventListener('fullscreenchange', onChange);
++    return () => document.removeEventListener('fullscreenchange', onChange);
++  }, []);
++
+   useEffect(() => () => {
+     streamRef.current?.getTracks().forEach((t) => t.stop());
++    window.clearTimeout(overlayTimerRef.current);
++  }, []);
++
++  // Keep the screen awake while the camera is running — the phone shouldn't dim mid-shift.
++  useEffect(() => {
++    if (cam !== 'on' || !('wakeLock' in navigator)) return;
++    let cancelled = false;
++    const held: { s: WakeLockSentinel | null } = { s: null };
++    const acquire = async () => {
++      try {
++        const s = await navigator.wakeLock.request('screen');
++        if (cancelled) void s.release();
++        else held.s = s;
++      } catch { /* denied (e.g. low battery) — harmless */ }
++    };
++    const onVisible = () => { if (document.visibilityState === 'visible') void acquire(); };
++    void acquire();
++    document.addEventListener('visibilitychange', onVisible);
++    return () => {
++      cancelled = true;
++      document.removeEventListener('visibilitychange', onVisible);
++      held.s?.release().catch(() => {});
++    };
++  }, [cam]);
++
++  // ─── Result feedback (overlay + haptics) ─────────────────────────────────
++  const showResult = useCallback((entry: RecentPunch) => {
++    setResult(entry);
++    setRecent((prev) => [entry, ...prev].slice(0, 8));
++    setOverlay(entry);
++    window.clearTimeout(overlayTimerRef.current);
++    overlayTimerRef.current = window.setTimeout(() => setOverlay(null), PAUSE_AFTER_RESULT_MS + 500);
++    if (entry.tone === 'bad') buzz(220);
++    else if (entry.tone === 'warn') buzz([60, 40, 60]);
++    else buzz(90);
+   }, []);
+ 
+   // ─── The scan loop ───────────────────────────────────────────────────────
+@@ -214,7 +395,8 @@ export function FaceAttendance({ stores }: Props) {
+ 
+     const submit = async (descriptor: number[]) => {
+       busyRef.current = true;
+-      setHint('Checking…');
++      say('Checking…', 'progress');
++      setChallengeUi(null);
+       const res = await recordFacePunch(storeIdRef.current, descriptor);
+       const d = describePunch(res);
+       const entry: RecentPunch = {
+@@ -224,19 +406,20 @@ export function FaceAttendance({ stores }: Props) {
+         tone: d.tone,
+         time: new Date().toISOString(),
+       };
+-      setResult(entry);
+-      setRecent((prev) => [entry, ...prev].slice(0, 8));
++      showResult(entry);
+       if (res.ok) void loadContext(storeIdRef.current);
+       lastGoodRef.current = null;
+       pausedUntilRef.current = Date.now() + PAUSE_AFTER_RESULT_MS;
+-      setHint('Next person');
++      say('Next person', !res.ok ? 'bad' : d.tone === 'warn' ? 'warn' : 'good');
+     };
+ 
+-    const failLiveness = (hint: string) => {
++    const failLiveness = (text: string) => {
+       challengeRef.current = null;
+       lastGoodRef.current = null;
+       pausedUntilRef.current = Date.now() + PAUSE_AFTER_LIVENESS_FAIL_MS;
+-      setHint(hint);
++      setChallengeUi(null);
++      buzz(160);
++      say(text, 'bad');
+     };
+ 
+     const tick = async () => {
+@@ -244,8 +427,10 @@ export function FaceAttendance({ stores }: Props) {
+       const video = videoRef.current;
+       const fa = engineRef.current;
+       let nextDelay = TICK_MS;
++      // Scanning can be paused with Space; enrolment sampling keeps running regardless.
++      const allowed = !pausedRef.current || tabRef.current === 'enroll';
+       const ready =
+-        video && fa && video.readyState >= 2 && !document.hidden &&
++        video && fa && video.readyState >= 2 && !document.hidden && allowed &&
+         !busyRef.current && Date.now() >= pausedUntilRef.current;
+ 
+       if (ready) {
+@@ -276,7 +461,8 @@ export function FaceAttendance({ stores }: Props) {
+               }
+             } else {
+               challengeRef.current = { ...challenge, state: next };
+-              setHint(challengeHint(next));
++              setChallengeUi({ direction: next.direction, phase: next.phase });
++              say(challengeHint(next), 'progress');
+             }
+           } else {
+             // ── Normal scanning ──
+@@ -286,13 +472,13 @@ export function FaceAttendance({ stores }: Props) {
+             if (frame.status !== 'OK') {
+               lastGoodRef.current = null;
+               latestForEnrollRef.current = null;
+-              setHint(HINTS[frame.status]);
++              say(HINTS[frame.status], frame.status === 'MULTIPLE' ? 'bad' : 'idle');
+             } else if (tabRef.current === 'enroll') {
+               latestForEnrollRef.current = { descriptor: frame.descriptor, at: Date.now() };
+-              setHint('Face ready — tap Capture');
++              say(touchRef.current ? 'Face ready — tap Capture' : 'Face ready — press Space or tap Capture', 'good');
+             } else if (!isFrontal(frame.yaw)) {
+               lastGoodRef.current = null;
+-              setHint('Look straight at the camera');
++              say('Look straight at the camera');
+             } else {
+               const prev = lastGoodRef.current;
+               if (prev && distance(prev, frame.descriptor) < STEADY_DISTANCE) {
+@@ -303,18 +489,21 @@ export function FaceAttendance({ stores }: Props) {
+                   const state = startChallenge(direction, facingRef.current === 'user', Date.now());
+                   challengeRef.current = { state, startDescriptor: frame.descriptor };
+                   setResult(null);
+-                  setHint(challengeHint(state));
++                  setOverlay(null);
++                  setChallengeUi({ direction: state.direction, phase: state.phase });
++                  say(challengeHint(state), 'progress');
+                 } else {
+                   await submit(frame.descriptor);
+                 }
+               } else {
+                 lastGoodRef.current = frame.descriptor;
+-                setHint('Hold still…');
++                say('Hold still…', 'progress');
+               }
+             }
+           }
+         } catch {
+           challengeRef.current = null;
++          setChallengeUi(null);
+         } finally {
+           busyRef.current = false;
+         }
+@@ -324,34 +513,46 @@ export function FaceAttendance({ stores }: Props) {
+ 
+     timer = window.setTimeout(tick, TICK_MS);
+     return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
+-  }, [cam, engine, loadContext]);
++  }, [cam, engine, loadContext, say, showResult]);
+ 
+   // ─── Enrolment actions ───────────────────────────────────────────────────
+-  const captureSample = () => {
++  const captureSample = useCallback(() => {
++    if (!enrollEmployeeId) {
++      setEnrollMsg({ ok: false, text: 'Pick an employee first, then capture.' });
++      return;
++    }
++    if (samples.length >= ENROLL_MAX_SAMPLES) return;
+     const latest = latestForEnrollRef.current;
+     if (!latest || Date.now() - latest.at > 2000) {
+       setEnrollMsg({ ok: false, text: 'No clear face right now. Hold the camera steady on one face and try again.' });
++      buzz(160);
+       return;
+     }
+     setEnrollMsg(null);
+     setSamples((s) => (s.length >= ENROLL_MAX_SAMPLES ? s : [...s, latest.descriptor]));
+     latestForEnrollRef.current = null;
+-  };
++    setFlash(true);
++    window.setTimeout(() => setFlash(false), 150);
++    buzz(50);
++  }, [enrollEmployeeId, samples.length]);
++
++  const canSave = !saving && !!enrollEmployeeId && samples.length >= ENROLL_MIN_SAMPLES && consent;
+ 
+-  const saveEnrollment = async () => {
++  const saveEnrollment = useCallback(async () => {
+     setSaving(true);
+     setEnrollMsg(null);
+     const res = await enrollFace(enrollEmployeeId, samples, consent);
+     setSaving(false);
+     if (res.ok) {
+       setEnrollMsg({ ok: true, text: 'Face enrolled. This person can now be scanned.' });
++      buzz(90);
+       setSamples([]);
+       setConsent(false);
+       await loadContext(storeId);
+     } else {
+       setEnrollMsg({ ok: false, text: res.error });
+     }
+-  };
++  }, [enrollEmployeeId, samples, consent, loadContext, storeId]);
+ 
+   const removeFaceData = async () => {
+     if (!enrollEmployeeId) return;
+@@ -363,21 +564,117 @@ export function FaceAttendance({ stores }: Props) {
+     if (res.ok) await loadContext(storeId);
+   };
+ 
++  // ─── Keyboard shortcuts ──────────────────────────────────────────────────
++  const actionsRef = useRef({
++    primary: () => {}, stop: () => {}, flip: () => {}, fullscreen: () => {},
++    setTab: (_t: 'scan' | 'enroll') => {}, clear: () => {}, save: () => {}, help: () => {}, helpOpen: false,
++  });
++  useEffect(() => {
++    actionsRef.current = {
++      primary: () => {
++        if (cam === 'starting') return;
++        if (cam !== 'on') { void startAll(); return; }
++        if (tab === 'enroll') captureSample();
++        else togglePause();
++      },
++      stop: () => { if (cam === 'on' && !document.fullscreenElement) stopCamera(); },
++      flip: () => { if (cam === 'on') void flipCamera(); },
++      fullscreen: () => { if (canFullscreen && cam === 'on') void toggleFullscreen(); },
++      setTab: (t) => { if (t === 'scan' || ctx?.canEnroll) setTab(t); },
++      clear: () => { if (tab === 'enroll') setSamples([]); },
++      save: () => { if (tab === 'enroll' && canSave) void saveEnrollment(); },
++      help: () => {
++        if (document.fullscreenElement) void document.exitFullscreen();
++        setHelpOpen(true);
++      },
++      helpOpen,
++    };
++  });
++
++  useEffect(() => {
++    const onKeyDown = (e: KeyboardEvent) => {
++      if (e.ctrlKey || e.metaKey || e.altKey) return;
++      const kind = targetKind(e.target);
++      if (kind === 'blocked') return;
++      const a = actionsRef.current;
++      if (a.helpOpen) return;
++      if (kind === 'button' && e.key === 'Enter') return; // let a focused button do its own thing
++
++      let handled = true;
++      if (e.code === 'Space' || e.key === ' ') {
++        if (!e.repeat) a.primary();
++        swallowSpaceUpRef.current = true; // stop a focused button also "clicking" on key-up
++      } else {
++        switch (e.key) {
++          case 'Escape': a.stop(); break;
++          case 'c': case 'C': a.flip(); break;
++          case 'f': case 'F': a.fullscreen(); break;
++          case '1': a.setTab('scan'); break;
++          case '2': a.setTab('enroll'); break;
++          case 'r': case 'R': a.clear(); break;
++          case 'Enter': a.save(); break;
++          case '?': a.help(); break;
++          default: handled = false;
++        }
++      }
++      if (handled) e.preventDefault();
++    };
++    const onKeyUp = (e: KeyboardEvent) => {
++      if ((e.code === 'Space' || e.key === ' ') && swallowSpaceUpRef.current) {
++        swallowSpaceUpRef.current = false;
++        e.preventDefault();
++      }
++    };
++    window.addEventListener('keydown', onKeyDown);
++    window.addEventListener('keyup', onKeyUp);
++    return () => {
++      window.removeEventListener('keydown', onKeyDown);
++      window.removeEventListener('keyup', onKeyUp);
++    };
++  }, []);
++
++  // ─── Derived values ──────────────────────────────────────────────────────
+   const selectedEmployee = ctx?.roster.find((e) => e.id === enrollEmployeeId) ?? null;
+   const enrolledCount = ctx?.roster.filter((e) => e.samples > 0).length ?? 0;
+ 
++  const filteredRoster = useMemo(() => {
++    const roster = ctx?.roster ?? [];
++    const q = rosterQuery.trim().toLowerCase();
++    if (!q) return roster;
++    return roster.filter((e) => e.id === enrollEmployeeId || e.name.toLowerCase().includes(q));
++  }, [ctx, rosterQuery, enrollEmployeeId]);
++
++  const enrollStep =
++    samples.length >= ENROLL_MAX_SAMPLES
++      ? 'All samples captured — save the enrollment.'
++      : `Sample ${samples.length + 1} of ${ENROLL_MAX_SAMPLES}: ${ENROLL_STEPS[Math.min(samples.length, ENROLL_STEPS.length - 1)]}${
++          samples.length >= ENROLL_MIN_SAMPLES ? ' (you can save now, or add more)' : ''
++        }`;
++
++  const camOn = cam === 'on';
++  const scanPaused = camOn && paused && tab === 'scan';
++  const showGuide = camOn && !scanPaused;
++  const bigHint = challengeUi !== null;
++
+   return (
+     <div className="p-4 sm:p-6 max-w-3xl mx-auto space-y-4">
+-      <div>
+-        <h1 className="text-xl font-bold">Face Attendance</h1>
+-        <p className="text-sm text-gray-500">
+-          Scan an employee’s face to mark them present. The first scan of the day is check-in; a later scan is check-out.
+-        </p>
++      <div className="flex items-start justify-between gap-3">
++        <div>
++          <h1 className="text-xl font-bold">Face Attendance</h1>
++          <p className="text-sm text-gray-500">
++            Scan an employee’s face to mark them present. The first scan of the day is check-in; a later scan is check-out.
++          </p>
++        </div>
++        {!isTouch && (
++          <Button variant="outline" size="sm" onClick={() => setHelpOpen(true)} className="shrink-0" aria-label="Keyboard shortcuts">
++            <Keyboard className="h-4 w-4 mr-1.5" /> Shortcuts <Kbd>?</Kbd>
++          </Button>
++        )}
+       </div>
+ 
+       {stores.length > 1 && (
+         <Select value={storeId} onValueChange={setStoreId}>
+-          <SelectTrigger><SelectValue placeholder="Select store" /></SelectTrigger>
++          <SelectTrigger className="h-11 sm:h-9"><SelectValue placeholder="Select store" /></SelectTrigger>
+           <SelectContent>
+             {stores.map((s) => (
+               <SelectItem key={s.id} value={s.id}>{s.client.shortName} — {s.name}</SelectItem>
+@@ -394,65 +691,167 @@ export function FaceAttendance({ stores }: Props) {
+         <>
+           {/* Camera — shared by both tabs */}
+           <Card>
+-            <CardContent className="p-3 space-y-3">
+-              <div className="relative overflow-hidden rounded-lg bg-black aspect-[4/3]">
++            <CardContent className="p-2 sm:p-3 space-y-3">
++              <div
++                ref={wrapRef}
++                className="relative mx-auto w-full overflow-hidden rounded-xl bg-black aspect-[3/4] max-h-[68dvh] sm:aspect-[4/3] sm:max-h-[70dvh] [&:fullscreen]:aspect-auto [&:fullscreen]:max-h-none [&:fullscreen]:h-full [&:fullscreen]:rounded-none"
++              >
+                 <video
+                   ref={videoRef}
+                   playsInline
+                   muted
++                  aria-label="Camera preview"
+                   className="h-full w-full object-cover"
+                   style={{ transform: facing === 'user' ? 'scaleX(-1)' : undefined }}
+                 />
+-                {cam !== 'on' && (
+-                  <div className="absolute inset-0 flex items-center justify-center text-slate-300 text-sm">
+-                    {cam === 'starting' ? <Loader2 className="h-6 w-6 animate-spin" /> : <CameraOff className="h-8 w-8" />}
++
++                {/* Face guide */}
++                {showGuide && (
++                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
++                    <div className={`h-[70%] aspect-[3/4] rounded-[50%] border-4 border-dashed transition-colors duration-300 ${GUIDE_CLASS[guide]}`} />
+                   </div>
+                 )}
+-                {cam === 'on' && (
+-                  <div className="absolute bottom-2 left-2 right-2 text-center">
+-                    <span className="inline-block rounded-full bg-black/60 text-white text-xs px-3 py-1">
++
++                {/* Head-turn arrow */}
++                {camOn && challengeUi?.phase === 'TURN' && (
++                  <div
++                    className={`pointer-events-none absolute inset-y-0 flex items-center ${
++                      challengeUi.direction === 'LEFT' ? 'left-3' : 'right-3'
++                    }`}
++                  >
++                    {challengeUi.direction === 'LEFT'
++                      ? <ArrowLeft className="h-16 w-16 text-white drop-shadow-lg animate-pulse" />
++                      : <ArrowRight className="h-16 w-16 text-white drop-shadow-lg animate-pulse" />}
++                  </div>
++                )}
++
++                {/* Capture flash */}
++                <div
++                  className={`pointer-events-none absolute inset-0 bg-white transition-opacity duration-150 ${flash ? 'opacity-70' : 'opacity-0'}`}
++                />
++
++                {/* Camera off / starting */}
++                {!camOn && (
++                  <button
++                    type="button"
++                    onClick={() => { if (cam !== 'starting') void startAll(); }}
++                    disabled={cam === 'starting'}
++                    className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center text-slate-300"
++                  >
++                    {cam === 'starting'
++                      ? <><Loader2 className="h-8 w-8 animate-spin" /><span className="text-sm">Starting camera…</span></>
++                      : <>
++                          <CameraOff className="h-10 w-10" />
++                          <span className="text-base font-medium">Camera is off</span>
++                          <span className="text-sm text-slate-400">
++                            {isTouch ? 'Tap here or use Start below' : 'Click here or press Space to start'}
++                          </span>
++                        </>}
++                  </button>
++                )}
++
++                {/* Paused */}
++                {scanPaused && (
++                  <button
++                    type="button"
++                    onClick={togglePause}
++                    className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 text-white"
++                  >
++                    <Play className="h-12 w-12" />
++                    <span className="text-lg font-semibold">Scanning paused</span>
++                    <span className="text-sm text-slate-300">{isTouch ? 'Tap to resume' : 'Tap or press Space to resume'}</span>
++                  </button>
++                )}
++
++                {/* Floating controls */}
++                {camOn && (
++                  <div className="absolute right-2 top-2 flex gap-2">
++                    {isFullscreen && tab === 'scan' && (
++                      <button
++                        type="button"
++                        onClick={togglePause}
++                        aria-label={paused ? 'Resume scanning' : 'Pause scanning'}
++                        className="flex h-11 w-11 items-center justify-center rounded-full bg-black/50 text-white hover:bg-black/70"
++                      >
++                        {paused ? <Play className="h-5 w-5" /> : <Pause className="h-5 w-5" />}
++                      </button>
++                    )}
++                    <button
++                      type="button"
++                      onClick={() => void flipCamera()}
++                      aria-label="Switch camera"
++                      title="Switch camera (C)"
++                      className="flex h-11 w-11 items-center justify-center rounded-full bg-black/50 text-white hover:bg-black/70"
++                    >
++                      <SwitchCamera className="h-5 w-5" />
++                    </button>
++                    {canFullscreen && (
++                      <button
++                        type="button"
++                        onClick={() => void toggleFullscreen()}
++                        aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
++                        title="Full screen (F)"
++                        className="flex h-11 w-11 items-center justify-center rounded-full bg-black/50 text-white hover:bg-black/70"
++                      >
++                        {isFullscreen ? <Minimize2 className="h-5 w-5" /> : <Maximize2 className="h-5 w-5" />}
++                      </button>
++                    )}
++                  </div>
++                )}
++
++                {/* Result banner */}
++                {camOn && overlay && (
++                  <div
++                    role="status"
++                    aria-live="polite"
++                    className={`absolute inset-x-3 top-16 rounded-xl border-2 px-4 py-3 shadow-lg ${OVERLAY_CLASS[overlay.tone]}`}
++                  >
++                    <p className="text-xl font-bold leading-tight truncate">{overlay.name}</p>
++                    <p className="text-sm">{overlay.text}</p>
++                  </div>
++                )}
++
++                {/* Status pill */}
++                {camOn && !scanPaused && (
++                  <div className="absolute bottom-3 left-3 right-3 text-center">
++                    <span
++                      className={`inline-block max-w-full rounded-full bg-black/70 text-white px-4 py-2 ${
++                        bigHint ? 'text-base font-semibold' : 'text-sm'
++                      }`}
++                    >
+                       {engine === 'loading' ? 'Loading face models…' : hint}
+                     </span>
+                   </div>
+                 )}
+               </div>
+ 
+-              {camError && <p className="text-sm text-red-700">{camError}</p>}
++              {camError && (
++                <p className="text-sm text-red-700 rounded-lg border border-red-200 bg-red-50 p-3">{camError}</p>
++              )}
+               {engine === 'error' && (
+-                <p className="text-sm text-red-700">
++                <p className="text-sm text-red-700 rounded-lg border border-red-200 bg-red-50 p-3">
+                   Could not load the face models. Check your connection and tap Start again.
+                 </p>
+               )}
+-
+-              <div className="flex gap-2">
+-                {cam === 'on' ? (
+-                  <>
+-                    <Button variant="outline" onClick={stopCamera} className="flex-1">
+-                      <CameraOff className="h-4 w-4 mr-2" /> Stop
+-                    </Button>
+-                    <Button variant="outline" onClick={flipCamera} aria-label="Switch camera">
+-                      <SwitchCamera className="h-4 w-4" />
+-                    </Button>
+-                  </>
+-                ) : (
+-                  <Button onClick={startAll} disabled={cam === 'starting'} className="flex-1">
+-                    <Camera className="h-4 w-4 mr-2" /> {cam === 'starting' ? 'Starting…' : 'Start camera'}
+-                  </Button>
+-                )}
+-              </div>
+             </CardContent>
+           </Card>
+ 
+           <Tabs value={tab} onValueChange={(v) => setTab(v as 'scan' | 'enroll')}>
+-            <TabsList className={ctx.canEnroll ? 'grid grid-cols-2 w-full' : 'grid grid-cols-1 w-full'}>
+-              <TabsTrigger value="scan">Scan</TabsTrigger>
+-              {ctx.canEnroll && <TabsTrigger value="enroll">Enroll faces</TabsTrigger>}
++            <TabsList className={`${ctx.canEnroll ? 'grid grid-cols-2' : 'grid grid-cols-1'} w-full h-11 sm:h-9`}>
++              <TabsTrigger value="scan" className="text-base sm:text-sm">
++                Scan{!isTouch && <Kbd>1</Kbd>}
++              </TabsTrigger>
++              {ctx.canEnroll && (
++                <TabsTrigger value="enroll" className="text-base sm:text-sm">
++                  Enroll faces{!isTouch && <Kbd>2</Kbd>}
++                </TabsTrigger>
++              )}
+             </TabsList>
+ 
+             {/* ── Scan ── */}
+             <TabsContent value="scan" className="space-y-3">
+               {result && (
+-                <div className={`rounded-lg border p-4 ${TONE_CLASS[result.tone]}`}>
++                <div className={`hidden sm:block rounded-lg border p-4 ${TONE_CLASS[result.tone]}`}>
+                   <p className="text-lg font-semibold">{result.name}</p>
+                   <p className="text-sm">{result.text}</p>
+                 </div>
+@@ -468,10 +867,13 @@ export function FaceAttendance({ stores }: Props) {
+                   <CardHeader className="pb-2">
+                     <CardTitle className="text-sm">This session</CardTitle>
+                   </CardHeader>
+-                  <CardContent className="space-y-1.5">
++                  <CardContent className="space-y-2">
+                     {recent.map((r) => (
+                       <div key={r.key} className="flex items-start justify-between gap-3 text-sm">
+-                        <span className="font-medium truncate">{r.name}</span>
++                        <span className="flex items-center gap-2 min-w-0">
++                          <span className={`h-2 w-2 shrink-0 rounded-full ${DOT_CLASS[r.tone]}`} />
++                          <span className="font-medium truncate">{r.name}</span>
++                        </span>
+                         <span className="text-gray-500 text-right">{r.tone === 'bad' ? 'Not recorded' : r.text}</span>
+                       </div>
+                     ))}
+@@ -487,17 +889,30 @@ export function FaceAttendance({ stores }: Props) {
+                   <CardHeader className="pb-2">
+                     <CardTitle className="text-sm">Enroll a face</CardTitle>
+                     <CardDescription>
+-                      Pick the employee, then capture {ENROLL_MIN_SAMPLES}–{ENROLL_MAX_SAMPLES} samples: face the camera, then slightly left and right.
++                      Pick the employee, then capture {ENROLL_MIN_SAMPLES}–{ENROLL_MAX_SAMPLES} samples using the Capture button below the camera.
+                     </CardDescription>
+                   </CardHeader>
+                   <CardContent className="space-y-3">
++                    {(ctx.roster.length > 8 || rosterQuery) && (
++                      <Input
++                        value={rosterQuery}
++                        onChange={(e) => setRosterQuery(e.target.value)}
++                        placeholder="Search employee by name"
++                        className="h-11 sm:h-9"
++                        inputMode="search"
++                        autoComplete="off"
++                      />
++                    )}
+                     <Select
+                       value={enrollEmployeeId}
+                       onValueChange={(v) => { setEnrollEmployeeId(v); setSamples([]); setEnrollMsg(null); }}
+                     >
+-                      <SelectTrigger><SelectValue placeholder="Select employee" /></SelectTrigger>
++                      <SelectTrigger className="h-11 sm:h-9"><SelectValue placeholder="Select employee" /></SelectTrigger>
+                       <SelectContent>
+-                        {ctx.roster.map((e) => (
++                        {filteredRoster.length === 0 && (
++                          <div className="px-3 py-2 text-sm text-gray-500">No matching employees</div>
++                        )}
++                        {filteredRoster.map((e) => (
+                           <SelectItem key={e.id} value={e.id}>
+                             {e.name}{e.samples > 0 ? ' ✓' : ''}
+                           </SelectItem>
+@@ -506,7 +921,7 @@ export function FaceAttendance({ stores }: Props) {
+                     </Select>
+ 
+                     {selectedEmployee && (
+-                      <div className="flex items-center gap-2 text-sm">
++                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                         <Badge variant="outline">{selectedEmployee.designation.replace(/_/g, ' ')}</Badge>
+                         <span className="text-gray-500">
+                           {selectedEmployee.samples > 0 ? 'Already enrolled — saving again replaces it' : 'Not enrolled yet'}
+@@ -514,28 +929,38 @@ export function FaceAttendance({ stores }: Props) {
+                       </div>
+                     )}
+ 
+-                    <div className="flex items-center gap-2">
+-                      <Button
+-                        onClick={captureSample}
+-                        disabled={!enrollEmployeeId || cam !== 'on' || engine !== 'ready' || samples.length >= ENROLL_MAX_SAMPLES}
+-                      >
+-                        Capture ({samples.length}/{ENROLL_MAX_SAMPLES})
+-                      </Button>
+-                      <Button variant="outline" onClick={() => setSamples([])} disabled={samples.length === 0} aria-label="Clear samples">
+-                        <RefreshCw className="h-4 w-4" />
+-                      </Button>
+-                      <div className="flex gap-1 ml-1">
++                    {selectedEmployee && (
++                      <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
++                        {enrollStep}
++                      </div>
++                    )}
++
++                    <div className="flex items-center gap-3">
++                      <div className="flex gap-1.5">
+                         {Array.from({ length: ENROLL_MAX_SAMPLES }).map((_, i) => (
+                           <span
+                             key={i}
+-                            className={`h-2.5 w-2.5 rounded-full ${i < samples.length ? 'bg-green-500' : 'bg-gray-200'}`}
++                            className={`h-3 w-3 rounded-full ${i < samples.length ? 'bg-green-500' : 'bg-gray-200'}`}
+                           />
+                         ))}
+                       </div>
++                      <span className="text-xs text-gray-500">
++                        {samples.length} captured{samples.length < ENROLL_MIN_SAMPLES ? ` · at least ${ENROLL_MIN_SAMPLES} needed` : ''}
++                      </span>
++                      <Button
++                        variant="outline"
++                        onClick={() => setSamples([])}
++                        disabled={samples.length === 0}
++                        aria-label="Clear samples"
++                        title="Clear samples (R)"
++                        className="ml-auto h-10 w-10 sm:h-9 sm:w-9 p-0"
++                      >
++                        <RefreshCw className="h-4 w-4" />
++                      </Button>
+                     </div>
+ 
+-                    <div className="flex items-start gap-2">
+-                      <Checkbox id="face-consent" checked={consent} onCheckedChange={(v) => setConsent(v === true)} />
++                    <div className="flex items-start gap-3">
++                      <Checkbox id="face-consent" checked={consent} onCheckedChange={(v) => setConsent(v === true)} className="mt-0.5 h-5 w-5" />
+                       <Label htmlFor="face-consent" className="text-sm font-normal leading-snug">
+                         This employee has agreed to their face data being stored for attendance. Only a numeric
+                         template is kept — never a photo.
+@@ -543,20 +968,33 @@ export function FaceAttendance({ stores }: Props) {
+                     </div>
+ 
+                     {enrollMsg && (
+-                      <p className={`text-sm ${enrollMsg.ok ? 'text-green-700' : 'text-red-700'}`}>{enrollMsg.text}</p>
++                      <p
++                        role="status"
++                        className={`text-sm rounded-lg border p-3 ${
++                          enrollMsg.ok ? 'text-green-700 bg-green-50 border-green-200' : 'text-red-700 bg-red-50 border-red-200'
++                        }`}
++                      >
++                        {enrollMsg.text}
++                      </p>
+                     )}
+ 
+                     <div className="flex gap-2">
+                       <Button
+-                        onClick={saveEnrollment}
+-                        disabled={saving || !enrollEmployeeId || samples.length < ENROLL_MIN_SAMPLES || !consent}
+-                        className="flex-1"
++                        onClick={() => void saveEnrollment()}
++                        disabled={!canSave}
++                        className="flex-1 h-12 sm:h-9 text-base sm:text-sm"
+                       >
+                         {saving ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+-                        Save enrollment
++                        Save enrollment{!isTouch && <Kbd>Enter</Kbd>}
+                       </Button>
+                       {selectedEmployee && selectedEmployee.samples > 0 && (
+-                        <Button variant="outline" onClick={removeFaceData} disabled={saving} aria-label="Delete face data">
++                        <Button
++                          variant="outline"
++                          onClick={removeFaceData}
++                          disabled={saving}
++                          aria-label="Delete face data"
++                          className="h-12 w-12 sm:h-9 sm:w-9 p-0"
++                        >
+                           <Trash2 className="h-4 w-4" />
+                         </Button>
+                       )}
+@@ -566,8 +1004,82 @@ export function FaceAttendance({ stores }: Props) {
+               </TabsContent>
+             )}
+           </Tabs>
++
++          {/* Main action bar — pinned to the bottom of the screen on phones so it's always under the thumb */}
++          <div className="sticky bottom-0 z-20 -mx-4 sm:mx-0 flex gap-2 border-t sm:border sm:rounded-xl bg-white/95 dark:bg-slate-900/95 backdrop-blur px-4 sm:px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:pb-3">
++            {!camOn ? (
++              <Button
++                onClick={() => void startAll()}
++                disabled={cam === 'starting'}
++                className="flex-1 h-12 sm:h-10 text-base sm:text-sm"
++              >
++                <Camera className="h-5 w-5 mr-2" />
++                {cam === 'starting' ? 'Starting…' : 'Start camera'}
++                {!isTouch && cam !== 'starting' && <Kbd>Space</Kbd>}
++              </Button>
++            ) : (
++              <>
++                {tab === 'scan' ? (
++                  <Button
++                    onClick={togglePause}
++                    variant={paused ? 'default' : 'outline'}
++                    className="flex-1 h-12 sm:h-10 text-base sm:text-sm"
++                  >
++                    {paused ? <Play className="h-5 w-5 mr-2" /> : <Pause className="h-5 w-5 mr-2" />}
++                    {paused ? 'Resume scanning' : 'Pause scanning'}
++                    {!isTouch && <Kbd>Space</Kbd>}
++                  </Button>
++                ) : (
++                  <Button
++                    onClick={captureSample}
++                    disabled={engine !== 'ready' || samples.length >= ENROLL_MAX_SAMPLES}
++                    className="flex-1 h-12 sm:h-10 text-base sm:text-sm"
++                  >
++                    <Camera className="h-5 w-5 mr-2" />
++                    Capture ({samples.length}/{ENROLL_MAX_SAMPLES})
++                    {!isTouch && <Kbd>Space</Kbd>}
++                  </Button>
++                )}
++                <Button
++                  variant="outline"
++                  onClick={stopCamera}
++                  className="h-12 sm:h-10 px-4"
++                  aria-label="Stop camera"
++                >
++                  <CameraOff className="h-5 w-5 sm:h-4 sm:w-4" />
++                  <span className="ml-2 hidden sm:inline">Stop</span>
++                  {!isTouch && <Kbd>Esc</Kbd>}
++                </Button>
++              </>
++            )}
++          </div>
+         </>
+       )}
++
++      <Dialog open={helpOpen} onOpenChange={setHelpOpen}>
++        <DialogContent className="max-w-md">
++          <DialogHeader>
++            <DialogTitle>Keyboard shortcuts</DialogTitle>
++            <DialogDescription>
++              Handy at a desk or kiosk. They pause while you’re typing or using a dropdown.
++            </DialogDescription>
++          </DialogHeader>
++          <ul className="space-y-2.5 text-sm">
++            {SHORTCUTS.map((s) => (
++              <li key={s.keys.join('+')} className="flex items-start gap-3">
++                <span className="flex w-16 shrink-0 gap-1">
++                  {s.keys.map((k) => (
++                    <kbd key={k} className="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 text-xs font-mono text-gray-800">
++                      {k}
++                    </kbd>
++                  ))}
++                </span>
++                <span className="text-gray-700">{s.label}</span>
++              </li>
++            ))}
++          </ul>
++        </DialogContent>
++      </Dialog>
+     </div>
+   );
+ }
