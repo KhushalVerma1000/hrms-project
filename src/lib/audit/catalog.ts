@@ -23,6 +23,7 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
 
   CLIENT_CREATE: { label: 'Client created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
   CLIENT_GOOGLE_FORM_UPDATE: { label: 'Onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
+  STORE_GOOGLE_FORM_UPDATE: { label: 'Store onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
   WAREHOUSE_TYPE_CREATE: { label: 'Brand created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
   CLIENT_DETAILS_UPDATE: { label: 'Company details updated', category: 'Stores & Clients', severity: 'info' },
   STORE_DETAILS_UPDATE: { label: 'Store details updated', category: 'Stores & Clients', severity: 'info' },
@@ -91,6 +92,9 @@ export function summarizeMetadata(action: string, raw: unknown): string {
       const keys = m.changes && typeof m.changes === 'object' ? Object.keys(m.changes as object) : [];
       return keys.length ? `Changed: ${keys.join(', ')}` : '';
     }
+    case 'CLIENT_GOOGLE_FORM_UPDATE':
+    case 'STORE_GOOGLE_FORM_UPDATE':
+      return m.googleFormBaseUrl ? 'Form link set' : 'Form link cleared (inherits default)';
     case 'STORE_ATTENDANCE_MODE_CHANGED':
       return s(m.newMode) ? `Now ${String(m.newMode).toLowerCase()}` : '';
     case 'STORE_CREATE':

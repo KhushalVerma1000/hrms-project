@@ -8,7 +8,7 @@ import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import bcrypt from 'bcryptjs';
 import { Designation, EmployeeStatus } from '@prisma/client';
-import { generatePrefilledFormUrl } from '@/lib/config';
+import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
 
 export interface OnboardingSubmitInput {
   name: string;
@@ -262,13 +262,13 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
       metadata: { staffCode: result.staffCode, designation: input.designation, storeId: input.storeId },
     });
 
-    // Build pre-filled Google Form link — uses the Client's own override if set,
-    // otherwise falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
+    // Build pre-filled Google Form link — the store's own form if set, else the
+    // client's default, else the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
     const store = await prisma.store.findUnique({
       where: { id: input.storeId },
-      select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } },
+      select: ONBOARDING_FORM_STORE_SELECT,
     });
-    const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store?.client);
+    const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store);
 
     return {
       ok: true,

@@ -2,7 +2,7 @@
 
 import { requireAuth } from '@/lib/auth/session';
 import { prisma } from '@/lib/prisma';
-import { generatePrefilledFormUrl } from '@/lib/config';
+import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 
 /**
@@ -17,7 +17,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
     select: {
       staffCode: true,
       storeId: true,
-      store: { select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } } },
+      store: { select: ONBOARDING_FORM_STORE_SELECT },
     },
   });
 
@@ -39,7 +39,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
     },
   });
 
-  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store.client);
+  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
   return { ok: true, formLink };
 }
 
@@ -59,7 +59,7 @@ export async function sendFormReminder(
       staffCode: true,
       storeId: true,
       name: true,
-      store: { select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } } },
+      store: { select: ONBOARDING_FORM_STORE_SELECT },
     },
   });
 
@@ -92,6 +92,6 @@ export async function sendFormReminder(
     },
   });
 
-  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store.client);
+  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
   return { ok: true, formLink };
 }

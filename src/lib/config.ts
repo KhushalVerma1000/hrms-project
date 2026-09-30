@@ -104,21 +104,55 @@ export const GOOGLE_FORM_BASE_URL: string =
 export const GOOGLE_FORM_ECODE_FIELD_ID: string =
   process.env.GOOGLE_FORM_ECODE_FIELD_ID ?? '';
 
+type FormPair = { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null };
+
+/** A store row (with its client) as needed to resolve the onboarding form. */
+export type OnboardingFormSource = FormPair & { client?: FormPair | null };
+
+/** Prisma `select` that loads everything resolveOnboardingForm() needs. */
+export const ONBOARDING_FORM_STORE_SELECT = {
+  googleFormBaseUrl: true,
+  googleFormECodeFieldId: true,
+  client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } },
+} as const;
+
 /**
- * Generates a pre-filled Google Form URL with the employee code pre-populated.
- *
- * If a `clientOverride` is provided and has its own `googleFormBaseUrl` and
- * `googleFormECodeFieldId`, those take precedence over the global env vars.
- * This allows each Client to have a separate onboarding form (Section 13.5).
- *
- * Returns an empty string if no usable form config is found.
+ * Which Google Form applies to a store: the store's own override, else its
+ * client's default, else the global env vars. The URL and the e-code field id
+ * belong to the same form, so they are taken together from the first level
+ * that has BOTH — never mixed across levels.
+ */
+export function resolveOnboardingForm(
+  source?: OnboardingFormSource | null,
+): { baseUrl: string; fieldId: string; level: 'store' | 'client' | 'global' | 'none' } {
+  const has = (p?: FormPair | null): p is Required<FormPair> =>
+    !!p?.googleFormBaseUrl && !!p?.googleFormECodeFieldId;
+  if (has(source)) {
+    return { baseUrl: source.googleFormBaseUrl!, fieldId: source.googleFormECodeFieldId!, level: 'store' };
+  }
+  if (has(source?.client)) {
+    return {
+      baseUrl: source!.client!.googleFormBaseUrl!,
+      fieldId: source!.client!.googleFormECodeFieldId!,
+      level: 'client',
+    };
+  }
+  if (GOOGLE_FORM_BASE_URL && GOOGLE_FORM_ECODE_FIELD_ID) {
+    return { baseUrl: GOOGLE_FORM_BASE_URL, fieldId: GOOGLE_FORM_ECODE_FIELD_ID, level: 'global' };
+  }
+  return { baseUrl: '', fieldId: '', level: 'none' };
+}
+
+/**
+ * Generates a pre-filled Google Form URL with the employee code pre-populated,
+ * using the store's override -> client default -> global env vars (see
+ * resolveOnboardingForm). Returns an empty string if no usable form is found.
  */
 export function generatePrefilledFormUrl(
   employeeCode: string,
-  clientOverride?: { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null },
+  source?: OnboardingFormSource | null,
 ): string {
-  const baseUrl = clientOverride?.googleFormBaseUrl || GOOGLE_FORM_BASE_URL;
-  const fieldId = clientOverride?.googleFormECodeFieldId || GOOGLE_FORM_ECODE_FIELD_ID;
+  const { baseUrl, fieldId } = resolveOnboardingForm(source);
   if (!baseUrl || !fieldId) return '';
   const url = new URL(baseUrl);
   url.searchParams.set(fieldId, employeeCode);

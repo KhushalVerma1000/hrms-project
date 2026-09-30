@@ -195,7 +195,8 @@ model Client {
   /// 15-character GST Identification Number for this vendor account, if registered.
   gstin     String?
 
-  /// Per-client Google Form onboarding link override (Section 13.1/13.5).
+  /// Client-wide default Google Form onboarding link (Section 13.1/13.5) — applies
+  /// to every store of this client unless the Store sets its own override.
   /// If null, the app falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
   googleFormBaseUrl      String?
   googleFormECodeFieldId String?
@@ -256,6 +257,13 @@ model Store {
   /// MANUAL-mode stores. Turning it off hides the feature and blocks scans and
   /// enrolment, but keeps enrolled face data (delete it per employee if needed).
   faceAttendanceEnabled Boolean @default(false)
+
+  /// Per-store onboarding Google Form override. When both are null the store
+  /// inherits its Client's form (Client.googleFormBaseUrl/ECodeFieldId), which
+  /// in turn falls back to the global env vars. Resolution lives in
+  /// resolveOnboardingForm() in src/lib/config.ts.
+  googleFormBaseUrl      String?
+  googleFormECodeFieldId String?
 
   address        String?
   /// City/area, e.g. "Saket, New Delhi". Shorter than `address` — for

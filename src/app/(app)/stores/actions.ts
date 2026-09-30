@@ -20,7 +20,7 @@ export async function getStoresDataAction() {
     where.id = user.storeId;
   }
 
-  const stores = await prisma.store.findMany({
+  const rawStores = await prisma.store.findMany({
     where,
     include: {
       client: true,
@@ -30,6 +30,13 @@ export async function getStoresDataAction() {
     },
     orderBy: { createdAt: 'desc' },
   });
+
+  // Tell the UI which onboarding-form links this user may edit (the server
+  // actions re-check via can() — this only decides whether to show the fields).
+  const stores = rawStores.map((st) => ({
+    ...st,
+    canEditForm: can(session, 'onboardingForm:editStore', { storeId: st.id, clientId: st.clientId }),
+  }));
 
   let clients: any[] = [];
   let warehouseTypes: any[] = [];
@@ -41,6 +48,11 @@ export async function getStoresDataAction() {
     clients = await prisma.client.findMany({ where: { id: user.clientId } });
     warehouseTypes = await prisma.warehouseType.findMany({ orderBy: { name: 'asc' } });
   }
+
+  clients = clients.map((c) => ({
+    ...c,
+    canEditForm: can(session, 'onboardingForm:editClient', { clientId: c.id }),
+  }));
 
   // Non-admins never need the numbering codes (they are the building blocks
   // of employee codes) — strip them here so they don't reach the browser at
@@ -61,7 +73,11 @@ export async function getStoresDataAction() {
     };
   }
 
-  return { stores, clients, warehouseTypes };
+  return {
+    stores,
+    clients,
+    warehouseTypes,
+  };
 }
 
 export async function createClientAction(
@@ -116,10 +132,29 @@ export async function createClientAction(
   }
 }
 
+/** Validates a form URL + e-code field id pair. Both set, or both empty (= clear). */
+function parseFormPair(url: string, fieldId: string):
+  | { ok: true; url: string | null; fieldId: string | null }
+  | { ok: false; error: string } {
+  const u = url.trim();
+  const f = fieldId.trim();
+  if (!u && !f) return { ok: true, url: null, fieldId: null };
+  if (!u || !f) {
+    return { ok: false, error: 'Enter both the form URL and the e-code field ID, or leave both empty to clear.' };
+  }
+  try {
+    // eslint-disable-next-line no-new
+    new URL(u);
+  } catch {
+    return { ok: false, error: 'Google Form Base URL is not a valid URL.' };
+  }
+  return { ok: true, url: u, fieldId: f };
+}
+
 /**
- * Updates a Client's Google Form onboarding link (Section 13.5). Split out
- * from createClientAction so an existing Client can have this added/changed
- * later without re-creating the whole record. Admin only.
+ * Sets/clears a Client's default onboarding Google Form (Section 13.5). It applies
+ * to every store of the client unless the store sets its own. Empty = clear.
+ * Who may do this is controlled centrally in can.ts (onboardingForm:editClient).
  */
 export async function updateClientGoogleFormAction(
   clientId: string,
@@ -127,26 +162,18 @@ export async function updateClientGoogleFormAction(
   googleFormECodeFieldId: string,
 ) {
   const session = await auth();
-  if (!session?.user || session.user.role !== 'ADMIN') {
-    return { ok: false, error: 'Only Admin users can edit Client Google Form settings.' };
+  if (!session?.user) throw new Error('Unauthorized');
+  if (!can(session, 'onboardingForm:editClient', { clientId })) {
+    return { ok: false, error: 'You do not have permission to edit this onboarding form link.' };
   }
 
-  if (googleFormBaseUrl.trim()) {
-    try {
-      // eslint-disable-next-line no-new
-      new URL(googleFormBaseUrl.trim());
-    } catch {
-      return { ok: false, error: 'Google Form Base URL is not a valid URL.' };
-    }
-  }
+  const parsed = parseFormPair(googleFormBaseUrl, googleFormECodeFieldId);
+  if (!parsed.ok) return parsed;
 
   try {
     const client = await prisma.client.update({
       where: { id: clientId },
-      data: {
-        googleFormBaseUrl: googleFormBaseUrl.trim() || null,
-        googleFormECodeFieldId: googleFormECodeFieldId.trim() || null,
-      },
+      data: { googleFormBaseUrl: parsed.url, googleFormECodeFieldId: parsed.fieldId },
     });
 
     await writeAuditLog({
@@ -163,6 +190,54 @@ export async function updateClientGoogleFormAction(
     return { ok: true, client };
   } catch (err: any) {
     return { ok: false, error: err.message || 'Failed to update client Google Form settings.' };
+  }
+}
+
+/**
+ * Sets/clears ONE store's onboarding Google Form override. Empty = clear, and the
+ * store goes back to inheriting its client's form. Permission: onboardingForm:editStore.
+ */
+export async function updateStoreGoogleFormAction(
+  storeId: string,
+  googleFormBaseUrl: string,
+  googleFormECodeFieldId: string,
+) {
+  const session = await auth();
+  if (!session?.user) throw new Error('Unauthorized');
+
+  const store = await prisma.store.findUnique({
+    where: { id: storeId },
+    select: { clientId: true, name: true },
+  });
+  if (!store) return { ok: false, error: 'Store not found.' };
+  if (!can(session, 'onboardingForm:editStore', { storeId, clientId: store.clientId })) {
+    return { ok: false, error: 'You do not have permission to edit this onboarding form link.' };
+  }
+
+  const parsed = parseFormPair(googleFormBaseUrl, googleFormECodeFieldId);
+  if (!parsed.ok) return parsed;
+
+  try {
+    await prisma.store.update({
+      where: { id: storeId },
+      data: { googleFormBaseUrl: parsed.url, googleFormECodeFieldId: parsed.fieldId },
+    });
+
+    await writeAuditLog({
+      userId: session.user.id,
+      action: 'STORE_GOOGLE_FORM_UPDATE',
+      targetType: 'Store',
+      targetId: storeId,
+      metadata: {
+        name: store.name,
+        googleFormBaseUrl: parsed.url,
+        googleFormECodeFieldId: parsed.fieldId,
+      },
+    });
+
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Failed to update store Google Form settings.' };
   }
 }
 

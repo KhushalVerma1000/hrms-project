@@ -1,0 +1,537 @@
+diff --git a/prisma/migrations/20260930110000_store_onboarding_form_override/migration.sql b/prisma/migrations/20260930110000_store_onboarding_form_override/migration.sql
+new file mode 100644
+index 0000000..fa852c1
+--- /dev/null
++++ b/prisma/migrations/20260930110000_store_onboarding_form_override/migration.sql
+@@ -0,0 +1,3 @@
++-- Store-level onboarding Google Form override. NULL = inherit the Client's form.
++ALTER TABLE "Store" ADD COLUMN "googleFormBaseUrl" TEXT;
++ALTER TABLE "Store" ADD COLUMN "googleFormECodeFieldId" TEXT;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index d22db3b..ed7d348 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -195,7 +195,8 @@ model Client {
+   /// 15-character GST Identification Number for this vendor account, if registered.
+   gstin     String?
+ 
+-  /// Per-client Google Form onboarding link override (Section 13.1/13.5).
++  /// Client-wide default Google Form onboarding link (Section 13.1/13.5) — applies
++  /// to every store of this client unless the Store sets its own override.
+   /// If null, the app falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
+   googleFormBaseUrl      String?
+   googleFormECodeFieldId String?
+@@ -257,6 +258,13 @@ model Store {
+   /// enrolment, but keeps enrolled face data (delete it per employee if needed).
+   faceAttendanceEnabled Boolean @default(false)
+ 
++  /// Per-store onboarding Google Form override. When both are null the store
++  /// inherits its Client's form (Client.googleFormBaseUrl/ECodeFieldId), which
++  /// in turn falls back to the global env vars. Resolution lives in
++  /// resolveOnboardingForm() in src/lib/config.ts.
++  googleFormBaseUrl      String?
++  googleFormECodeFieldId String?
++
+   address        String?
+   /// City/area, e.g. "Saket, New Delhi". Shorter than `address` — for
+   /// quick display/filtering, not geofencing (see latitude/longitude below).
+diff --git a/src/app/(app)/onboarding/actions.ts b/src/app/(app)/onboarding/actions.ts
+index b65e052..3f6c936 100644
+--- a/src/app/(app)/onboarding/actions.ts
++++ b/src/app/(app)/onboarding/actions.ts
+@@ -8,7 +8,7 @@ import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
+ import { writeAuditLog } from '@/lib/smartoffice/audit';
+ import bcrypt from 'bcryptjs';
+ import { Designation, EmployeeStatus } from '@prisma/client';
+-import { generatePrefilledFormUrl } from '@/lib/config';
++import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
+ 
+ export interface OnboardingSubmitInput {
+   name: string;
+@@ -262,13 +262,13 @@ export async function submitOnboardingAction(input: OnboardingSubmitInput) {
+       metadata: { staffCode: result.staffCode, designation: input.designation, storeId: input.storeId },
+     });
+ 
+-    // Build pre-filled Google Form link — uses the Client's own override if set,
+-    // otherwise falls back to the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
++    // Build pre-filled Google Form link — the store's own form if set, else the
++    // client's default, else the global GOOGLE_FORM_BASE_URL/FIELD_ID env vars.
+     const store = await prisma.store.findUnique({
+       where: { id: input.storeId },
+-      select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } },
++      select: ONBOARDING_FORM_STORE_SELECT,
+     });
+-    const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store?.client);
++    const googleFormUrl = generatePrefilledFormUrl(result.staffCode, store);
+ 
+     return {
+       ok: true,
+diff --git a/src/app/(app)/onboarding/pending-forms/actions.ts b/src/app/(app)/onboarding/pending-forms/actions.ts
+index 463df3b..3b51b17 100644
+--- a/src/app/(app)/onboarding/pending-forms/actions.ts
++++ b/src/app/(app)/onboarding/pending-forms/actions.ts
+@@ -2,7 +2,7 @@
+ 
+ import { requireAuth } from '@/lib/auth/session';
+ import { prisma } from '@/lib/prisma';
+-import { generatePrefilledFormUrl } from '@/lib/config';
++import { generatePrefilledFormUrl, ONBOARDING_FORM_STORE_SELECT } from '@/lib/config';
+ import { writeAuditLog } from '@/lib/smartoffice/audit';
+ 
+ /**
+@@ -17,7 +17,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
+     select: {
+       staffCode: true,
+       storeId: true,
+-      store: { select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } } },
++      store: { select: ONBOARDING_FORM_STORE_SELECT },
+     },
+   });
+ 
+@@ -39,7 +39,7 @@ export async function markFormSent(employeeId: string): Promise<{ ok: boolean; f
+     },
+   });
+ 
+-  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store.client);
++  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
+   return { ok: true, formLink };
+ }
+ 
+@@ -59,7 +59,7 @@ export async function sendFormReminder(
+       staffCode: true,
+       storeId: true,
+       name: true,
+-      store: { select: { client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } } } },
++      store: { select: ONBOARDING_FORM_STORE_SELECT },
+     },
+   });
+ 
+@@ -92,6 +92,6 @@ export async function sendFormReminder(
+     },
+   });
+ 
+-  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store.client);
++  const formLink = generatePrefilledFormUrl(employee.staffCode, employee.store);
+   return { ok: true, formLink };
+ }
+diff --git a/src/app/(app)/stores/actions.ts b/src/app/(app)/stores/actions.ts
+index 7a24eb2..a3e421e 100644
+--- a/src/app/(app)/stores/actions.ts
++++ b/src/app/(app)/stores/actions.ts
+@@ -20,7 +20,7 @@ export async function getStoresDataAction() {
+     where.id = user.storeId;
+   }
+ 
+-  const stores = await prisma.store.findMany({
++  const rawStores = await prisma.store.findMany({
+     where,
+     include: {
+       client: true,
+@@ -31,6 +31,13 @@ export async function getStoresDataAction() {
+     orderBy: { createdAt: 'desc' },
+   });
+ 
++  // Tell the UI which onboarding-form links this user may edit (the server
++  // actions re-check via can() — this only decides whether to show the fields).
++  const stores = rawStores.map((st) => ({
++    ...st,
++    canEditForm: can(session, 'onboardingForm:editStore', { storeId: st.id, clientId: st.clientId }),
++  }));
++
+   let clients: any[] = [];
+   let warehouseTypes: any[] = [];
+ 
+@@ -42,6 +49,11 @@ export async function getStoresDataAction() {
+     warehouseTypes = await prisma.warehouseType.findMany({ orderBy: { name: 'asc' } });
+   }
+ 
++  clients = clients.map((c) => ({
++    ...c,
++    canEditForm: can(session, 'onboardingForm:editClient', { clientId: c.id }),
++  }));
++
+   // Non-admins never need the numbering codes (they are the building blocks
+   // of employee codes) — strip them here so they don't reach the browser at
+   // all, rather than just hiding them in the UI.
+@@ -61,7 +73,11 @@ export async function getStoresDataAction() {
+     };
+   }
+ 
+-  return { stores, clients, warehouseTypes };
++  return {
++    stores,
++    clients,
++    warehouseTypes,
++  };
+ }
+ 
+ export async function createClientAction(
+@@ -116,10 +132,29 @@ export async function createClientAction(
+   }
+ }
+ 
++/** Validates a form URL + e-code field id pair. Both set, or both empty (= clear). */
++function parseFormPair(url: string, fieldId: string):
++  | { ok: true; url: string | null; fieldId: string | null }
++  | { ok: false; error: string } {
++  const u = url.trim();
++  const f = fieldId.trim();
++  if (!u && !f) return { ok: true, url: null, fieldId: null };
++  if (!u || !f) {
++    return { ok: false, error: 'Enter both the form URL and the e-code field ID, or leave both empty to clear.' };
++  }
++  try {
++    // eslint-disable-next-line no-new
++    new URL(u);
++  } catch {
++    return { ok: false, error: 'Google Form Base URL is not a valid URL.' };
++  }
++  return { ok: true, url: u, fieldId: f };
++}
++
+ /**
+- * Updates a Client's Google Form onboarding link (Section 13.5). Split out
+- * from createClientAction so an existing Client can have this added/changed
+- * later without re-creating the whole record. Admin only.
++ * Sets/clears a Client's default onboarding Google Form (Section 13.5). It applies
++ * to every store of the client unless the store sets its own. Empty = clear.
++ * Who may do this is controlled centrally in can.ts (onboardingForm:editClient).
+  */
+ export async function updateClientGoogleFormAction(
+   clientId: string,
+@@ -127,26 +162,18 @@ export async function updateClientGoogleFormAction(
+   googleFormECodeFieldId: string,
+ ) {
+   const session = await auth();
+-  if (!session?.user || session.user.role !== 'ADMIN') {
+-    return { ok: false, error: 'Only Admin users can edit Client Google Form settings.' };
++  if (!session?.user) throw new Error('Unauthorized');
++  if (!can(session, 'onboardingForm:editClient', { clientId })) {
++    return { ok: false, error: 'You do not have permission to edit this onboarding form link.' };
+   }
+ 
+-  if (googleFormBaseUrl.trim()) {
+-    try {
+-      // eslint-disable-next-line no-new
+-      new URL(googleFormBaseUrl.trim());
+-    } catch {
+-      return { ok: false, error: 'Google Form Base URL is not a valid URL.' };
+-    }
+-  }
++  const parsed = parseFormPair(googleFormBaseUrl, googleFormECodeFieldId);
++  if (!parsed.ok) return parsed;
+ 
+   try {
+     const client = await prisma.client.update({
+       where: { id: clientId },
+-      data: {
+-        googleFormBaseUrl: googleFormBaseUrl.trim() || null,
+-        googleFormECodeFieldId: googleFormECodeFieldId.trim() || null,
+-      },
++      data: { googleFormBaseUrl: parsed.url, googleFormECodeFieldId: parsed.fieldId },
+     });
+ 
+     await writeAuditLog({
+@@ -166,6 +193,54 @@ export async function updateClientGoogleFormAction(
+   }
+ }
+ 
++/**
++ * Sets/clears ONE store's onboarding Google Form override. Empty = clear, and the
++ * store goes back to inheriting its client's form. Permission: onboardingForm:editStore.
++ */
++export async function updateStoreGoogleFormAction(
++  storeId: string,
++  googleFormBaseUrl: string,
++  googleFormECodeFieldId: string,
++) {
++  const session = await auth();
++  if (!session?.user) throw new Error('Unauthorized');
++
++  const store = await prisma.store.findUnique({
++    where: { id: storeId },
++    select: { clientId: true, name: true },
++  });
++  if (!store) return { ok: false, error: 'Store not found.' };
++  if (!can(session, 'onboardingForm:editStore', { storeId, clientId: store.clientId })) {
++    return { ok: false, error: 'You do not have permission to edit this onboarding form link.' };
++  }
++
++  const parsed = parseFormPair(googleFormBaseUrl, googleFormECodeFieldId);
++  if (!parsed.ok) return parsed;
++
++  try {
++    await prisma.store.update({
++      where: { id: storeId },
++      data: { googleFormBaseUrl: parsed.url, googleFormECodeFieldId: parsed.fieldId },
++    });
++
++    await writeAuditLog({
++      userId: session.user.id,
++      action: 'STORE_GOOGLE_FORM_UPDATE',
++      targetType: 'Store',
++      targetId: storeId,
++      metadata: {
++        name: store.name,
++        googleFormBaseUrl: parsed.url,
++        googleFormECodeFieldId: parsed.fieldId,
++      },
++    });
++
++    return { ok: true };
++  } catch (err: any) {
++    return { ok: false, error: err.message || 'Failed to update store Google Form settings.' };
++  }
++}
++
+ export async function createWarehouseTypeAction(name: string) {
+   const session = await auth();
+   if (!session?.user || session.user.role !== 'ADMIN') {
+diff --git a/src/components/stores/StoreManagement.tsx b/src/components/stores/StoreManagement.tsx
+index 7455e8a..a42b81f 100644
+--- a/src/components/stores/StoreManagement.tsx
++++ b/src/components/stores/StoreManagement.tsx
+@@ -9,6 +9,8 @@ import {
+   updateClientDetailsAction,
+   updateStoreDetailsAction,
+   updateStoreFaceAttendanceAction,
++  updateClientGoogleFormAction,
++  updateStoreGoogleFormAction,
+ } from '@/app/(app)/stores/actions';
+ import { Button } from '@/components/ui/button';
+ import { Input } from '@/components/ui/input';
+@@ -66,6 +68,12 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+     address: string;
+     location: string;
+     gstin: string;
++    /// Onboarding Google Form link — only editable when canEditForm is true.
++    canEditForm: boolean;
++    formUrl: string;
++    formFieldId: string;
++    /// For stores: the client's default, shown as the inherited value.
++    inheritedFormUrl: string;
+   } | null>(null);
+   const [savingEdit, setSavingEdit] = useState(false);
+ 
+@@ -180,6 +188,17 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+         toast.error(res.error || 'Failed to save changes');
+         return;
+       }
++      if (editTarget.canEditForm) {
++        const formRes =
++          editTarget.kind === 'store'
++            ? await updateStoreGoogleFormAction(editTarget.id, editTarget.formUrl, editTarget.formFieldId)
++            : await updateClientGoogleFormAction(editTarget.id, editTarget.formUrl, editTarget.formFieldId);
++        if (!formRes.ok) {
++          toast.error(formRes.error || 'Details saved, but the form link could not be saved');
++          fetchData();
++          return;
++        }
++      }
+       toast.success('Details saved');
+       setEditTarget(null);
+       fetchData();
+@@ -374,6 +393,10 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+                                 address: st.address || '',
+                                 location: st.location || '',
+                                 gstin: st.gstin || '',
++                                canEditForm: !!st.canEditForm,
++                                formUrl: st.googleFormBaseUrl || '',
++                                formFieldId: st.googleFormECodeFieldId || '',
++                                inheritedFormUrl: st.client?.googleFormBaseUrl || '',
+                               })
+                             }
+                           >
+@@ -434,6 +457,10 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+                                 address: '',
+                                 location: cl.location || '',
+                                 gstin: cl.gstin || '',
++                                canEditForm: !!cl.canEditForm,
++                                formUrl: cl.googleFormBaseUrl || '',
++                                formFieldId: cl.googleFormECodeFieldId || '',
++                                inheritedFormUrl: '',
+                               })
+                             }
+                           >
+@@ -642,6 +669,39 @@ export function StoreManagement({ userRole }: { userRole: string }) {
+                   onChange={(e) => setEditTarget({ ...editTarget, gstin: e.target.value.toUpperCase() })}
+                 />
+               </div>
++
++              {editTarget.canEditForm && (
++                <div className="space-y-3 rounded-lg border p-3">
++                  <div>
++                    <div className="text-sm font-medium">Onboarding Google Form</div>
++                    <p className="text-xs text-gray-500 mt-0.5">
++                      {editTarget.kind === 'client'
++                        ? 'Default form for every store of this client, unless a store sets its own. Leave both empty to use the app-wide form.'
++                        : editTarget.inheritedFormUrl
++                          ? "Leave both empty to use this client's default form."
++                          : 'Leave both empty to use the client or app-wide form.'}
++                    </p>
++                  </div>
++                  <div className="space-y-2">
++                    <Label>Form URL</Label>
++                    <Input
++                      className="font-mono text-xs"
++                      placeholder={editTarget.kind === 'store' ? editTarget.inheritedFormUrl || 'https://docs.google.com/forms/d/e/…/viewform' : 'https://docs.google.com/forms/d/e/…/viewform'}
++                      value={editTarget.formUrl}
++                      onChange={(e) => setEditTarget({ ...editTarget, formUrl: e.target.value })}
++                    />
++                  </div>
++                  <div className="space-y-2">
++                    <Label>E-code field ID</Label>
++                    <Input
++                      className="font-mono text-xs"
++                      placeholder="entry.1234567890"
++                      value={editTarget.formFieldId}
++                      onChange={(e) => setEditTarget({ ...editTarget, formFieldId: e.target.value })}
++                    />
++                  </div>
++                </div>
++              )}
+             </div>
+           )}
+           <DialogFooter>
+diff --git a/src/lib/audit/catalog.ts b/src/lib/audit/catalog.ts
+index 6ca2e97..b708806 100644
+--- a/src/lib/audit/catalog.ts
++++ b/src/lib/audit/catalog.ts
+@@ -23,6 +23,7 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
+ 
+   CLIENT_CREATE: { label: 'Client created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
+   CLIENT_GOOGLE_FORM_UPDATE: { label: 'Onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
++  STORE_GOOGLE_FORM_UPDATE: { label: 'Store onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
+   WAREHOUSE_TYPE_CREATE: { label: 'Brand created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
+   CLIENT_DETAILS_UPDATE: { label: 'Company details updated', category: 'Stores & Clients', severity: 'info' },
+   STORE_DETAILS_UPDATE: { label: 'Store details updated', category: 'Stores & Clients', severity: 'info' },
+@@ -91,6 +92,9 @@ export function summarizeMetadata(action: string, raw: unknown): string {
+       const keys = m.changes && typeof m.changes === 'object' ? Object.keys(m.changes as object) : [];
+       return keys.length ? `Changed: ${keys.join(', ')}` : '';
+     }
++    case 'CLIENT_GOOGLE_FORM_UPDATE':
++    case 'STORE_GOOGLE_FORM_UPDATE':
++      return m.googleFormBaseUrl ? 'Form link set' : 'Form link cleared (inherits default)';
+     case 'STORE_ATTENDANCE_MODE_CHANGED':
+       return s(m.newMode) ? `Now ${String(m.newMode).toLowerCase()}` : '';
+     case 'STORE_CREATE':
+diff --git a/src/lib/auth/can.ts b/src/lib/auth/can.ts
+index ba36ba8..0dc4a5d 100644
+--- a/src/lib/auth/can.ts
++++ b/src/lib/auth/can.ts
+@@ -30,7 +30,17 @@ export type Action =
+   | 'syncIssues:view'
+   | 'syncIssues:retry'
+   | 'formTracking:view'
+-  | 'formTracking:remind';
++  | 'formTracking:remind'
++  | 'onboardingForm:editClient'
++  | 'onboardingForm:editStore';
++
++/**
++ * Roles allowed to change onboarding Google Form links. Admin only for now.
++ * To let clients (client-wide default) and/or managers (their own store's
++ * override) manage their own links later, add 'CLIENT' and/or 'MANAGER' here —
++ * the scoping below (own client / own store) is already in place.
++ */
++const ONBOARDING_FORM_EDITOR_ROLES: readonly Role[] = ['ADMIN'];
+ 
+ /**
+  * Context for scoped permission checks.
+@@ -241,6 +251,26 @@ export function can(
+         default: return false;
+       }
+ 
++    // ── Onboarding Google Form links ─────────────────────────────────
++    // Client-wide default: Admin, or a Client for their own account.
++    case 'onboardingForm:editClient':
++      if (!ONBOARDING_FORM_EDITOR_ROLES.includes(role)) return false;
++      switch (role) {
++        case 'ADMIN': return true;
++        case 'CLIENT': return !!ctx.clientId && inClient(ctx.clientId);
++        default: return false;
++      }
++
++    // Per-store override: Admin, the store's Client, or that store's Manager.
++    case 'onboardingForm:editStore':
++      if (!ONBOARDING_FORM_EDITOR_ROLES.includes(role)) return false;
++      switch (role) {
++        case 'ADMIN': return true;
++        case 'CLIENT': return !!ctx.clientId && inClient(ctx.clientId);
++        case 'MANAGER': return !!ctx.storeId && inStore(ctx.storeId);
++        default: return false;
++      }
++
+     default:
+       return false;
+   }
+diff --git a/src/lib/config.ts b/src/lib/config.ts
+index cf21a5a..8b36504 100644
+--- a/src/lib/config.ts
++++ b/src/lib/config.ts
+@@ -104,21 +104,55 @@ export const GOOGLE_FORM_BASE_URL: string =
+ export const GOOGLE_FORM_ECODE_FIELD_ID: string =
+   process.env.GOOGLE_FORM_ECODE_FIELD_ID ?? '';
+ 
++type FormPair = { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null };
++
++/** A store row (with its client) as needed to resolve the onboarding form. */
++export type OnboardingFormSource = FormPair & { client?: FormPair | null };
++
++/** Prisma `select` that loads everything resolveOnboardingForm() needs. */
++export const ONBOARDING_FORM_STORE_SELECT = {
++  googleFormBaseUrl: true,
++  googleFormECodeFieldId: true,
++  client: { select: { googleFormBaseUrl: true, googleFormECodeFieldId: true } },
++} as const;
++
+ /**
+- * Generates a pre-filled Google Form URL with the employee code pre-populated.
+- *
+- * If a `clientOverride` is provided and has its own `googleFormBaseUrl` and
+- * `googleFormECodeFieldId`, those take precedence over the global env vars.
+- * This allows each Client to have a separate onboarding form (Section 13.5).
+- *
+- * Returns an empty string if no usable form config is found.
++ * Which Google Form applies to a store: the store's own override, else its
++ * client's default, else the global env vars. The URL and the e-code field id
++ * belong to the same form, so they are taken together from the first level
++ * that has BOTH — never mixed across levels.
++ */
++export function resolveOnboardingForm(
++  source?: OnboardingFormSource | null,
++): { baseUrl: string; fieldId: string; level: 'store' | 'client' | 'global' | 'none' } {
++  const has = (p?: FormPair | null): p is Required<FormPair> =>
++    !!p?.googleFormBaseUrl && !!p?.googleFormECodeFieldId;
++  if (has(source)) {
++    return { baseUrl: source.googleFormBaseUrl!, fieldId: source.googleFormECodeFieldId!, level: 'store' };
++  }
++  if (has(source?.client)) {
++    return {
++      baseUrl: source!.client!.googleFormBaseUrl!,
++      fieldId: source!.client!.googleFormECodeFieldId!,
++      level: 'client',
++    };
++  }
++  if (GOOGLE_FORM_BASE_URL && GOOGLE_FORM_ECODE_FIELD_ID) {
++    return { baseUrl: GOOGLE_FORM_BASE_URL, fieldId: GOOGLE_FORM_ECODE_FIELD_ID, level: 'global' };
++  }
++  return { baseUrl: '', fieldId: '', level: 'none' };
++}
++
++/**
++ * Generates a pre-filled Google Form URL with the employee code pre-populated,
++ * using the store's override -> client default -> global env vars (see
++ * resolveOnboardingForm). Returns an empty string if no usable form is found.
+  */
+ export function generatePrefilledFormUrl(
+   employeeCode: string,
+-  clientOverride?: { googleFormBaseUrl?: string | null; googleFormECodeFieldId?: string | null },
++  source?: OnboardingFormSource | null,
+ ): string {
+-  const baseUrl = clientOverride?.googleFormBaseUrl || GOOGLE_FORM_BASE_URL;
+-  const fieldId = clientOverride?.googleFormECodeFieldId || GOOGLE_FORM_ECODE_FIELD_ID;
++  const { baseUrl, fieldId } = resolveOnboardingForm(source);
+   if (!baseUrl || !fieldId) return '';
+   const url = new URL(baseUrl);
+   url.searchParams.set(fieldId, employeeCode);

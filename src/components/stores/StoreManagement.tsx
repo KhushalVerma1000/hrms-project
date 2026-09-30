@@ -9,6 +9,8 @@ import {
   updateClientDetailsAction,
   updateStoreDetailsAction,
   updateStoreFaceAttendanceAction,
+  updateClientGoogleFormAction,
+  updateStoreGoogleFormAction,
 } from '@/app/(app)/stores/actions';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -66,6 +68,12 @@ export function StoreManagement({ userRole }: { userRole: string }) {
     address: string;
     location: string;
     gstin: string;
+    /// Onboarding Google Form link — only editable when canEditForm is true.
+    canEditForm: boolean;
+    formUrl: string;
+    formFieldId: string;
+    /// For stores: the client's default, shown as the inherited value.
+    inheritedFormUrl: string;
   } | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
 
@@ -179,6 +187,17 @@ export function StoreManagement({ userRole }: { userRole: string }) {
       if (!res.ok) {
         toast.error(res.error || 'Failed to save changes');
         return;
+      }
+      if (editTarget.canEditForm) {
+        const formRes =
+          editTarget.kind === 'store'
+            ? await updateStoreGoogleFormAction(editTarget.id, editTarget.formUrl, editTarget.formFieldId)
+            : await updateClientGoogleFormAction(editTarget.id, editTarget.formUrl, editTarget.formFieldId);
+        if (!formRes.ok) {
+          toast.error(formRes.error || 'Details saved, but the form link could not be saved');
+          fetchData();
+          return;
+        }
       }
       toast.success('Details saved');
       setEditTarget(null);
@@ -374,6 +393,10 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                                 address: st.address || '',
                                 location: st.location || '',
                                 gstin: st.gstin || '',
+                                canEditForm: !!st.canEditForm,
+                                formUrl: st.googleFormBaseUrl || '',
+                                formFieldId: st.googleFormECodeFieldId || '',
+                                inheritedFormUrl: st.client?.googleFormBaseUrl || '',
                               })
                             }
                           >
@@ -434,6 +457,10 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                                 address: '',
                                 location: cl.location || '',
                                 gstin: cl.gstin || '',
+                                canEditForm: !!cl.canEditForm,
+                                formUrl: cl.googleFormBaseUrl || '',
+                                formFieldId: cl.googleFormECodeFieldId || '',
+                                inheritedFormUrl: '',
                               })
                             }
                           >
@@ -642,6 +669,39 @@ export function StoreManagement({ userRole }: { userRole: string }) {
                   onChange={(e) => setEditTarget({ ...editTarget, gstin: e.target.value.toUpperCase() })}
                 />
               </div>
+
+              {editTarget.canEditForm && (
+                <div className="space-y-3 rounded-lg border p-3">
+                  <div>
+                    <div className="text-sm font-medium">Onboarding Google Form</div>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      {editTarget.kind === 'client'
+                        ? 'Default form for every store of this client, unless a store sets its own. Leave both empty to use the app-wide form.'
+                        : editTarget.inheritedFormUrl
+                          ? "Leave both empty to use this client's default form."
+                          : 'Leave both empty to use the client or app-wide form.'}
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Form URL</Label>
+                    <Input
+                      className="font-mono text-xs"
+                      placeholder={editTarget.kind === 'store' ? editTarget.inheritedFormUrl || 'https://docs.google.com/forms/d/e/…/viewform' : 'https://docs.google.com/forms/d/e/…/viewform'}
+                      value={editTarget.formUrl}
+                      onChange={(e) => setEditTarget({ ...editTarget, formUrl: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>E-code field ID</Label>
+                    <Input
+                      className="font-mono text-xs"
+                      placeholder="entry.1234567890"
+                      value={editTarget.formFieldId}
+                      onChange={(e) => setEditTarget({ ...editTarget, formFieldId: e.target.value })}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           )}
           <DialogFooter>

@@ -30,7 +30,17 @@ export type Action =
   | 'syncIssues:view'
   | 'syncIssues:retry'
   | 'formTracking:view'
-  | 'formTracking:remind';
+  | 'formTracking:remind'
+  | 'onboardingForm:editClient'
+  | 'onboardingForm:editStore';
+
+/**
+ * Roles allowed to change onboarding Google Form links. Admin only for now.
+ * To let clients (client-wide default) and/or managers (their own store's
+ * override) manage their own links later, add 'CLIENT' and/or 'MANAGER' here —
+ * the scoping below (own client / own store) is already in place.
+ */
+const ONBOARDING_FORM_EDITOR_ROLES: readonly Role[] = ['ADMIN'];
 
 /**
  * Context for scoped permission checks.
@@ -238,6 +248,26 @@ export function can(
         case 'CLIENT': return true;
         case 'MANAGER':
         case 'SHIFT_INCHARGE': return inStore(ctx.storeId);
+        default: return false;
+      }
+
+    // ── Onboarding Google Form links ─────────────────────────────────
+    // Client-wide default: Admin, or a Client for their own account.
+    case 'onboardingForm:editClient':
+      if (!ONBOARDING_FORM_EDITOR_ROLES.includes(role)) return false;
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return !!ctx.clientId && inClient(ctx.clientId);
+        default: return false;
+      }
+
+    // Per-store override: Admin, the store's Client, or that store's Manager.
+    case 'onboardingForm:editStore':
+      if (!ONBOARDING_FORM_EDITOR_ROLES.includes(role)) return false;
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return !!ctx.clientId && inClient(ctx.clientId);
+        case 'MANAGER': return !!ctx.storeId && inStore(ctx.storeId);
         default: return false;
       }
 
