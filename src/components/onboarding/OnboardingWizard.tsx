@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Designation } from '@prisma/client';
 import {
   getStoresForOnboardingAction,
@@ -17,8 +17,9 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { markFormSent } from '@/app/(app)/onboarding/pending-forms/actions';
 import { normalizeMobile, formatMobile } from '@/lib/whatsapp';
-import { CheckCircle2, AlertTriangle, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle } from 'lucide-react';
+import { CheckCircle2, Check, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle, Pencil } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface StoreOption {
@@ -56,6 +57,11 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   const [email, setEmail] = useState('');
   const [tempPassword, setTempPassword] = useState('');
 
+  // Validation: errors show inline once the user has tried to continue
+  // (mobile also shows live, as soon as something is typed).
+  const [showErrors, setShowErrors] = useState(false);
+  const topRef = useRef<HTMLDivElement>(null);
+
   // Enrollment mode
   const [enrollmentMode, setEnrollmentMode] = useState<'DIRECT_UPLOAD' | 'REMOTE_LINK'>('DIRECT_UPLOAD');
 
@@ -70,6 +76,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
     staffCode: string;
     googleFormUrl: string;
     whatsappUrl: string;
+    employeeId: string;
     commandId: string;
   } | null>(null);
   const [cmdStatus, setCmdStatus] = useState<string>('PENDING');
@@ -110,25 +117,39 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
     designation === Designation.SHIFT_INCHARGE ||
     designation === Designation.STORE_MANAGER;
 
+  const mobileNormalized = normalizeMobile(mobileNumber);
+  const errors = {
+    name: !name.trim() ? 'Enter the employee\'s full name.' : '',
+    mobile:
+      !mobileNumber.trim() ? 'Enter a mobile number — the form link is sent here.'
+      : mobileNormalized === null ? 'Enter 10 digits, or a number with country code.'
+      : '',
+    store: !storeId ? 'Select the store this person works at.' : '',
+    email:
+      isAppRoleDesignation && createAppLogin && (!email || !/^\S+@\S+\.\S+$/.test(email))
+        ? 'Enter a valid email for the app login.'
+        : '',
+  };
+  const hasErrors = Object.values(errors).some(Boolean);
+  const fieldCls = (msg: string, always = false) =>
+    (showErrors || always) && msg ? 'border-red-400 focus-visible:ring-red-400' : '';
+  const FieldError = ({ msg, always = false }: { msg: string; always?: boolean }) =>
+    (showErrors || always) && msg ? <p className="text-xs text-red-600" role="alert">{msg}</p> : null;
+
   const handleStep1Next = () => {
-    if (!name.trim()) {
-      toast.error('Please enter the employee name');
-      return;
-    }
-    if (!storeId) {
-      toast.error('Please select a store');
-      return;
-    }
-    if (normalizeMobile(mobileNumber) === null) {
-      toast.error('Please enter a valid mobile number (10 digits, or with country code)');
-      return;
-    }
-    if (isAppRoleDesignation && createAppLogin && (!email || !email.includes('@'))) {
-      toast.error('Please enter a valid email for app login');
+    if (hasErrors) {
+      setShowErrors(true);
+      const first = errors.name ? 'name' : errors.mobile ? 'mobile' : errors.store ? 'store' : 'loginEmail';
+      document.getElementById(first)?.focus();
       return;
     }
     setStep(2);
   };
+
+  // Every step change starts at the top of the wizard.
+  useEffect(() => {
+    topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [step]);
 
   const handleStep2Next = () => {
     setStep(3);
@@ -163,6 +184,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
         staffCode: res.staffCode!,
         googleFormUrl: res.googleFormUrl!,
         whatsappUrl: res.whatsappUrl!,
+        employeeId: res.employeeId!,
         commandId: res.commandId!,
       });
       toast.success(`Associate ${res.staffCode} onboarded successfully!`);
@@ -192,7 +214,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   }, [step, onboardResult?.commandId]);
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
+    <div className="max-w-4xl mx-auto space-y-6" ref={topRef}>
       {/* Header & Steps Indicator */}
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
@@ -209,29 +231,55 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
           Onboard new associates, auto-assign 10-digit E-Codes, and sync biometric enrollment.
         </p>
 
-        {/* Progress Bar */}
-        <div className="grid grid-cols-4 gap-2 mt-4">
+        {/* Progress stepper — completed steps can be clicked to go back */}
+        <ol className="flex items-center mt-4" aria-label="Onboarding progress">
           {[
             { num: 1, label: 'Basic Details' },
             { num: 2, label: 'Biometrics & Card' },
             { num: 3, label: 'Review & Submit' },
             { num: 4, label: 'Confirmation' },
-          ].map((s) => (
-            <div
-              key={s.num}
-              className={`p-3 rounded-lg border text-center transition-all ${
-                step === s.num
-                  ? 'bg-primary text-primary-foreground border-primary shadow-sm font-semibold'
-                  : step > s.num
-                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-300'
-                  : 'bg-gray-50 text-gray-400 border-gray-200 dark:bg-gray-900'
-              }`}
-            >
-              <div className="text-xs uppercase tracking-wider font-medium">Step {s.num}</div>
-              <div className="text-sm truncate">{s.label}</div>
-            </div>
-          ))}
-        </div>
+          ].map((st, idx, arr) => {
+            const done = step > st.num;
+            const current = step === st.num;
+            const canGoBack = done && step < 4;
+            return (
+              <li key={st.num} className={`flex items-center ${idx < arr.length - 1 ? 'flex-1' : ''}`}>
+                <button
+                  type="button"
+                  disabled={!canGoBack}
+                  onClick={() => canGoBack && setStep(st.num as 1 | 2 | 3)}
+                  aria-current={current ? 'step' : undefined}
+                  className={`flex items-center gap-2 ${canGoBack ? 'cursor-pointer' : 'cursor-default'}`}
+                >
+                  <span
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-sm font-semibold transition-colors ${
+                      done
+                        ? 'bg-emerald-600 border-emerald-600 text-white'
+                        : current
+                        ? 'bg-primary border-primary text-primary-foreground shadow-sm'
+                        : 'bg-white border-gray-300 text-gray-400 dark:bg-gray-900 dark:border-gray-700'
+                    }`}
+                  >
+                    {done ? <Check className="h-4 w-4" /> : st.num}
+                  </span>
+                  <span
+                    className={`hidden sm:inline text-sm whitespace-nowrap ${
+                      current ? 'font-semibold text-gray-900 dark:text-white' : done ? 'text-emerald-700 dark:text-emerald-400' : 'text-gray-400'
+                    }`}
+                  >
+                    {st.label}
+                  </span>
+                </button>
+                {idx < arr.length - 1 && (
+                  <span className={`mx-3 h-px flex-1 ${done ? 'bg-emerald-500' : 'bg-gray-200 dark:bg-gray-800'}`} />
+                )}
+              </li>
+            );
+          })}
+        </ol>
+        <p className="sm:hidden text-xs text-gray-500 mt-1">
+          Step {Math.min(step, 4)} of 4
+        </p>
       </div>
 
       {/* STEP 1: BASIC DETAILS */}
@@ -243,7 +291,16 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
               Enter personal details and designation. Store choice generates the 10-digit E-Code automatically.
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent
+            className="space-y-4"
+            onKeyDown={(e) => {
+              // Enter in a text box moves on, like submitting a form (not inside dropdowns/buttons).
+              if (e.key === 'Enter' && (e.target as HTMLElement).tagName === 'INPUT') {
+                e.preventDefault();
+                handleStep1Next();
+              }
+            }}
+          >
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="name">Full Name *</Label>
@@ -251,8 +308,12 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   id="name"
                   placeholder="e.g. Ramesh Kumar"
                   value={name}
+                  autoFocus
+                  aria-invalid={showErrors && !!errors.name}
+                  className={fieldCls(errors.name)}
                   onChange={(e) => setName(e.target.value)}
                 />
+                <FieldError msg={errors.name} />
               </div>
 
               <div className="space-y-2">
@@ -278,9 +339,21 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   autoComplete="off"
                   placeholder="e.g. 98765 43210"
                   value={mobileNumber}
+                  aria-invalid={(showErrors || !!mobileNumber.trim()) && !!errors.mobile}
+                  className={fieldCls(errors.mobile, !!mobileNumber.trim())}
                   onChange={(e) => setMobileNumber(e.target.value)}
                 />
-                <p className="text-xs text-gray-500">The onboarding form link is sent to this number on WhatsApp.</p>
+                {mobileNormalized && !errors.mobile ? (
+                  <p className="text-xs text-emerald-700 dark:text-emerald-400">
+                    <Check className="inline w-3 h-3 mr-1" />
+                    {formatMobile(mobileNormalized)}
+                  </p>
+                ) : (
+                  <FieldError msg={errors.mobile} always={!!mobileNumber.trim()} />
+                )}
+                {!errors.mobile && !mobileNormalized && !showErrors && (
+                  <p className="text-xs text-gray-500">The onboarding form link is sent to this number on WhatsApp.</p>
+                )}
               </div>
 
               <div className="space-y-2">
@@ -301,7 +374,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   </div>
                 ) : (
                   <Select value={storeId} onValueChange={setStoreId}>
-                    <SelectTrigger id="store">
+                    <SelectTrigger id="store" aria-invalid={showErrors && !!errors.store} className={fieldCls(errors.store)}>
                       <SelectValue placeholder="Select store" />
                     </SelectTrigger>
                     <SelectContent>
@@ -313,6 +386,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                     </SelectContent>
                   </Select>
                 )}
+                <FieldError msg={errors.store} />
               </div>
 
               <div className="space-y-2">
@@ -345,6 +419,11 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                     </SelectItem>
                   </SelectContent>
                 </Select>
+                <p className="text-xs text-gray-500">
+                  {isAppRoleDesignation
+                    ? 'Can also get an app login — set it up below.'
+                    : 'Attendance only — no app login is created.'}
+                </p>
               </div>
 
               <div className="space-y-2">
@@ -427,8 +506,11 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                         type="email"
                         placeholder="associate@store.com"
                         value={email}
+                        aria-invalid={showErrors && !!errors.email}
+                        className={fieldCls(errors.email)}
                         onChange={(e) => setEmail(e.target.value)}
                       />
+                      <FieldError msg={errors.email} />
                     </div>
                     <div className="space-y-1">
                       <Label htmlFor="tempPass" className="text-xs">Temporary Password (Optional)</Label>
@@ -537,6 +619,11 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="flex justify-end -mb-2">
+              <Button variant="ghost" size="sm" onClick={() => setStep(1)}>
+                <Pencil className="w-3.5 h-3.5 mr-1" /> Edit details
+              </Button>
+            </div>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-4 p-4 rounded-lg bg-gray-50 dark:bg-gray-900 border text-sm">
               <div>
                 <span className="text-gray-500 block text-xs">Employee Name</span>
@@ -544,11 +631,17 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Designation</span>
-                <span className="font-semibold">{designation.replace('_', ' ')}</span>
+                <span className="font-semibold">{designation.replace(/_/g, ' ')}</span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Assigned E-Code</span>
                 <span className="font-mono font-bold text-primary">{previewCode || 'Generating...'}</span>
+              </div>
+              <div>
+                <span className="text-gray-500 block text-xs">Store</span>
+                <span className="font-semibold">
+                  {stores.find((x) => x.id === storeId)?.name ?? '-'}
+                </span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Gender</span>
@@ -621,6 +714,31 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
             </div>
           </CardHeader>
           <CardContent className="space-y-6">
+            {/* Next action first: get the form to the associate */}
+            <div className="p-4 rounded-lg bg-white dark:bg-slate-900 border border-green-200 space-y-2">
+              <div className="font-medium text-sm">Next: send the paperwork form</div>
+              {onboardResult.whatsappUrl ? (
+                <Button size="lg" className="w-full bg-green-600 hover:bg-green-700 text-white" asChild>
+                  <a
+                    href={onboardResult.whatsappUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={() => {
+                      // Record the send so Pending Forms shows "Awaiting", not "Not sent".
+                      // Best effort: roles without form-tracking access simply skip it.
+                      markFormSent(onboardResult.employeeId).catch(() => {});
+                    }}
+                  >
+                    <MessageCircle className="w-4 h-4 mr-2" /> Send form link on WhatsApp
+                  </a>
+                </Button>
+              ) : (
+                <p className="text-xs text-amber-600">
+                  No onboarding form is configured for this store, so there is no link to send yet.
+                </p>
+              )}
+            </div>
+
             {/* Sync Command Badge */}
             <div className="p-4 rounded-lg bg-white dark:bg-slate-900 border space-y-2">
               <div className="flex items-center justify-between">
@@ -677,32 +795,36 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                   </a>
                 </Button>
               </div>
-              {onboardResult.whatsappUrl ? (
-                <Button className="w-full bg-green-600 hover:bg-green-700 text-white" asChild>
-                  <a href={onboardResult.whatsappUrl} target="_blank" rel="noreferrer">
-                    <MessageCircle className="w-4 h-4 mr-2" /> Send form link on WhatsApp
-                  </a>
-                </Button>
-              ) : (
-                <p className="text-xs text-amber-600">
-                  No onboarding form is configured for this store, so there is no link to send yet.
-                </p>
-              )}
             </div>
           </CardContent>
           <CardFooter className="flex justify-between">
             <Button
               variant="outline"
               onClick={() => {
+                // Keep store / designation / grade / team — people are usually onboarded in batches.
                 setStep(1);
                 setName('');
                 setCardNumber('');
                 setMobileNumber('');
-                setPreviewCode(null);
+                setDateOfBirth('');
+                setCreateAppLogin(false);
+                setEmail('');
+                setTempPassword('');
+                setShowErrors(false);
+                setCmdStatus('PENDING');
                 setOnboardResult(null);
+                // the next E-Code is different — refresh the preview
+                if (storeId) {
+                  getStoreECodePreviewAction(storeId)
+                    .then((res) => {
+                      setPreviewCode(res.previewCode);
+                      setPreviewCapacity({ slotsRemaining: res.slotsRemaining, nearCapacity: res.nearCapacity });
+                    })
+                    .catch(() => setPreviewCode(null));
+                }
               }}
             >
-              Onboard Another Associate
+              Onboard Another (same store)
             </Button>
             <Button asChild>
               <a href="/employees">View in Employee Directory &rarr;</a>

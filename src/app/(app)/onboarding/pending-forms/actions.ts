@@ -111,3 +111,43 @@ export async function sendFormReminder(
   });
   return { ok: true, formLink, whatsappUrl };
 }
+
+/**
+ * Marks an employee's form as submitted by hand — for forms whose Google Sheet
+ * has no webhook script installed, or a paper/other-channel submission.
+ */
+export async function markFormSubmittedManually(employeeId: string): Promise<{ ok: boolean; error?: string }> {
+  const session = await requireAuth('formTracking:remind');
+
+  const employee = await prisma.employee.findUnique({
+    where: { id: employeeId },
+    select: { staffCode: true, storeId: true, onboardingFormStatus: true },
+  });
+  if (!employee) return { ok: false, error: 'Employee not found' };
+
+  // Same scope rule as sending: Manager / Shift Incharge only for their own store.
+  if (
+    (session.user.role === 'MANAGER' || session.user.role === 'SHIFT_INCHARGE') &&
+    employee.storeId !== session.user.storeId
+  ) {
+    return { ok: false, error: 'This employee is not in your store.' };
+  }
+  if (employee.onboardingFormStatus === 'SUBMITTED') return { ok: true };
+
+  await prisma.employee.update({
+    where: { id: employeeId },
+    data: {
+      onboardingFormStatus: 'SUBMITTED',
+      onboardingFormSubmittedAt: new Date(),
+      onboardingFormSubmittedVia: 'MANUAL',
+    },
+  });
+  await writeAuditLog({
+    userId: session.user.id,
+    action: 'EMPLOYEE_FORM_MARKED_SUBMITTED',
+    targetType: 'Employee',
+    targetId: employeeId,
+    metadata: { staffCode: employee.staffCode },
+  });
+  return { ok: true };
+}

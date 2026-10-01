@@ -396,6 +396,9 @@ model Employee {
   onboardingFormSentAt         DateTime?
   onboardingFormSubmittedAt    DateTime?
   onboardingFormLastRemindedAt DateTime?
+  /// How the SUBMITTED status was set: WEBHOOK (Google Form script), MANUAL
+  /// (someone marked it) or ASSIGNED (an unmatched submission linked to them).
+  onboardingFormSubmittedVia   String?
 
   /// Present only if designation = PROCESS_ASSOCIATE or SHIFT_INCHARGE and a login was created.
   linkedUser User?
@@ -741,7 +744,15 @@ model UnmatchedFormSubmission {
   staffCodeGuess  String?  /// The staffCode extracted from the submission (if any)
   resolvedAt      DateTime?
   resolvedByUserId String?
+  /// Which Google Form sent it (form id from the Apps Script), so admins can
+  /// tell forms apart when clients/stores have their own.
+  formId          String?
+  /// ASSIGNED (linked to an employee) or DISMISSED (not needed). Null while open.
+  resolution      String?
+  resolvedEmployeeId String?
   createdAt       DateTime @default(now())
+
+  @@index([resolvedAt, createdAt])
 }
 
 /**

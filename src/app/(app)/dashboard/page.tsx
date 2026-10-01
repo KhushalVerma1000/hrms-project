@@ -430,7 +430,7 @@ export default async function DashboardPage() {
       { label: 'Stores that missed the attendance deadline', count: missedPeriods, href: '/attendance/deadlines', tone: 'danger' },
       { label: 'Devices offline', count: offlineDevices, href: '/devices', tone: 'warning' },
       { label: 'Pending onboarding forms', count: pendingForms, href: '/onboarding/pending-forms', tone: 'warning' },
-      { label: 'Unmatched form submissions', count: unmatchedForms, href: '/onboarding/pending-forms', tone: 'warning', hint: 'Received but not linked to an employee' },
+      { label: 'Unmatched form submissions', count: unmatchedForms, href: '/form-submissions', tone: 'warning', hint: 'Received but not linked to an employee' },
     ];
 
     return (

@@ -31,6 +31,7 @@ export type Action =
   | 'syncIssues:retry'
   | 'formTracking:view'
   | 'formTracking:remind'
+  | 'formSubmissions:manage'
   | 'onboardingForm:editClient'
   | 'onboardingForm:editStore';
 
@@ -230,6 +231,10 @@ export function can(
       return role === 'ADMIN' || role === 'CLIENT' || role === 'MANAGER';
 
     case 'syncIssues:retry':
+      return role === 'ADMIN';
+
+    // Reconciling Google Form submissions that matched no employee.
+    case 'formSubmissions:manage':
       return role === 'ADMIN';
 
     // ── Form tracking ────────────────────────────────────────────────

@@ -40,6 +40,7 @@ export default async function AppLayout({
   const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
   const canViewSyncIssues = can(session, 'syncIssues:view', {});
   const canViewAuditLog = can(session, 'auditLog:view', {});
+  const canReviewForms = can(session, 'formSubmissions:manage', {});
 
   const navItems: NavItem[] = [
     { href: '/dashboard', label: 'Dashboard', icon: '📊' },
@@ -50,6 +51,7 @@ export default async function AppLayout({
     ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),
     { href: '/onboarding', label: 'Onboarding Wizard', icon: '✨' },
     { href: '/onboarding/pending-forms', label: 'Pending Forms', icon: '📋' },
+    ...(canReviewForms ? [{ href: '/form-submissions', label: 'Form Submissions', icon: '📥' }] : []),
     { href: '/employees', label: 'Employee Directory', icon: '👥' },
     ...(canManageStores ? [{ href: '/stores', label: 'Stores & Brands', icon: '🏬' }] : []),
     ...(canManageDevices ? [{ href: '/devices', label: 'Biometric Devices', icon: '📱' }] : []),

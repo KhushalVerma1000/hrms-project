@@ -7,6 +7,7 @@ import { enqueueCommand, deriveIdempotencyKey } from '@/lib/queue/commands';
 import { writeAuditLog } from '@/lib/smartoffice/audit';
 import { EmployeeStatus } from '@prisma/client';
 import { subDays } from 'date-fns';
+import { normalizeMobile } from '@/lib/whatsapp';
 
 export interface EmployeeFilterOpts {
   storeId?: string;
@@ -73,6 +74,157 @@ export async function getEmployeesAction(opts: EmployeeFilterOpts = {}) {
   });
 }
 
+export interface EmployeePageOpts {
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  status?: EmployeeStatus;
+  designation?: string;
+  clientId?: string;
+  storeId?: string;
+  formStatus?: 'NOT_SENT' | 'PENDING' | 'SUBMITTED';
+}
+
+const PAGE_SIZES = [10, 25, 50, 100];
+
+/**
+ * Server-side paginated + filtered employee list for the directory, plus the
+ * client/store options the current user may filter by. Role scope is always
+ * enforced here; the filters can only narrow it further.
+ */
+export async function getEmployeesPageAction(opts: EmployeePageOpts = {}) {
+  const session = await auth();
+  if (!session?.user) throw new Error('Unauthorized');
+  const user = session.user;
+
+  const pageSize = PAGE_SIZES.includes(opts.pageSize ?? 0) ? opts.pageSize! : 25;
+
+  // Role scope — never widened by the filters below.
+  const scope: any = {};
+  if (user.role === 'CLIENT' && user.clientId) {
+    scope.store = { clientId: user.clientId };
+  } else if (
+    (user.role === 'MANAGER' || user.role === 'PROCESS_ASSOCIATE' || user.role === 'SHIFT_INCHARGE') &&
+    user.storeId
+  ) {
+    scope.storeId = user.storeId;
+  }
+
+  const and: any[] = [scope];
+  if (opts.clientId && user.role === 'ADMIN') and.push({ store: { clientId: opts.clientId } });
+  if (opts.storeId) and.push({ storeId: opts.storeId });
+  if (opts.status) and.push({ status: opts.status });
+  if (opts.designation) and.push({ designation: opts.designation });
+  if (opts.formStatus) and.push({ onboardingFormStatus: opts.formStatus });
+
+  const q = opts.search?.trim();
+  if (q) {
+    const digits = q.replace(/\D/g, '');
+    and.push({
+      OR: [
+        { name: { contains: q, mode: 'insensitive' } },
+        { staffCode: { contains: q, mode: 'insensitive' } },
+        { cardNumber: { contains: q, mode: 'insensitive' } },
+        ...(digits.length >= 4 ? [{ mobileNumber: { contains: digits } }] : []),
+      ],
+    });
+  }
+  const where = { AND: and };
+
+  const total = await prisma.employee.count({ where });
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(1, opts.page ?? 1), totalPages);
+
+  const rows = await prisma.employee.findMany({
+    where,
+    select: {
+      id: true,
+      staffCode: true,
+      isLegacyCode: true,
+      name: true,
+      gender: true,
+      status: true,
+      designation: true,
+      grade: true,
+      team: true,
+      cardNumber: true,
+      mobileNumber: true,
+      onboardingFormStatus: true,
+      createdAt: true,
+      storeId: true,
+      store: {
+        select: {
+          name: true,
+          clientId: true,
+          client: { select: { shortName: true, name: true } },
+          warehouseType: { select: { name: true } },
+        },
+      },
+      linkedUser: { select: { id: true, email: true, role: true } },
+    },
+    orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
+    skip: (page - 1) * pageSize,
+    take: pageSize,
+  });
+
+  // Contact numbers are only shown to people who may edit that employee.
+  const employees = rows.map((r) => {
+    const canEdit = can(session, 'employee:edit', { storeId: r.storeId, clientId: r.store.clientId });
+    return { ...r, mobileNumber: canEdit ? r.mobileNumber : null, canEdit };
+  });
+
+  // Filter options (scoped to what this user can see).
+  const storeWhere: any = {};
+  if (user.role === 'CLIENT' && user.clientId) storeWhere.clientId = user.clientId;
+  else if (scope.storeId) storeWhere.id = scope.storeId;
+  const stores = await prisma.store.findMany({
+    where: storeWhere,
+    select: { id: true, name: true, clientId: true, client: { select: { shortName: true } } },
+    orderBy: { name: 'asc' },
+  });
+  const clients =
+    user.role === 'ADMIN'
+      ? await prisma.client.findMany({ select: { id: true, name: true, shortName: true }, orderBy: { name: 'asc' } })
+      : [];
+
+  return { employees, total, page, pageSize, totalPages, stores, clients };
+}
+
+/**
+ * Sets or clears one employee's mobile number (used by the directory and the
+ * pending-forms screen). Empty string clears it.
+ */
+export async function updateEmployeeMobileAction(employeeId: string, mobile: string) {
+  const session = await auth();
+  if (!session?.user) throw new Error('Unauthorized');
+
+  const employee = await prisma.employee.findUnique({
+    where: { id: employeeId },
+    select: { staffCode: true, storeId: true, store: { select: { clientId: true } } },
+  });
+  if (!employee) return { ok: false, error: 'Employee not found' };
+
+  const ctx = { storeId: employee.storeId, clientId: employee.store.clientId };
+  if (!can(session, 'employee:edit', ctx) && !can(session, 'formTracking:remind', ctx)) {
+    return { ok: false, error: 'Permission denied to edit this employee.' };
+  }
+
+  const normalized = mobile.trim() ? normalizeMobile(mobile) : null;
+  if (mobile.trim() && !normalized) {
+    return { ok: false, error: 'Enter a valid mobile number (10 digits, or with country code).' };
+  }
+
+  await prisma.employee.update({ where: { id: employeeId }, data: { mobileNumber: normalized } });
+  await writeAuditLog({
+    userId: session.user.id,
+    action: 'EMPLOYEE_UPDATE',
+    targetType: 'Employee',
+    targetId: employeeId,
+    metadata: { staffCode: employee.staffCode, changes: { mobileNumber: normalized ? 'updated' : 'cleared' } },
+  });
+  return { ok: true, mobileNumber: normalized };
+}
+
 export async function updateEmployeeAction(
   employeeId: string,
   data: {
@@ -81,6 +233,7 @@ export async function updateEmployeeAction(
     cardNumber?: string;
     grade?: string;
     team?: string;
+    mobileNumber?: string;
   },
 ) {
   const session = await auth();
@@ -93,9 +246,19 @@ export async function updateEmployeeAction(
     return { ok: false, error: 'Permission denied to edit this employee.' };
   }
 
+  // undefined = leave unchanged; '' = clear; otherwise must be a valid number.
+  let mobileNumber: string | null | undefined;
+  if (data.mobileNumber !== undefined) {
+    mobileNumber = data.mobileNumber.trim() ? normalizeMobile(data.mobileNumber) : null;
+    if (data.mobileNumber.trim() && !mobileNumber) {
+      return { ok: false, error: 'Enter a valid mobile number (10 digits, or with country code).' };
+    }
+  }
+
   const updated = await prisma.employee.update({
     where: { id: employeeId },
     data: {
+      ...(mobileNumber !== undefined ? { mobileNumber } : {}),
       name: data.name?.trim(),
       gender: data.gender,
       cardNumber: data.cardNumber?.trim() || null,
@@ -109,7 +272,11 @@ export async function updateEmployeeAction(
     action: 'EMPLOYEE_UPDATE',
     targetType: 'Employee',
     targetId: employeeId,
-    metadata: { staffCode: employee.staffCode, changes: data },
+    // Mobile numbers are personal data — record that it changed, not the value.
+    metadata: {
+      staffCode: employee.staffCode,
+      changes: { ...data, ...(data.mobileNumber !== undefined ? { mobileNumber: 'updated' } : {}) },
+    },
   });
 
   return { ok: true, employee: updated };

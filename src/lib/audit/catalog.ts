@@ -19,6 +19,9 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
   EMPLOYEE_SOFT_DELETE: { label: 'Employee deactivated', category: 'Employees', severity: 'notice' },
   EMPLOYEE_REACTIVATE: { label: 'Employee reactivated', category: 'Employees', severity: 'notice' },
   EMPLOYEE_HARD_DELETE: { label: 'Employee permanently deleted', category: 'Employees', severity: 'critical' },
+  EMPLOYEE_FORM_MARKED_SUBMITTED: { label: 'Onboarding form marked submitted', category: 'Employees', severity: 'notice' },
+  FORM_SUBMISSION_ASSIGNED: { label: 'Unmatched form submission linked to employee', category: 'Employees', severity: 'notice' },
+  FORM_SUBMISSION_DISMISSED: { label: 'Unmatched form submission dismissed', category: 'System', severity: 'info', adminOnly: true },
   FORM_REMINDER_SENT: { label: 'Onboarding form reminder sent', category: 'Employees', severity: 'info' },
 
   CLIENT_CREATE: { label: 'Client created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },

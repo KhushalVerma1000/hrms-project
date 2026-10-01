@@ -42,7 +42,8 @@ export default async function PendingFormsPage() {
       onboardingFormStatus: true,
       onboardingFormSentAt: true,
       onboardingFormLastRemindedAt: true,
-      store: { select: { name: true, client: { select: { shortName: true } } } },
+      storeId: true,
+      store: { select: { name: true, clientId: true, client: { select: { shortName: true } } } },
     },
     orderBy: { dateOfJoining: 'asc' },
   });

@@ -1,0 +1,1190 @@
+diff --git a/.env.example b/.env.example
+index 7f14fb3..32fc22a 100644
+--- a/.env.example
++++ b/.env.example
+@@ -20,7 +20,8 @@ SMARTOFFICE_TIMEZONE="Asia/Kolkata"
+ CRON_SECRET="your-cron-secret"
+ 
+ # Google Forms onboarding tracking (Section 13)
+-# Apps Script webhook shared secret — sent in X-Webhook-Secret header on each submission
++# REQUIRED. Apps Script webhook shared secret — sent in X-Webhook-Secret header on each submission.
++# Without it the form webhooks refuse every request (503). Use a long random value.
+ FORM_WEBHOOK_SECRET="your-webhook-secret"
+ # Base URL of the Google Form (without query params)
+ GOOGLE_FORM_BASE_URL="https://docs.google.com/forms/d/e/YOUR_FORM_ID/viewform"
+diff --git a/prisma/migrations/20260930130000_form_submission_tracking/migration.sql b/prisma/migrations/20260930130000_form_submission_tracking/migration.sql
+new file mode 100644
+index 0000000..b6ca323
+--- /dev/null
++++ b/prisma/migrations/20260930130000_form_submission_tracking/migration.sql
+@@ -0,0 +1,6 @@
++-- Track how a form became SUBMITTED, and let admins resolve unmatched submissions.
++ALTER TABLE "Employee" ADD COLUMN "onboardingFormSubmittedVia" TEXT;
++ALTER TABLE "UnmatchedFormSubmission" ADD COLUMN "formId" TEXT;
++ALTER TABLE "UnmatchedFormSubmission" ADD COLUMN "resolution" TEXT;
++ALTER TABLE "UnmatchedFormSubmission" ADD COLUMN "resolvedEmployeeId" TEXT;
++CREATE INDEX "UnmatchedFormSubmission_resolvedAt_createdAt_idx" ON "UnmatchedFormSubmission"("resolvedAt", "createdAt");
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index cb89b21..d96e6c8 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -396,6 +396,9 @@ model Employee {
+   onboardingFormSentAt         DateTime?
+   onboardingFormSubmittedAt    DateTime?
+   onboardingFormLastRemindedAt DateTime?
++  /// How the SUBMITTED status was set: WEBHOOK (Google Form script), MANUAL
++  /// (someone marked it) or ASSIGNED (an unmatched submission linked to them).
++  onboardingFormSubmittedVia   String?
+ 
+   /// Present only if designation = PROCESS_ASSOCIATE or SHIFT_INCHARGE and a login was created.
+   linkedUser User?
+@@ -741,7 +744,15 @@ model UnmatchedFormSubmission {
+   staffCodeGuess  String?  /// The staffCode extracted from the submission (if any)
+   resolvedAt      DateTime?
+   resolvedByUserId String?
++  /// Which Google Form sent it (form id from the Apps Script), so admins can
++  /// tell forms apart when clients/stores have their own.
++  formId          String?
++  /// ASSIGNED (linked to an employee) or DISMISSED (not needed). Null while open.
++  resolution      String?
++  resolvedEmployeeId String?
+   createdAt       DateTime @default(now())
++
++  @@index([resolvedAt, createdAt])
+ }
+ 
+ /**
+diff --git a/scripts/google-apps-script/onboarding-form-webhook.gs b/scripts/google-apps-script/onboarding-form-webhook.gs
+new file mode 100644
+index 0000000..8514c73
+--- /dev/null
++++ b/scripts/google-apps-script/onboarding-form-webhook.gs
+@@ -0,0 +1,111 @@
++/**
++ * Tells the HRMS app when someone submits an onboarding Google Form.
++ *
++ * SAFE TO ADD NEXT TO YOUR EXISTING SCRIPTS (offer letters etc.):
++ *  - Every name here starts with "hrms" / "HRMS_", so nothing clashes with your code.
++ *  - It only READS the submitted answers. It never edits the Sheet or your other scripts.
++ *  - It runs from its own trigger, so a failure here cannot stop your offer-letter
++ *    script, and the other way round.
++ *
++ * SET UP (once per form):
++ *  1. Open the form's response Sheet -> Extensions -> Apps Script.
++ *  2. Do NOT replace your existing code. Click "+" next to Files -> Script, name it
++ *     "hrms-webhook", and paste this whole file into that NEW file.
++ *  3. Project Settings (gear) -> Script properties -> add two properties:
++ *       HRMS_WEBHOOK_URL     https://YOUR-APP.vercel.app/api/webhooks/onboarding-form
++ *       HRMS_WEBHOOK_SECRET  the same value as FORM_WEBHOOK_SECRET in the app's environment
++ *  4. Triggers (clock icon) -> Add trigger, and leave your existing triggers alone:
++ *       function: hrmsOnFormSubmit  |  event source: From spreadsheet  |  event type: On form submit
++ *  5. Google will ask you to approve permissions again ("connect to an external service").
++ *     Approve it. If a trigger of yours shows an authorization error afterwards, open the
++ *     project, run any function once by hand and approve — that re-enables all triggers.
++ *  6. Test: run hrmsTestWebhook once (checks URL + secret), then submit the form with a
++ *     real e-code. The employee should leave "Pending Forms" in the app.
++ *
++ * ALREADY HAVE ONE onFormSubmit YOU WANT TO KEEP AS THE ONLY TRIGGER?
++ *  Skip step 4 and call this from inside it instead:   hrmsNotifyApp_(e);
++ *  Wrap it so an HRMS problem cannot break your offer letters:
++ *      try { hrmsNotifyApp_(e); } catch (err) { console.error(err); }
++ *
++ * The form must have a question titled with "Employee Code" or "E-Code" (that is where
++ * the app pre-fills the code). Other common titles are tolerated by the app, and anything
++ * it cannot match goes to "Form Submissions" in the app for an admin to link.
++ */
++
++/** Trigger entry point. */
++function hrmsOnFormSubmit(e) {
++  hrmsNotifyApp_(e);
++}
++
++/** Sends one submission to the HRMS app. Throws if it could not be delivered. */
++function hrmsNotifyApp_(e) {
++  var props = PropertiesService.getScriptProperties();
++  var url = props.getProperty('HRMS_WEBHOOK_URL');
++  var secret = props.getProperty('HRMS_WEBHOOK_SECRET');
++  if (!url || !secret) {
++    throw new Error('HRMS: set HRMS_WEBHOOK_URL and HRMS_WEBHOOK_SECRET in Project Settings -> Script properties.');
++  }
++
++  var answers = (e && e.namedValues) || {};
++  var payload = {
++    employeeCode: hrmsFindEmployeeCode_(answers),
++    formId: hrmsGetFormId_(e),
++    submittedAt: new Date().toISOString(),
++    rawValues: answers, // lets an admin reconcile a submission the app could not match
++  };
++
++  var options = {
++    method: 'post',
++    contentType: 'application/json',
++    payload: JSON.stringify(payload),
++    headers: { 'X-Webhook-Secret': secret },
++    muteHttpExceptions: true,
++  };
++
++  // Retry on server errors / timeouts so a brief outage does not lose a submission.
++  var lastStatus = 0;
++  for (var attempt = 1; attempt <= 4; attempt++) {
++    try {
++      var res = UrlFetchApp.fetch(url, options);
++      lastStatus = res.getResponseCode();
++      if (lastStatus >= 200 && lastStatus < 300) return;
++      if (lastStatus >= 400 && lastStatus < 500) break; // wrong secret/URL: retrying will not help
++    } catch (err) {
++      lastStatus = -1;
++    }
++    Utilities.sleep(2000 * attempt);
++  }
++  // Shows in Apps Script "Executions" (and in failure notification emails if you enabled them).
++  throw new Error('HRMS webhook failed, last HTTP status: ' + lastStatus);
++}
++
++/** Finds the answer to the e-code question, whatever the question is titled exactly. */
++function hrmsFindEmployeeCode_(answers) {
++  for (var title in answers) {
++    if (/(employee|staff)\s*code|e[\s-]?code/i.test(title)) {
++      var v = answers[title];
++      var value = (Array.isArray(v) ? v[0] : v) || '';
++      return String(value).replace(/\s+/g, '');
++    }
++  }
++  return '';
++}
++
++/** The linked form's id, so unmatched submissions show which form they came from. */
++function hrmsGetFormId_(e) {
++  try {
++    var formUrl = e.range.getSheet().getParent().getFormUrl();
++    var m = formUrl && formUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
++    return m ? m[1] : '';
++  } catch (err) {
++    return '';
++  }
++}
++
++/**
++ * Run this by hand once to check the URL and secret. It sends a fake code, so the app
++ * will list it under "Form Submissions" as unmatched — just dismiss it there.
++ */
++function hrmsTestWebhook() {
++  hrmsNotifyApp_({ namedValues: { 'Employee Code': ['0000000000'] } });
++}
+diff --git a/src/app/(app)/dashboard/page.tsx b/src/app/(app)/dashboard/page.tsx
+index ab6adbe..55f74b9 100644
+--- a/src/app/(app)/dashboard/page.tsx
++++ b/src/app/(app)/dashboard/page.tsx
+@@ -430,7 +430,7 @@ export default async function DashboardPage() {
+       { label: 'Stores that missed the attendance deadline', count: missedPeriods, href: '/attendance/deadlines', tone: 'danger' },
+       { label: 'Devices offline', count: offlineDevices, href: '/devices', tone: 'warning' },
+       { label: 'Pending onboarding forms', count: pendingForms, href: '/onboarding/pending-forms', tone: 'warning' },
+-      { label: 'Unmatched form submissions', count: unmatchedForms, href: '/onboarding/pending-forms', tone: 'warning', hint: 'Received but not linked to an employee' },
++      { label: 'Unmatched form submissions', count: unmatchedForms, href: '/form-submissions', tone: 'warning', hint: 'Received but not linked to an employee' },
+     ];
+ 
+     return (
+diff --git a/src/app/(app)/form-submissions/actions.ts b/src/app/(app)/form-submissions/actions.ts
+new file mode 100644
+index 0000000..b08c20a
+--- /dev/null
++++ b/src/app/(app)/form-submissions/actions.ts
+@@ -0,0 +1,141 @@
++'use server';
++
++import { prisma } from '@/lib/prisma';
++import { requireAuth } from '@/lib/auth/session';
++import { writeAuditLog } from '@/lib/smartoffice/audit';
++
++export interface UnmatchedSubmissionRow {
++  id: string;
++  submittedAt: Date;
++  staffCodeGuess: string | null;
++  formId: string | null;
++  resolution: string | null;
++  resolvedAt: Date | null;
++  /** Human-readable question/answer pairs from the form, capped. */
++  answers: { question: string; answer: string }[];
++}
++
++/** Flattens the stored payload into readable question/answer pairs. */
++function toAnswers(raw: unknown): { question: string; answer: string }[] {
++  const payload = (raw && typeof raw === 'object' ? raw : {}) as Record<string, any>;
++  const source =
++    payload.rawValues && typeof payload.rawValues === 'object' ? (payload.rawValues as Record<string, any>) : payload;
++  const skip = new Set(['rawValues', 'formId', 'submittedAt', 'employeeCode']);
++  return Object.entries(source)
++    .filter(([k]) => source !== payload || !skip.has(k))
++    .map(([question, v]) => {
++      const first = Array.isArray(v) ? v[0] : v;
++      const answer = typeof first === 'string' ? first : first == null ? '' : JSON.stringify(first);
++      return { question: question.slice(0, 120), answer: answer.slice(0, 200) };
++    })
++    .filter((a) => a.answer !== '')
++    .slice(0, 14);
++}
++
++export async function listUnmatchedSubmissionsAction(
++  filter: 'OPEN' | 'RESOLVED' = 'OPEN',
++): Promise<UnmatchedSubmissionRow[]> {
++  await requireAuth('formSubmissions:manage');
++  const rows = await prisma.unmatchedFormSubmission.findMany({
++    where: filter === 'OPEN' ? { resolvedAt: null } : { resolvedAt: { not: null } },
++    orderBy: { createdAt: 'desc' },
++    take: 200,
++  });
++  return rows.map((r) => ({
++    id: r.id,
++    submittedAt: r.submittedAt,
++    staffCodeGuess: r.staffCodeGuess,
++    formId: r.formId,
++    resolution: r.resolution,
++    resolvedAt: r.resolvedAt,
++    answers: toAnswers(r.rawPayload),
++  }));
++}
++
++/** Finds employees to link a submission to (by name, e-code or mobile). */
++export async function searchEmployeesForAssignAction(query: string) {
++  await requireAuth('formSubmissions:manage');
++  const q = query.trim();
++  if (q.length < 2) return [];
++  const digits = q.replace(/\D/g, '');
++  return prisma.employee.findMany({
++    where: {
++      OR: [
++        { name: { contains: q, mode: 'insensitive' } },
++        { staffCode: { contains: q, mode: 'insensitive' } },
++        ...(digits.length >= 4 ? [{ mobileNumber: { contains: digits } }] : []),
++      ],
++    },
++    select: {
++      id: true,
++      staffCode: true,
++      name: true,
++      onboardingFormStatus: true,
++      store: { select: { name: true, client: { select: { shortName: true } } } },
++    },
++    orderBy: { createdAt: 'desc' },
++    take: 8,
++  });
++}
++
++/** Links an unmatched submission to an employee and marks their form Submitted. */
++export async function assignSubmissionAction(submissionId: string, employeeId: string) {
++  const session = await requireAuth('formSubmissions:manage');
++
++  const [submission, employee] = await Promise.all([
++    prisma.unmatchedFormSubmission.findUnique({ where: { id: submissionId } }),
++    prisma.employee.findUnique({ where: { id: employeeId }, select: { id: true, staffCode: true, name: true } }),
++  ]);
++  if (!submission) return { ok: false, error: 'Submission not found.' };
++  if (submission.resolvedAt) return { ok: false, error: 'This submission was already resolved.' };
++  if (!employee) return { ok: false, error: 'Employee not found.' };
++
++  await prisma.$transaction([
++    prisma.employee.update({
++      where: { id: employee.id },
++      data: {
++        onboardingFormStatus: 'SUBMITTED',
++        // Keep the earliest real submission time if one is already recorded.
++        onboardingFormSubmittedAt: submission.submittedAt,
++        onboardingFormSubmittedVia: 'ASSIGNED',
++      },
++    }),
++    prisma.unmatchedFormSubmission.update({
++      where: { id: submissionId },
++      data: {
++        resolvedAt: new Date(),
++        resolvedByUserId: session.user.id,
++        resolution: 'ASSIGNED',
++        resolvedEmployeeId: employee.id,
++      },
++    }),
++  ]);
++  await writeAuditLog({
++    userId: session.user.id,
++    action: 'FORM_SUBMISSION_ASSIGNED',
++    targetType: 'Employee',
++    targetId: employee.id,
++    metadata: { staffCode: employee.staffCode, submissionId },
++  });
++  return { ok: true, employeeName: employee.name };
++}
++
++export async function dismissSubmissionAction(submissionId: string) {
++  const session = await requireAuth('formSubmissions:manage');
++  const submission = await prisma.unmatchedFormSubmission.findUnique({ where: { id: submissionId } });
++  if (!submission) return { ok: false, error: 'Submission not found.' };
++  if (submission.resolvedAt) return { ok: true };
++
++  await prisma.unmatchedFormSubmission.update({
++    where: { id: submissionId },
++    data: { resolvedAt: new Date(), resolvedByUserId: session.user.id, resolution: 'DISMISSED' },
++  });
++  await writeAuditLog({
++    userId: session.user.id,
++    action: 'FORM_SUBMISSION_DISMISSED',
++    targetType: 'UnmatchedFormSubmission',
++    targetId: submissionId,
++    metadata: { staffCodeGuess: submission.staffCodeGuess },
++  });
++  return { ok: true };
++}
+diff --git a/src/app/(app)/form-submissions/page.tsx b/src/app/(app)/form-submissions/page.tsx
+new file mode 100644
+index 0000000..64b9204
+--- /dev/null
++++ b/src/app/(app)/form-submissions/page.tsx
+@@ -0,0 +1,16 @@
++import { auth } from '@/auth';
++import { redirect } from 'next/navigation';
++import { can } from '@/lib/auth/can';
++import { FormSubmissionsPanel } from '@/components/onboarding/FormSubmissionsPanel';
++
++export default async function FormSubmissionsPage() {
++  const session = await auth();
++  if (!session?.user) redirect('/login');
++  if (!can(session, 'formSubmissions:manage', {})) redirect('/dashboard');
++
++  return (
++    <div className="container mx-auto py-6 px-4">
++      <FormSubmissionsPanel />
++    </div>
++  );
++}
+diff --git a/src/app/(app)/layout.tsx b/src/app/(app)/layout.tsx
+index 9ff3c3f..8ac6640 100644
+--- a/src/app/(app)/layout.tsx
++++ b/src/app/(app)/layout.tsx
+@@ -40,6 +40,7 @@ export default async function AppLayout({
+   const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
+   const canViewSyncIssues = can(session, 'syncIssues:view', {});
+   const canViewAuditLog = can(session, 'auditLog:view', {});
++  const canReviewForms = can(session, 'formSubmissions:manage', {});
+ 
+   const navItems: NavItem[] = [
+     { href: '/dashboard', label: 'Dashboard', icon: '📊' },
+@@ -50,6 +51,7 @@ export default async function AppLayout({
+     ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),
+     { href: '/onboarding', label: 'Onboarding Wizard', icon: '✨' },
+     { href: '/onboarding/pending-forms', label: 'Pending Forms', icon: '📋' },
++    ...(canReviewForms ? [{ href: '/form-submissions', label: 'Form Submissions', icon: '📥' }] : []),
+     { href: '/employees', label: 'Employee Directory', icon: '👥' },
+     ...(canManageStores ? [{ href: '/stores', label: 'Stores & Brands', icon: '🏬' }] : []),
+     ...(canManageDevices ? [{ href: '/devices', label: 'Biometric Devices', icon: '📱' }] : []),
+diff --git a/src/app/(app)/onboarding/pending-forms/actions.ts b/src/app/(app)/onboarding/pending-forms/actions.ts
+index bec3c79..3918111 100644
+--- a/src/app/(app)/onboarding/pending-forms/actions.ts
++++ b/src/app/(app)/onboarding/pending-forms/actions.ts
+@@ -111,3 +111,43 @@ export async function sendFormReminder(
+   });
+   return { ok: true, formLink, whatsappUrl };
+ }
++
++/**
++ * Marks an employee's form as submitted by hand — for forms whose Google Sheet
++ * has no webhook script installed, or a paper/other-channel submission.
++ */
++export async function markFormSubmittedManually(employeeId: string): Promise<{ ok: boolean; error?: string }> {
++  const session = await requireAuth('formTracking:remind');
++
++  const employee = await prisma.employee.findUnique({
++    where: { id: employeeId },
++    select: { staffCode: true, storeId: true, onboardingFormStatus: true },
++  });
++  if (!employee) return { ok: false, error: 'Employee not found' };
++
++  // Same scope rule as sending: Manager / Shift Incharge only for their own store.
++  if (
++    (session.user.role === 'MANAGER' || session.user.role === 'SHIFT_INCHARGE') &&
++    employee.storeId !== session.user.storeId
++  ) {
++    return { ok: false, error: 'This employee is not in your store.' };
++  }
++  if (employee.onboardingFormStatus === 'SUBMITTED') return { ok: true };
++
++  await prisma.employee.update({
++    where: { id: employeeId },
++    data: {
++      onboardingFormStatus: 'SUBMITTED',
++      onboardingFormSubmittedAt: new Date(),
++      onboardingFormSubmittedVia: 'MANUAL',
++    },
++  });
++  await writeAuditLog({
++    userId: session.user.id,
++    action: 'EMPLOYEE_FORM_MARKED_SUBMITTED',
++    targetType: 'Employee',
++    targetId: employeeId,
++    metadata: { staffCode: employee.staffCode },
++  });
++  return { ok: true };
++}
+diff --git a/src/app/api/webhooks/google-forms/route.ts b/src/app/api/webhooks/google-forms/route.ts
+index e7ba025..3d83898 100644
+--- a/src/app/api/webhooks/google-forms/route.ts
++++ b/src/app/api/webhooks/google-forms/route.ts
+@@ -1,58 +1,8 @@
+-import { NextRequest, NextResponse } from 'next/server';
+-import { prisma } from '@/lib/prisma';
+-import { OnboardingFormStatus } from '@prisma/client';
+-
+-export async function POST(req: NextRequest) {
+-  try {
+-    const body = await req.json();
+-
+-    // Extract staffCode from payload — standard key names or Google Form entry fields
+-    const staffCodeRaw =
+-      body.staffCode ||
+-      body.staff_code ||
+-      body.employeeCode ||
+-      body['Employee Code'] ||
+-      body['E-Code'];
+-
+-    const staffCode = typeof staffCodeRaw === 'string' ? staffCodeRaw.trim() : null;
+-
+-    if (!staffCode) {
+-      await prisma.unmatchedFormSubmission.create({
+-        data: {
+-          rawPayload: body,
+-          submittedAt: new Date(),
+-          staffCodeGuess: null,
+-        },
+-      });
+-      return NextResponse.json({ ok: false, message: 'No staffCode found in payload, saved to unmatched list.' }, { status: 400 });
+-    }
+-
+-    const employee = await prisma.employee.findUnique({
+-      where: { staffCode },
+-    });
+-
+-    if (!employee) {
+-      await prisma.unmatchedFormSubmission.create({
+-        data: {
+-          rawPayload: body,
+-          submittedAt: new Date(),
+-          staffCodeGuess: staffCode,
+-        },
+-      });
+-      return NextResponse.json({ ok: false, message: `No employee found with staffCode ${staffCode}, saved to unmatched list.` }, { status: 404 });
+-    }
+-
+-    // Match found! Update employee onboarding form status
+-    await prisma.employee.update({
+-      where: { id: employee.id },
+-      data: {
+-        onboardingFormStatus: OnboardingFormStatus.SUBMITTED,
+-        onboardingFormSubmittedAt: new Date(),
+-      },
+-    });
+-
+-    return NextResponse.json({ ok: true, message: `Employee ${staffCode} onboarding paperwork confirmed submitted.` });
+-  } catch (err: any) {
+-    return NextResponse.json({ ok: false, error: err.message || 'Webhook processing failed' }, { status: 500 });
+-  }
+-}
++import { handleFormWebhook } from '@/lib/forms/submission';
++
++/**
++ * Legacy alias of /api/webhooks/onboarding-form so existing senders keep
++ * working. Same secret check, same behaviour — it used to accept requests with
++ * no authentication at all.
++ */
++export const POST = handleFormWebhook;
+diff --git a/src/app/api/webhooks/onboarding-form/route.ts b/src/app/api/webhooks/onboarding-form/route.ts
+index 73c0758..faab171 100644
+--- a/src/app/api/webhooks/onboarding-form/route.ts
++++ b/src/app/api/webhooks/onboarding-form/route.ts
+@@ -1,114 +1,13 @@
+-import { NextResponse } from 'next/server';
+-import type { NextRequest } from 'next/server';
+-import { prisma } from '@/lib/prisma';
++import { handleFormWebhook } from '@/lib/forms/submission';
+ 
+ /**
+  * POST /api/webhooks/onboarding-form
+  *
+- * Receives form submission notifications from the Google Apps Script trigger
+- * attached to the onboarding Google Form/Sheet.
++ * Called by the Google Apps Script attached to each onboarding form's response
++ * Sheet (see scripts/google-apps-script/onboarding-form-webhook.gs).
+  *
+- * Security: Validates X-Webhook-Secret header against FORM_WEBHOOK_SECRET env var.
+- *
+- * On success: matches submission to Employee by staffCode, sets SUBMITTED status.
+- * On no match: logs to UnmatchedFormSubmission for Admin reconciliation.
+- *
+- * Apps Script trigger code (attach to Form's linked Sheet):
+- * ```javascript
+- * function onFormSubmit(e) {
+- *   const response = e.namedValues;
+- *   const payload = {
+- *     employeeCode: (response['Employee Code'] || [''])[0].trim(),
+- *     respondentName: (response['Name'] || [''])[0],
+- *     submittedAt: new Date().toISOString(),
+- *     rawValues: response,
+- *   };
+- *   const options = {
+- *     method: 'post',
+- *     contentType: 'application/json',
+- *     payload: JSON.stringify(payload),
+- *     headers: { 'X-Webhook-Secret': 'YOUR_FORM_WEBHOOK_SECRET' },
+- *     muteHttpExceptions: true,
+- *   };
+- *   UrlFetchApp.fetch('https://your-app.vercel.app/api/webhooks/onboarding-form', options);
+- * }
+- * ```
++ * Requires the X-Webhook-Secret header to match FORM_WEBHOOK_SECRET; if that env
++ * var is unset the endpoint refuses everything (503). Matches the submission to
++ * an Employee by e-code and sets SUBMITTED, or parks it in the unmatched list.
+  */
+-export async function POST(request: NextRequest): Promise<NextResponse> {
+-  // Validate webhook secret
+-  const webhookSecret = process.env.FORM_WEBHOOK_SECRET;
+-  if (webhookSecret) {
+-    const headerSecret = request.headers.get('X-Webhook-Secret');
+-    if (headerSecret !== webhookSecret) {
+-      console.warn('[FormWebhook] Invalid webhook secret');
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+-    }
+-  }
+-
+-  let body: {
+-    employeeCode?: string;
+-    respondentName?: string;
+-    submittedAt?: string;
+-    rawValues?: unknown;
+-  };
+-
+-  try {
+-    body = await request.json();
+-  } catch {
+-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+-  }
+-
+-  const staffCode = body.employeeCode?.trim();
+-  const submittedAt = body.submittedAt ? new Date(body.submittedAt) : new Date();
+-
+-  if (!staffCode) {
+-    // No employee code — log as unmatched
+-    await prisma.unmatchedFormSubmission.create({
+-      data: {
+-        rawPayload: body as object,
+-        submittedAt,
+-        staffCodeGuess: null,
+-      },
+-    });
+-    console.warn('[FormWebhook] Submission received with no employee code');
+-    return NextResponse.json({ ok: false, message: 'No employee code in submission' });
+-  }
+-
+-  // Find matching employee
+-  const employee = await prisma.employee.findUnique({
+-    where: { staffCode },
+-    select: { id: true, name: true, onboardingFormStatus: true },
+-  });
+-
+-  if (!employee) {
+-    // No matching employee — log as unmatched for Admin reconciliation
+-    await prisma.unmatchedFormSubmission.create({
+-      data: {
+-        rawPayload: body as object,
+-        submittedAt,
+-        staffCodeGuess: staffCode,
+-      },
+-    });
+-    console.warn(`[FormWebhook] No employee found for staffCode: ${staffCode}`);
+-    return NextResponse.json({
+-      ok: false,
+-      message: `No employee found for code ${staffCode} — logged for reconciliation`,
+-    });
+-  }
+-
+-  // Update employee form status
+-  await prisma.employee.update({
+-    where: { id: employee.id },
+-    data: {
+-      onboardingFormStatus: 'SUBMITTED',
+-      onboardingFormSubmittedAt: submittedAt,
+-    },
+-  });
+-
+-  console.log(`[FormWebhook] Form submitted for employee ${employee.name} (${staffCode})`);
+-  return NextResponse.json({
+-    ok: true,
+-    message: `Form submission recorded for employee ${employee.name}`,
+-    employeeId: employee.id,
+-  });
+-}
++export const POST = handleFormWebhook;
+diff --git a/src/components/onboarding/FormSubmissionsPanel.tsx b/src/components/onboarding/FormSubmissionsPanel.tsx
+new file mode 100644
+index 0000000..ee4b736
+--- /dev/null
++++ b/src/components/onboarding/FormSubmissionsPanel.tsx
+@@ -0,0 +1,259 @@
++'use client';
++
++import { useCallback, useEffect, useState } from 'react';
++import { Inbox, Search, Loader2, CheckCircle2, Trash2, Link2, RefreshCw } from 'lucide-react';
++import { toast } from 'sonner';
++import { Button } from '@/components/ui/button';
++import { Input } from '@/components/ui/input';
++import { Badge } from '@/components/ui/badge';
++import { Card, CardContent } from '@/components/ui/card';
++import {
++  listUnmatchedSubmissionsAction,
++  searchEmployeesForAssignAction,
++  assignSubmissionAction,
++  dismissSubmissionAction,
++  type UnmatchedSubmissionRow,
++} from '@/app/(app)/form-submissions/actions';
++
++type Candidate = Awaited<ReturnType<typeof searchEmployeesForAssignAction>>[number];
++
++function fmt(d: Date | string) {
++  return new Date(d).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
++}
++
++function reasonFor(row: UnmatchedSubmissionRow) {
++  return row.staffCodeGuess
++    ? `No employee has the code “${row.staffCodeGuess}”`
++    : 'The submission had no employee code';
++}
++
++function SubmissionCard({ row, onResolved }: { row: UnmatchedSubmissionRow; onResolved: () => void }) {
++  const [query, setQuery] = useState(row.staffCodeGuess ?? '');
++  const [results, setResults] = useState<Candidate[] | null>(null);
++  const [searching, setSearching] = useState(false);
++  const [busy, setBusy] = useState(false);
++
++  const search = useCallback(async (q: string) => {
++    setSearching(true);
++    try {
++      setResults(await searchEmployeesForAssignAction(q));
++    } catch (e: any) {
++      toast.error(e.message || 'Search failed');
++    } finally {
++      setSearching(false);
++    }
++  }, []);
++
++  // A near-miss code (typo, stray character) often still finds the right person.
++  useEffect(() => {
++    if (row.staffCodeGuess && row.staffCodeGuess.length >= 4) search(row.staffCodeGuess);
++  }, [row.staffCodeGuess, search]);
++
++  async function assign(c: Candidate) {
++    if (!window.confirm(`Mark ${c.name} (${c.staffCode}) as having submitted their form?`)) return;
++    setBusy(true);
++    try {
++      const res = await assignSubmissionAction(row.id, c.id);
++      if (res.ok) {
++        toast.success(`Linked to ${res.employeeName}`);
++        onResolved();
++      } else toast.error(res.error || 'Could not link');
++    } catch (e: any) {
++      toast.error(e.message || 'Could not link');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function dismiss() {
++    if (!window.confirm('Dismiss this submission? It will move to Resolved and no employee is changed.')) return;
++    setBusy(true);
++    try {
++      const res = await dismissSubmissionAction(row.id);
++      if (res.ok) {
++        toast.success('Dismissed');
++        onResolved();
++      } else toast.error(res.error || 'Could not dismiss');
++    } catch (e: any) {
++      toast.error(e.message || 'Could not dismiss');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <Card className="shadow-sm">
++      <CardContent className="p-4 grid gap-4 md:grid-cols-2">
++        <div className="space-y-2 min-w-0">
++          <div className="flex flex-wrap items-center gap-2">
++            <Badge variant="outline" className="border-amber-300 text-amber-700 bg-amber-50">Unmatched</Badge>
++            <span className="text-xs text-gray-500">{fmt(row.submittedAt)}</span>
++            {row.formId && (
++              <span className="text-xs text-gray-400 font-mono truncate max-w-[180px]" title={`Form ${row.formId}`}>
++                form …{row.formId.slice(-8)}
++              </span>
++            )}
++          </div>
++          <p className="text-sm font-medium">{reasonFor(row)}</p>
++          {row.answers.length > 0 ? (
++            <dl className="text-xs space-y-1 rounded-md bg-gray-50 dark:bg-gray-900 border p-3 max-h-48 overflow-auto">
++              {row.answers.map((a, i) => (
++                <div key={i} className="grid grid-cols-[40%_1fr] gap-2">
++                  <dt className="text-gray-500 truncate" title={a.question}>{a.question}</dt>
++                  <dd className="break-words">{a.answer}</dd>
++                </div>
++              ))}
++            </dl>
++          ) : (
++            <p className="text-xs text-gray-400">No answers were included.</p>
++          )}
++        </div>
++
++        <div className="space-y-2">
++          <p className="text-sm font-medium">Link to an employee</p>
++          <form
++            onSubmit={(e) => {
++              e.preventDefault();
++              search(query);
++            }}
++            className="flex gap-2"
++          >
++            <div className="relative flex-1">
++              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-gray-400" />
++              <Input
++                value={query}
++                onChange={(e) => setQuery(e.target.value)}
++                placeholder="Name, e-code or mobile"
++                aria-label="Find employee"
++                className="pl-8 text-sm"
++              />
++            </div>
++            <Button type="submit" variant="secondary" disabled={searching || query.trim().length < 2}>
++              {searching ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Find'}
++            </Button>
++          </form>
++
++          {results && results.length === 0 && <p className="text-xs text-gray-500">No employees found.</p>}
++          <ul className="space-y-1.5">
++            {results?.map((c) => (
++              <li key={c.id} className="flex items-center justify-between gap-2 rounded-md border px-3 py-2 text-sm">
++                <div className="min-w-0">
++                  <div className="font-medium truncate">{c.name}</div>
++                  <div className="text-xs text-gray-500 truncate">
++                    <span className="font-mono">{c.staffCode}</span> &bull; {c.store.client.shortName} — {c.store.name}
++                    {c.onboardingFormStatus === 'SUBMITTED' && ' • already submitted'}
++                  </div>
++                </div>
++                <Button size="sm" onClick={() => assign(c)} disabled={busy}>
++                  <Link2 className="w-3.5 h-3.5 mr-1" /> Link
++                </Button>
++              </li>
++            ))}
++          </ul>
++
++          <div className="pt-1 flex justify-end">
++            <Button variant="ghost" size="sm" onClick={dismiss} disabled={busy} className="text-gray-500">
++              <Trash2 className="w-3.5 h-3.5 mr-1" /> Dismiss
++            </Button>
++          </div>
++        </div>
++      </CardContent>
++    </Card>
++  );
++}
++
++export function FormSubmissionsPanel() {
++  const [tab, setTab] = useState<'OPEN' | 'RESOLVED'>('OPEN');
++  const [rows, setRows] = useState<UnmatchedSubmissionRow[] | null>(null);
++  const [loading, setLoading] = useState(false);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    try {
++      setRows(await listUnmatchedSubmissionsAction(tab));
++    } catch (e: any) {
++      toast.error(e.message || 'Failed to load submissions');
++    } finally {
++      setLoading(false);
++    }
++  }, [tab]);
++
++  useEffect(() => {
++    setRows(null);
++    load();
++  }, [load]);
++
++  return (
++    <div className="space-y-6">
++      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
++        <div>
++          <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
++            <Inbox className="w-6 h-6 text-primary" /> Form Submissions to Review
++          </h1>
++          <p className="text-sm text-gray-500 max-w-2xl">
++            Google Form responses that arrived but couldn&apos;t be matched to an employee — usually a mistyped or missing
++            e-code. Link each one to the right person, or dismiss it.
++          </p>
++        </div>
++        <Button variant="outline" onClick={load} disabled={loading}>
++          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} /> Refresh
++        </Button>
++      </div>
++
++      <div className="inline-flex rounded-lg bg-gray-100 dark:bg-gray-900 p-0.5 text-sm" role="tablist">
++        {(['OPEN', 'RESOLVED'] as const).map((t) => (
++          <button
++            key={t}
++            role="tab"
++            aria-selected={tab === t}
++            onClick={() => setTab(t)}
++            className={`px-4 py-1.5 rounded-md transition-colors ${
++              tab === t ? 'bg-white dark:bg-gray-700 shadow-sm font-medium' : 'text-gray-500 hover:text-gray-700'
++            }`}
++          >
++            {t === 'OPEN' ? 'Needs review' : 'Resolved'}
++          </button>
++        ))}
++      </div>
++
++      {rows === null ? (
++        <div className="py-12 text-center text-gray-500">
++          <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" /> Loading...
++        </div>
++      ) : rows.length === 0 ? (
++        <div className="py-14 text-center">
++          <CheckCircle2 className="w-9 h-9 text-emerald-400 mx-auto mb-2" />
++          <p className="font-medium text-gray-700 dark:text-gray-200">
++            {tab === 'OPEN' ? 'Nothing to review' : 'No resolved submissions yet'}
++          </p>
++          {tab === 'OPEN' && (
++            <p className="text-sm text-gray-500 mt-1">Every form response so far has matched an employee.</p>
++          )}
++        </div>
++      ) : tab === 'OPEN' ? (
++        <div className="space-y-3">
++          {rows.map((r) => (
++            <SubmissionCard key={r.id} row={r} onResolved={load} />
++          ))}
++        </div>
++      ) : (
++        <Card className="shadow-sm">
++          <CardContent className="p-0 divide-y">
++            {rows.map((r) => (
++              <div key={r.id} className="px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-sm">
++                <div>
++                  <span className="font-mono">{r.staffCodeGuess ?? '(no code)'}</span>
++                  <span className="text-gray-500"> &bull; submitted {fmt(r.submittedAt)}</span>
++                </div>
++                <Badge variant="secondary">
++                  {r.resolution === 'ASSIGNED' ? 'Linked to employee' : 'Dismissed'}
++                  {r.resolvedAt && ` • ${fmt(r.resolvedAt)}`}
++                </Badge>
++              </div>
++            ))}
++          </CardContent>
++        </Card>
++      )}
++    </div>
++  );
++}
+diff --git a/src/components/onboarding/PendingFormsPanel.tsx b/src/components/onboarding/PendingFormsPanel.tsx
+index 664e456..98d8926 100644
+--- a/src/components/onboarding/PendingFormsPanel.tsx
++++ b/src/components/onboarding/PendingFormsPanel.tsx
+@@ -16,7 +16,7 @@ import {
+   Loader2,
+ } from 'lucide-react';
+ import { toast } from 'sonner';
+-import { markFormSent, sendFormReminder } from '@/app/(app)/onboarding/pending-forms/actions';
++import { markFormSent, sendFormReminder, markFormSubmittedManually } from '@/app/(app)/onboarding/pending-forms/actions';
+ import { updateEmployeeMobileAction } from '@/app/(app)/employees/actions';
+ import { formatMobile, normalizeMobile } from '@/lib/whatsapp';
+ 
+@@ -140,10 +140,12 @@ function EmployeeRow({
+   employee,
+   canRemind,
+   onChange,
++  onSubmitted,
+ }: {
+   employee: Employee;
+   canRemind: boolean;
+   onChange: (patch: Partial<Employee>) => void;
++  onSubmitted: () => void;
+ }) {
+   const [isPending, startTransition] = useTransition();
+ 
+@@ -205,6 +207,19 @@ function EmployeeRow({
+     });
+   }
+ 
++  function handleMarkSubmitted() {
++    if (!window.confirm(`Mark ${employee.name}'s form as submitted? Use this only if they really completed it.`)) return;
++    startTransition(async () => {
++      const result = await markFormSubmittedManually(employee.id);
++      if (result.ok) {
++        toast.success(`${employee.name} marked as submitted`);
++        onSubmitted();
++      } else {
++        toast.error(result.error || 'Could not update');
++      }
++    });
++  }
++
+   return (
+     <tr className="hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors align-top">
+       <td className="px-4 py-3">
+@@ -261,6 +276,14 @@ function EmployeeRow({
+             >
+               <Copy className="w-3 h-3" /> Copy link
+             </button>
++            <button
++              onClick={handleMarkSubmitted}
++              disabled={isPending}
++              className="text-xs text-slate-500 hover:text-emerald-700 underline disabled:opacity-40"
++              title="Use if they completed the form but it didn't register here"
++            >
++              Mark submitted
++            </button>
+             {notSent && (
+               <button
+                 onClick={handleMarkSent}
+@@ -287,6 +310,7 @@ export function PendingFormsPanel({ employees: initial, summaryStats, submittedC
+   const [storeFilter, setStoreFilter] = useState('ALL');
+   const [sort, setSort] = useState<SortKey>('OLDEST_JOINED');
+   const [page, setPage] = useState(1);
++  const [newlySubmitted, setNewlySubmitted] = useState(0);
+ 
+   const patchRow = (id: string, patch: Partial<Employee>) =>
+     setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+@@ -294,8 +318,9 @@ export function PendingFormsPanel({ employees: initial, summaryStats, submittedC
+   // Counts follow the live rows, so they stay right after "Send"/"Already sent".
+   const notSent = rows.filter((r) => r.onboardingFormStatus === 'NOT_SENT').length;
+   const awaiting = rows.length - notSent;
+-  const total = rows.length + submittedCount;
+-  const completionPct = total > 0 ? Math.round((submittedCount / total) * 100) : 0;
++  const submitted = submittedCount + newlySubmitted;
++  const total = rows.length + submitted;
++  const completionPct = total > 0 ? Math.round((submitted / total) * 100) : 0;
+ 
+   const clients = useMemo(() => {
+     const m = new Map<string, string>();
+@@ -393,13 +418,13 @@ export function PendingFormsPanel({ employees: initial, summaryStats, submittedC
+           <p className="text-xs text-amber-600 dark:text-amber-500 mt-1">Awaiting submission</p>
+         </button>
+         <div className="bg-emerald-50 dark:bg-emerald-950/30 rounded-xl border border-emerald-100 dark:border-emerald-900 p-4">
+-          <p className="text-2xl font-bold text-emerald-700 dark:text-emerald-400">{submittedCount}</p>
++          <p className="text-2xl font-bold text-emerald-700 dark:text-emerald-400">{submitted}</p>
+           <p className="text-xs text-emerald-600 dark:text-emerald-500 mt-1">Submitted</p>
+         </div>
+         <div className="bg-blue-50 dark:bg-blue-950/30 rounded-xl border border-blue-100 dark:border-blue-900 p-4">
+           <p className="text-2xl font-bold text-blue-700 dark:text-blue-400">{completionPct}%</p>
+           <p className="text-xs text-blue-600 dark:text-blue-500 mt-1">
+-            Completion &bull; {submittedCount} of {total}
++            Completion &bull; {submitted} of {total}
+           </p>
+           <div className="mt-2 w-full bg-blue-100 dark:bg-blue-900/50 rounded-full h-1.5">
+             <div className="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${completionPct}%` }} />
+@@ -517,7 +542,16 @@ export function PendingFormsPanel({ employees: initial, summaryStats, submittedC
+                 </tr>
+               ) : (
+                 pageRows.map((emp) => (
+-                  <EmployeeRow key={emp.id} employee={emp} canRemind={canRemind} onChange={(patch) => patchRow(emp.id, patch)} />
++                  <EmployeeRow
++                    key={emp.id}
++                    employee={emp}
++                    canRemind={canRemind}
++                    onChange={(patch) => patchRow(emp.id, patch)}
++                    onSubmitted={() => {
++                      setRows((rs) => rs.filter((r) => r.id !== emp.id));
++                      setNewlySubmitted((n) => n + 1);
++                    }}
++                  />
+                 ))
+               )}
+             </tbody>
+diff --git a/src/lib/audit/catalog.ts b/src/lib/audit/catalog.ts
+index b708806..d74941e 100644
+--- a/src/lib/audit/catalog.ts
++++ b/src/lib/audit/catalog.ts
+@@ -19,6 +19,9 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
+   EMPLOYEE_SOFT_DELETE: { label: 'Employee deactivated', category: 'Employees', severity: 'notice' },
+   EMPLOYEE_REACTIVATE: { label: 'Employee reactivated', category: 'Employees', severity: 'notice' },
+   EMPLOYEE_HARD_DELETE: { label: 'Employee permanently deleted', category: 'Employees', severity: 'critical' },
++  EMPLOYEE_FORM_MARKED_SUBMITTED: { label: 'Onboarding form marked submitted', category: 'Employees', severity: 'notice' },
++  FORM_SUBMISSION_ASSIGNED: { label: 'Unmatched form submission linked to employee', category: 'Employees', severity: 'notice' },
++  FORM_SUBMISSION_DISMISSED: { label: 'Unmatched form submission dismissed', category: 'System', severity: 'info', adminOnly: true },
+   FORM_REMINDER_SENT: { label: 'Onboarding form reminder sent', category: 'Employees', severity: 'info' },
+ 
+   CLIENT_CREATE: { label: 'Client created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
+diff --git a/src/lib/auth/can.ts b/src/lib/auth/can.ts
+index 0dc4a5d..2a7ee56 100644
+--- a/src/lib/auth/can.ts
++++ b/src/lib/auth/can.ts
+@@ -31,6 +31,7 @@ export type Action =
+   | 'syncIssues:retry'
+   | 'formTracking:view'
+   | 'formTracking:remind'
++  | 'formSubmissions:manage'
+   | 'onboardingForm:editClient'
+   | 'onboardingForm:editStore';
+ 
+@@ -232,6 +233,10 @@ export function can(
+     case 'syncIssues:retry':
+       return role === 'ADMIN';
+ 
++    // Reconciling Google Form submissions that matched no employee.
++    case 'formSubmissions:manage':
++      return role === 'ADMIN';
++
+     // ── Form tracking ────────────────────────────────────────────────
+     case 'formTracking:view':
+       switch (role) {
+diff --git a/src/lib/forms/submission.ts b/src/lib/forms/submission.ts
+new file mode 100644
+index 0000000..d25a859
+--- /dev/null
++++ b/src/lib/forms/submission.ts
+@@ -0,0 +1,147 @@
++import { createHash, timingSafeEqual } from 'crypto';
++import type { NextRequest } from 'next/server';
++import { NextResponse } from 'next/server';
++import { prisma } from '@/lib/prisma';
++
++/** Keys a sender might use for the employee code (top level, or a form question title). */
++const CODE_KEYS = /^(staff[\s_-]?code|employee[\s_-]?code|e[\s_-]?code|ecode)$/i;
++
++/** Pulls the employee code out of a webhook body, tolerating different field names. */
++export function extractStaffCode(body: any): string | null {
++  const clean = (v: unknown) => {
++    const raw = Array.isArray(v) ? v[0] : v;
++    return typeof raw === 'string' || typeof raw === 'number' ? String(raw).replace(/\s+/g, '') : '';
++  };
++  const search = (obj: any): string | null => {
++    if (!obj || typeof obj !== 'object') return null;
++    for (const [k, v] of Object.entries(obj)) {
++      if (CODE_KEYS.test(k.trim())) {
++        const c = clean(v);
++        if (c) return c;
++      }
++    }
++    return null;
++  };
++  // Explicit field first, then top-level aliases, then the raw form answers.
++  return clean(body?.employeeCode) || search(body) || search(body?.rawValues) || null;
++}
++
++/** Constant-time check of the X-Webhook-Secret header. The secret is REQUIRED. */
++export function checkWebhookSecret(request: NextRequest): 'ok' | 'unauthorized' | 'not_configured' {
++  const expected = process.env.FORM_WEBHOOK_SECRET;
++  if (!expected) return 'not_configured';
++  const given = request.headers.get('X-Webhook-Secret') ?? '';
++  const a = createHash('sha256').update(given).digest();
++  const b = createHash('sha256').update(expected).digest();
++  return timingSafeEqual(a, b) ? 'ok' : 'unauthorized';
++}
++
++export type SubmissionResult =
++  | { status: 'recorded'; employeeId: string; name: string }
++  | { status: 'already_submitted'; employeeId: string; name: string }
++  | { status: 'unmatched'; reason: 'no_code' | 'no_employee' };
++
++/**
++ * Records a Google Form submission against an employee, or parks it in the
++ * unmatched list for an admin to reconcile. Safe to call twice for the same
++ * submission: the first submission time is kept.
++ */
++export async function recordFormSubmission(p: {
++  staffCode: string | null;
++  submittedAt?: Date;
++  rawPayload: object;
++  formId?: string | null;
++}): Promise<SubmissionResult> {
++  // A bad or future timestamp from the sender must not poison the record.
++  const now = new Date();
++  const at = p.submittedAt && !isNaN(p.submittedAt.getTime()) && p.submittedAt <= now ? p.submittedAt : now;
++
++  const park = async (reason: 'no_code' | 'no_employee') => {
++    await prisma.unmatchedFormSubmission.create({
++      data: {
++        rawPayload: p.rawPayload,
++        submittedAt: at,
++        staffCodeGuess: p.staffCode,
++        formId: p.formId?.slice(0, 200) || null,
++      },
++    });
++    return { status: 'unmatched', reason } as const;
++  };
++
++  if (!p.staffCode) return park('no_code');
++
++  const employee = await prisma.employee.findUnique({
++    where: { staffCode: p.staffCode },
++    select: { id: true, name: true, onboardingFormStatus: true },
++  });
++  if (!employee) return park('no_employee');
++
++  if (employee.onboardingFormStatus === 'SUBMITTED') {
++    return { status: 'already_submitted', employeeId: employee.id, name: employee.name };
++  }
++  await prisma.employee.update({
++    where: { id: employee.id },
++    data: {
++      onboardingFormStatus: 'SUBMITTED',
++      onboardingFormSubmittedAt: at,
++      onboardingFormSubmittedVia: 'WEBHOOK',
++    },
++  });
++  return { status: 'recorded', employeeId: employee.id, name: employee.name };
++}
++
++/** Shared POST handler for both webhook URLs. */
++export async function handleFormWebhook(request: NextRequest): Promise<NextResponse> {
++  const auth = checkWebhookSecret(request);
++  if (auth === 'not_configured') {
++    console.error('[FormWebhook] FORM_WEBHOOK_SECRET is not set — refusing all requests');
++    return NextResponse.json({ error: 'Webhook is not configured' }, { status: 503 });
++  }
++  if (auth === 'unauthorized') {
++    console.warn('[FormWebhook] Invalid webhook secret');
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
++  }
++
++  let body: any;
++  try {
++    body = await request.json();
++  } catch {
++    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
++  }
++  if (!body || typeof body !== 'object') {
++    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
++  }
++
++  try {
++    const result = await recordFormSubmission({
++      staffCode: extractStaffCode(body),
++      submittedAt: body.submittedAt ? new Date(body.submittedAt) : undefined,
++      rawPayload: body,
++      formId: typeof body.formId === 'string' ? body.formId : null,
++    });
++
++    // Always 200 once we've handled it (even if unmatched) so the sender doesn't retry-storm.
++    if (result.status === 'unmatched') {
++      console.warn(`[FormWebhook] Unmatched submission (${result.reason})`);
++      return NextResponse.json({
++        ok: false,
++        message:
++          result.reason === 'no_code'
++            ? 'No employee code in submission — saved for admin review'
++            : 'No employee found for that code — saved for admin review',
++      });
++    }
++    return NextResponse.json({
++      ok: true,
++      message:
++        result.status === 'recorded'
++          ? `Form submission recorded for ${result.name}`
++          : `Form was already recorded for ${result.name}`,
++      employeeId: result.employeeId,
++    });
++  } catch (err: any) {
++    console.error('[FormWebhook] Failed to record submission', err);
++    // 500 so the Apps Script retries.
++    return NextResponse.json({ ok: false, error: 'Failed to record submission' }, { status: 500 });
++  }
++}
