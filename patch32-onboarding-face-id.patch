@@ -1,0 +1,644 @@
+diff --git a/src/components/onboarding/FaceCaptureStep.tsx b/src/components/onboarding/FaceCaptureStep.tsx
+new file mode 100644
+index 0000000..b3faf6b
+--- /dev/null
++++ b/src/components/onboarding/FaceCaptureStep.tsx
+@@ -0,0 +1,365 @@
++'use client';
++
++import { useCallback, useEffect, useRef, useState } from 'react';
++import { loadFaceEngine, scanFrame, type FrameResult } from '@/lib/face/engine';
++import { ENROLL_MAX_SAMPLES, ENROLL_MIN_SAMPLES } from '@/lib/face/match';
++import { Button } from '@/components/ui/button';
++import { Checkbox } from '@/components/ui/checkbox';
++import { Label } from '@/components/ui/label';
++import { Camera, CameraOff, Loader2, RefreshCw, SwitchCamera } from 'lucide-react';
++
++/**
++ * Face capture for the onboarding wizard.
++ *
++ * Only collects the 128-number face descriptors in the browser (no photo is
++ * ever kept). The wizard saves them with `enrollFace` right after the employee
++ * record is created — an enrolment needs an employee id, which doesn't exist
++ * until the wizard is submitted.
++ *
++ * Browser-only (camera + WebGL): the wizard loads this with next/dynamic and
++ * ssr:false, exactly like the Face Attendance screen.
++ */
++
++type Facing = 'environment' | 'user';
++type CamState = 'off' | 'starting' | 'on' | 'error';
++type EngineState = 'idle' | 'loading' | 'ready' | 'error';
++type GuideTone = 'idle' | 'good' | 'bad';
++
++const TICK_MS = 500;
++/** Same key as the Face Attendance screen, so the phone remembers its camera. */
++const FACING_KEY = 'hrms.face.facing';
++
++const STEPS = [
++  'Look straight at the camera',
++  'Turn the head slightly to the left',
++  'Turn the head slightly to the right',
++  'Any small tilt or angle',
++  'One last straight-on shot',
++];
++
++const HINTS: Record<Exclude<FrameResult['status'], 'OK'>, string> = {
++  NO_FACE: 'No face in view',
++  MULTIPLE: 'One person at a time, please',
++  TOO_FAR: 'Move closer',
++};
++
++const GUIDE_CLASS: Record<GuideTone, string> = {
++  idle: 'border-white/60',
++  good: 'border-green-400',
++  bad: 'border-red-400',
++};
++
++interface Props {
++  samples: number[][];
++  onSamplesChange: (samples: number[][]) => void;
++  consent: boolean;
++  onConsentChange: (consent: boolean) => void;
++}
++
++function buzz(pattern: number | number[]) {
++  try { navigator.vibrate?.(pattern); } catch { /* not supported — harmless */ }
++}
++
++export function FaceCaptureStep({ samples, onSamplesChange, consent, onConsentChange }: Props) {
++  const [facing, setFacing] = useState<Facing>(() => {
++    try {
++      const v = localStorage.getItem(FACING_KEY);
++      return v === 'user' || v === 'environment' ? v : 'environment';
++    } catch { return 'environment'; }
++  });
++  const [cam, setCam] = useState<CamState>('off');
++  const [camError, setCamError] = useState<string | null>(null);
++  const [engine, setEngine] = useState<EngineState>('idle');
++  const [hint, setHint] = useState('Start the camera to begin');
++  const [guide, setGuide] = useState<GuideTone>('idle');
++  const [flash, setFlash] = useState(false);
++  const [msg, setMsg] = useState<string | null>(null);
++
++  const videoRef = useRef<HTMLVideoElement | null>(null);
++  const streamRef = useRef<MediaStream | null>(null);
++  const engineRef = useRef<Awaited<ReturnType<typeof loadFaceEngine>> | null>(null);
++  const latestRef = useRef<{ descriptor: number[]; at: number } | null>(null);
++  const samplesRef = useRef(samples);
++  samplesRef.current = samples;
++
++  const say = useCallback((text: string, tone: GuideTone = 'idle') => {
++    setHint(text);
++    setGuide(tone);
++  }, []);
++
++  // ─── Camera ──────────────────────────────────────────────────────────────
++  const stopCamera = useCallback(() => {
++    streamRef.current?.getTracks().forEach((t) => t.stop());
++    streamRef.current = null;
++    if (videoRef.current) videoRef.current.srcObject = null;
++    latestRef.current = null;
++    setGuide('idle');
++    setCam('off');
++  }, []);
++
++  const startCamera = useCallback(async (which: Facing) => {
++    setCam('starting');
++    setCamError(null);
++    try {
++      if (!navigator.mediaDevices?.getUserMedia) {
++        throw new Error('The camera needs a secure (https) connection.');
++      }
++      streamRef.current?.getTracks().forEach((t) => t.stop());
++      const stream = await navigator.mediaDevices.getUserMedia({
++        video: { facingMode: { ideal: which }, width: { ideal: 640 }, height: { ideal: 480 } },
++        audio: false,
++      });
++      streamRef.current = stream;
++      const video = videoRef.current;
++      if (!video) throw new Error('Camera view is not ready.');
++      video.srcObject = stream;
++      await video.play();
++      setCam('on');
++      say('Point the camera at the face');
++    } catch (err) {
++      setCam('error');
++      const name = err instanceof DOMException ? err.name : '';
++      setCamError(
++        name === 'NotAllowedError'
++          ? 'Camera permission was blocked. Allow camera access for this site in your browser settings, then try again.'
++          : err instanceof Error ? err.message : 'Could not start the camera.',
++      );
++    }
++  }, [say]);
++
++  const startAll = useCallback(async () => {
++    if (engine !== 'ready') {
++      setEngine('loading');
++      loadFaceEngine()
++        .then((fa) => { engineRef.current = fa; setEngine('ready'); })
++        .catch(() => setEngine('error'));
++    }
++    await startCamera(facing);
++  }, [engine, facing, startCamera]);
++
++  const flipCamera = useCallback(async () => {
++    const next: Facing = facing === 'environment' ? 'user' : 'environment';
++    setFacing(next);
++    try { localStorage.setItem(FACING_KEY, next); } catch { /* remembering the choice is optional */ }
++    await startCamera(next);
++  }, [facing, startCamera]);
++
++  // Always release the camera when leaving this step.
++  useEffect(() => () => {
++    streamRef.current?.getTracks().forEach((t) => t.stop());
++  }, []);
++
++  // ─── Frame loop: keep the latest good descriptor ready for "Capture" ─────
++  useEffect(() => {
++    if (cam !== 'on' || engine !== 'ready') return;
++    let cancelled = false;
++    let timer: number | undefined;
++    let busy = false;
++
++    const tick = async () => {
++      if (cancelled) return;
++      const video = videoRef.current;
++      const fa = engineRef.current;
++      if (video && fa && video.readyState >= 2 && !document.hidden && !busy) {
++        busy = true;
++        try {
++          const frame = await scanFrame(fa, video);
++          if (cancelled) return;
++          if (frame.status !== 'OK') {
++            latestRef.current = null;
++            say(HINTS[frame.status], frame.status === 'MULTIPLE' ? 'bad' : 'idle');
++          } else {
++            latestRef.current = { descriptor: frame.descriptor, at: Date.now() };
++            say(
++              samplesRef.current.length >= ENROLL_MAX_SAMPLES ? 'All samples captured' : 'Face ready — tap Capture',
++              'good',
++            );
++          }
++        } catch {
++          latestRef.current = null;
++        } finally {
++          busy = false;
++        }
++      }
++      if (!cancelled) timer = window.setTimeout(tick, TICK_MS);
++    };
++
++    timer = window.setTimeout(tick, TICK_MS);
++    return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
++  }, [cam, engine, say]);
++
++  // ─── Capture ─────────────────────────────────────────────────────────────
++  const capture = useCallback(() => {
++    const current = samplesRef.current;
++    if (current.length >= ENROLL_MAX_SAMPLES) return;
++    const latest = latestRef.current;
++    if (!latest || Date.now() - latest.at > 2000) {
++      setMsg('No clear face right now. Hold the camera steady on one face and try again.');
++      buzz(160);
++      return;
++    }
++    setMsg(null);
++    onSamplesChange([...current, latest.descriptor]);
++    latestRef.current = null;
++    setFlash(true);
++    window.setTimeout(() => setFlash(false), 150);
++    buzz(50);
++  }, [onSamplesChange]);
++
++  // Space = start camera / capture. Ignored while typing or on a focused control,
++  // so it never fights the wizard's own buttons.
++  useEffect(() => {
++    const onKey = (e: KeyboardEvent) => {
++      if (e.code !== 'Space' || e.repeat) return;
++      const t = e.target as HTMLElement | null;
++      const tag = t?.tagName;
++      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || t?.isContentEditable) return;
++      if (t?.getAttribute('role') === 'checkbox') return;
++      e.preventDefault();
++      if (cam === 'on') capture();
++      else if (cam !== 'starting') void startAll();
++    };
++    window.addEventListener('keydown', onKey);
++    return () => window.removeEventListener('keydown', onKey);
++  }, [cam, capture, startAll]);
++
++  const camOn = cam === 'on';
++  const full = samples.length >= ENROLL_MAX_SAMPLES;
++  const stepText = full
++    ? 'All samples captured — you can continue.'
++    : samples.length >= ENROLL_MIN_SAMPLES
++      ? `Enough captured. Add up to ${ENROLL_MAX_SAMPLES - samples.length} more for better accuracy, or continue.`
++      : `Sample ${samples.length + 1}: ${STEPS[samples.length]}`;
++
++  return (
++    <div className="space-y-3">
++      <div className="relative aspect-[4/3] w-full max-w-md mx-auto overflow-hidden rounded-xl bg-slate-900">
++        <video
++          ref={videoRef}
++          playsInline
++          muted
++          aria-label="Camera preview"
++          className="h-full w-full object-cover"
++          style={{ transform: facing === 'user' ? 'scaleX(-1)' : undefined }}
++        />
++
++        {camOn && (
++          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
++            <div className={`h-[70%] aspect-[3/4] rounded-[50%] border-4 border-dashed transition-colors duration-300 ${GUIDE_CLASS[guide]}`} />
++          </div>
++        )}
++
++        <div
++          className={`pointer-events-none absolute inset-0 bg-white transition-opacity duration-150 ${flash ? 'opacity-70' : 'opacity-0'}`}
++        />
++
++        {!camOn && (
++          <button
++            type="button"
++            onClick={() => { if (cam !== 'starting') void startAll(); }}
++            disabled={cam === 'starting'}
++            className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center text-slate-300"
++          >
++            {cam === 'starting'
++              ? <><Loader2 className="h-8 w-8 animate-spin" /><span className="text-sm">Starting camera…</span></>
++              : <>
++                  <CameraOff className="h-10 w-10" />
++                  <span className="text-base font-medium">Camera is off</span>
++                  <span className="text-sm text-slate-400">Tap here to start</span>
++                </>}
++          </button>
++        )}
++
++        {camOn && (
++          <>
++            <button
++              type="button"
++              onClick={() => void flipCamera()}
++              aria-label="Switch camera"
++              className="absolute right-2 top-2 flex h-11 w-11 items-center justify-center rounded-full bg-black/50 text-white hover:bg-black/70"
++            >
++              <SwitchCamera className="h-5 w-5" />
++            </button>
++            <div className="absolute bottom-3 left-3 right-3 text-center">
++              <span className="inline-block max-w-full rounded-full bg-black/70 text-white px-4 py-2 text-sm">
++                {engine === 'loading' ? 'Loading face models…' : hint}
++              </span>
++            </div>
++          </>
++        )}
++      </div>
++
++      {camError && (
++        <p className="text-sm text-red-700 rounded-lg border border-red-200 bg-red-50 p-3">{camError}</p>
++      )}
++      {engine === 'error' && (
++        <p className="text-sm text-red-700 rounded-lg border border-red-200 bg-red-50 p-3">
++          Could not load the face models. Check your connection and tap the camera to try again.
++        </p>
++      )}
++
++      <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">{stepText}</div>
++
++      <div className="flex items-center gap-3">
++        <div className="flex gap-1.5" aria-hidden="true">
++          {Array.from({ length: ENROLL_MAX_SAMPLES }).map((_, i) => (
++            <span key={i} className={`h-3 w-3 rounded-full ${i < samples.length ? 'bg-green-500' : 'bg-gray-200'}`} />
++          ))}
++        </div>
++        <span className="text-xs text-gray-500">
++          {samples.length} captured{samples.length < ENROLL_MIN_SAMPLES ? ` · at least ${ENROLL_MIN_SAMPLES} needed` : ''}
++        </span>
++        <Button
++          type="button"
++          variant="outline"
++          onClick={() => { onSamplesChange([]); setMsg(null); }}
++          disabled={samples.length === 0}
++          aria-label="Clear samples"
++          className="ml-auto h-10 w-10 p-0"
++        >
++          <RefreshCw className="h-4 w-4" />
++        </Button>
++      </div>
++
++      {msg && (
++        <p role="status" className="text-sm rounded-lg border border-red-200 bg-red-50 text-red-700 p-3">{msg}</p>
++      )}
++
++      <div className="flex gap-2">
++        {camOn ? (
++          <>
++            <Button type="button" onClick={capture} disabled={full || engine !== 'ready'} className="flex-1 h-12 text-base">
++              <Camera className="h-4 w-4 mr-2" /> Capture
++            </Button>
++            <Button type="button" variant="outline" onClick={stopCamera} className="h-12">
++              Stop camera
++            </Button>
++          </>
++        ) : (
++          <Button
++            type="button"
++            onClick={() => void startAll()}
++            disabled={cam === 'starting'}
++            className="flex-1 h-12 text-base"
++          >
++            {cam === 'starting' ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Camera className="h-4 w-4 mr-2" />}
++            Start camera
++          </Button>
++        )}
++      </div>
++
++      <div className="flex items-start gap-3">
++        <Checkbox
++          id="onboarding-face-consent"
++          checked={consent}
++          onCheckedChange={(v) => onConsentChange(v === true)}
++          className="mt-0.5 h-5 w-5"
++        />
++        <Label htmlFor="onboarding-face-consent" className="text-sm font-normal leading-snug">
++          This employee has agreed to their face data being stored for attendance. Only a numeric
++          template is kept — never a photo.
++        </Label>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/onboarding/OnboardingWizard.tsx b/src/components/onboarding/OnboardingWizard.tsx
+index cd6b5da..ee06772 100644
+--- a/src/components/onboarding/OnboardingWizard.tsx
++++ b/src/components/onboarding/OnboardingWizard.tsx
+@@ -1,6 +1,7 @@
+ 'use client';
+ 
+ import { useState, useEffect, useRef } from 'react';
++import dynamic from 'next/dynamic';
+ import { Designation } from '@prisma/client';
+ import {
+   getStoresForOnboardingAction,
+@@ -18,14 +19,33 @@ import { Badge } from '@/components/ui/badge';
+ import { Checkbox } from '@/components/ui/checkbox';
+ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+ import { markFormSent } from '@/app/(app)/onboarding/pending-forms/actions';
++import { enrollFace } from '@/app/(app)/face-attendance/actions';
++import { ENROLL_MIN_SAMPLES } from '@/lib/face/match';
+ import { normalizeMobile, formatMobile } from '@/lib/whatsapp';
+-import { CheckCircle2, Check, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle, Pencil } from 'lucide-react';
++import { CheckCircle2, Check, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle, Pencil, ScanFace } from 'lucide-react';
+ import { toast } from 'sonner';
+ 
++/** Camera + WebGL face engine — browser only, so never part of the server render. */
++const FaceCaptureStep = dynamic(
++  () => import('./FaceCaptureStep').then((m) => m.FaceCaptureStep),
++  {
++    ssr: false,
++    loading: () => (
++      <div className="p-6 flex items-center justify-center text-sm text-gray-500">
++        <Loader2 className="h-4 w-4 animate-spin mr-2" /> Loading face capture…
++      </div>
++    ),
++  },
++);
++
++/** Same roles the server allows to enrol faces (attendance:faceEnroll). */
++const FACE_ENROLL_ROLES = ['ADMIN', 'CLIENT', 'MANAGER', 'SHIFT_INCHARGE'];
++
+ interface StoreOption {
+   id: string;
+   name: string;
+   code: string;
++  faceAttendanceEnabled?: boolean;
+   client: { name: string; code: string; shortName: string };
+   warehouseType: { name: string; code: string };
+ }
+@@ -49,7 +69,6 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+   const [designation, setDesignation] = useState<Designation>(Designation.ASSOCIATE);
+   const [grade, setGrade] = useState('');
+   const [team, setTeam] = useState('');
+-  const [cardNumber, setCardNumber] = useState('');
+   const [mobileNumber, setMobileNumber] = useState('');
+ 
+   // App login fields (PA/SI/Store Manager only)
+@@ -62,6 +81,14 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+   const [showErrors, setShowErrors] = useState(false);
+   const topRef = useRef<HTMLDivElement>(null);
+ 
++  // Face ID capture (descriptors only — saved after the employee record exists)
++  const [faceSamples, setFaceSamples] = useState<number[][]>([]);
++  const [faceConsent, setFaceConsent] = useState(false);
++  const [faceOutcome, setFaceOutcome] = useState<
++    { state: 'ENROLLED' } | { state: 'FAILED'; error: string } | { state: 'SKIPPED' } | null
++  >(null);
++  const [retryingFace, setRetryingFace] = useState(false);
++
+   // Enrollment mode
+   const [enrollmentMode, setEnrollmentMode] = useState<'DIRECT_UPLOAD' | 'REMOTE_LINK'>('DIRECT_UPLOAD');
+ 
+@@ -117,6 +144,18 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+     designation === Designation.SHIFT_INCHARGE ||
+     designation === Designation.STORE_MANAGER;
+ 
++  const selectedStore = stores.find((x) => x.id === storeId);
++  const canEnrollFace = !!role && FACE_ENROLL_ROLES.includes(role);
++  const storeFaceOn = !!selectedStore?.faceAttendanceEnabled;
++  const faceAvailable = canEnrollFace && storeFaceOn;
++  const faceReady = faceAvailable && faceSamples.length >= ENROLL_MIN_SAMPLES && faceConsent;
++
++  // A different store may have face attendance off, and samples are per person — start clean.
++  useEffect(() => {
++    setFaceSamples([]);
++    setFaceConsent(false);
++  }, [storeId]);
++
+   const mobileNormalized = normalizeMobile(mobileNumber);
+   const errors = {
+     name: !name.trim() ? 'Enter the employee\'s full name.' : '',
+@@ -166,7 +205,6 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+         designation,
+         grade: grade || undefined,
+         team: team || undefined,
+-        cardNumber: cardNumber || undefined,
+         mobileNumber,
+         createAppLogin: isAppRoleDesignation ? createAppLogin : false,
+         email: isAppRoleDesignation && createAppLogin ? email : undefined,
+@@ -180,6 +218,15 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+         return;
+       }
+ 
++      // The employee exists now, so the captured face can be saved against them.
++      // Onboarding itself has already succeeded — a face problem never undoes it.
++      if (faceReady) {
++        const faceRes = await enrollFace(res.employeeId!, faceSamples, faceConsent);
++        setFaceOutcome(faceRes.ok ? { state: 'ENROLLED' } : { state: 'FAILED', error: faceRes.error });
++      } else {
++        setFaceOutcome({ state: 'SKIPPED' });
++      }
++
+       setOnboardResult({
+         staffCode: res.staffCode!,
+         googleFormUrl: res.googleFormUrl!,
+@@ -196,6 +243,18 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+     }
+   };
+ 
++  const retryFaceEnrol = async () => {
++    if (!onboardResult) return;
++    setRetryingFace(true);
++    try {
++      const r = await enrollFace(onboardResult.employeeId, faceSamples, faceConsent);
++      setFaceOutcome(r.ok ? { state: 'ENROLLED' } : { state: 'FAILED', error: r.error });
++      if (r.ok) toast.success('Face ID saved.');
++    } finally {
++      setRetryingFace(false);
++    }
++  };
++
+   // Poll command status in step 4
+   useEffect(() => {
+     if (step !== 4 || !onboardResult?.commandId) return;
+@@ -235,7 +294,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+         <ol className="flex items-center mt-4" aria-label="Onboarding progress">
+           {[
+             { num: 1, label: 'Basic Details' },
+-            { num: 2, label: 'Biometrics & Card' },
++            { num: 2, label: 'Face ID & Biometrics' },
+             { num: 3, label: 'Review & Submit' },
+             { num: 4, label: 'Confirmation' },
+           ].map((st, idx, arr) => {
+@@ -529,30 +588,57 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+           </CardContent>
+           <CardFooter className="flex justify-end gap-2">
+             <Button onClick={handleStep1Next} size="lg">
+-              Next: Biometrics & Card &rarr;
++              Next: Face ID &rarr;
+             </Button>
+           </CardFooter>
+         </Card>
+       )}
+ 
+-      {/* STEP 2: BIOMETRICS & CARD */}
++      {/* STEP 2: FACE ID & BIOMETRICS */}
+       {step === 2 && (
+         <Card className="shadow-sm">
+           <CardHeader>
+-            <CardTitle>Step 2: Biometric & Smart Card Enrollment</CardTitle>
++            <CardTitle>Step 2: Face ID & Biometric Enrollment</CardTitle>
+             <CardDescription>
+-              Specify card number or choose enrollment method for SmartOffice biometric scanners.
++              Capture the associate's face for phone attendance, and choose how they enrol on the SmartOffice scanners.
+             </CardDescription>
+           </CardHeader>
+           <CardContent className="space-y-6">
+-            <div className="space-y-2">
+-              <Label htmlFor="cardNumber">Smart Card / RFID Number (Optional)</Label>
+-              <Input
+-                id="cardNumber"
+-                placeholder="e.g. 10048592"
+-                value={cardNumber}
+-                onChange={(e) => setCardNumber(e.target.value)}
+-              />
++            {/* Face ID capture */}
++            <div className="space-y-3">
++              <div className="flex items-center justify-between gap-2">
++                <Label className="flex items-center gap-2">
++                  <ScanFace className="w-4 h-4 text-primary" /> Face ID (Optional)
++                </Label>
++                {faceAvailable && (
++                  <Badge variant={faceReady ? 'default' : 'secondary'}>
++                    {faceReady ? 'Ready to save' : 'Not captured'}
++                  </Badge>
++                )}
++              </div>
++              {!canEnrollFace ? (
++                <p className="text-sm text-gray-600 rounded-lg border bg-gray-50 p-3 dark:bg-gray-900 dark:text-gray-400">
++                  Your role can't enrol faces. A Manager, Shift Incharge, Client or Admin can add this person's Face ID later from Face Attendance &rarr; Enroll.
++                </p>
++              ) : !storeFaceOn ? (
++                <p className="text-sm text-gray-600 rounded-lg border bg-gray-50 p-3 dark:bg-gray-900 dark:text-gray-400">
++                  Face attendance is switched off for {selectedStore?.name ?? 'this store'}, so Face ID can't be saved yet. An Admin or Client can switch it on in Stores &amp; Brands — you can enrol this person afterwards from Face Attendance &rarr; Enroll.
++                </p>
++              ) : (
++                <FaceCaptureStep
++                  samples={faceSamples}
++                  onSamplesChange={setFaceSamples}
++                  consent={faceConsent}
++                  onConsentChange={setFaceConsent}
++                />
++              )}
++              {faceAvailable && !faceReady && faceSamples.length > 0 && (
++                <p className="text-xs text-amber-600">
++                  {faceSamples.length < ENROLL_MIN_SAMPLES
++                    ? `Capture at least ${ENROLL_MIN_SAMPLES} samples to save Face ID, or continue to skip it.`
++                    : 'Tick the consent box to save Face ID, or continue to skip it.'}
++                </p>
++              )}
+             </div>
+ 
+             <div className="space-y-3">
+@@ -656,8 +742,14 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                 <span>{formatMobile(normalizeMobile(mobileNumber)) || '-'}</span>
+               </div>
+               <div>
+-                <span className="text-gray-500 block text-xs">Card Number</span>
+-                <span>{cardNumber || 'None'}</span>
++                <span className="text-gray-500 block text-xs">Face ID</span>
++                <span>
++                  {faceReady
++                    ? `Captured (${faceSamples.length} samples)`
++                    : faceAvailable
++                      ? 'Not captured'
++                      : 'Not available for this store/role'}
++                </span>
+               </div>
+               <div>
+                 <span className="text-gray-500 block text-xs">Enrollment Mode</span>
+@@ -739,6 +831,33 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+               )}
+             </div>
+ 
++            {/* Face ID result */}
++            {faceOutcome && faceOutcome.state !== 'SKIPPED' && (
++              <div
++                className={`p-4 rounded-lg border space-y-2 ${
++                  faceOutcome.state === 'ENROLLED'
++                    ? 'bg-white dark:bg-slate-900 border-emerald-200'
++                    : 'bg-amber-50 dark:bg-amber-950/20 border-amber-200'
++                }`}
++              >
++                <div className="flex items-center gap-2 font-medium text-sm">
++                  <ScanFace className="w-4 h-4" />
++                  {faceOutcome.state === 'ENROLLED' ? 'Face ID saved' : 'Face ID was not saved'}
++                </div>
++                {faceOutcome.state === 'FAILED' && (
++                  <>
++                    <p className="text-xs text-amber-800 dark:text-amber-300">
++                      {faceOutcome.error} The employee was still onboarded.
++                    </p>
++                    <Button size="sm" variant="outline" onClick={retryFaceEnrol} disabled={retryingFace}>
++                      {retryingFace ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : null}
++                      Try saving again
++                    </Button>
++                  </>
++                )}
++              </div>
++            )}
++
+             {/* Sync Command Badge */}
+             <div className="p-4 rounded-lg bg-white dark:bg-slate-900 border space-y-2">
+               <div className="flex items-center justify-between">
+@@ -804,7 +923,9 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
+                 // Keep store / designation / grade / team — people are usually onboarded in batches.
+                 setStep(1);
+                 setName('');
+-                setCardNumber('');
++                setFaceSamples([]);
++                setFaceConsent(false);
++                setFaceOutcome(null);
+                 setMobileNumber('');
+                 setDateOfBirth('');
+                 setCreateAppLogin(false);

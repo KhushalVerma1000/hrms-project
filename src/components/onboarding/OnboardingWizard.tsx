@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import dynamic from 'next/dynamic';
 import { Designation } from '@prisma/client';
 import {
   getStoresForOnboardingAction,
@@ -18,14 +19,33 @@ import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { markFormSent } from '@/app/(app)/onboarding/pending-forms/actions';
+import { enrollFace } from '@/app/(app)/face-attendance/actions';
+import { ENROLL_MIN_SAMPLES } from '@/lib/face/match';
 import { normalizeMobile, formatMobile } from '@/lib/whatsapp';
-import { CheckCircle2, Check, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle, Pencil } from 'lucide-react';
+import { CheckCircle2, Check, Copy, ExternalLink, Loader2, Sparkles, UserPlus, Shield, Smartphone, QrCode, MessageCircle, Pencil, ScanFace } from 'lucide-react';
 import { toast } from 'sonner';
+
+/** Camera + WebGL face engine — browser only, so never part of the server render. */
+const FaceCaptureStep = dynamic(
+  () => import('./FaceCaptureStep').then((m) => m.FaceCaptureStep),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="p-6 flex items-center justify-center text-sm text-gray-500">
+        <Loader2 className="h-4 w-4 animate-spin mr-2" /> Loading face capture…
+      </div>
+    ),
+  },
+);
+
+/** Same roles the server allows to enrol faces (attendance:faceEnroll). */
+const FACE_ENROLL_ROLES = ['ADMIN', 'CLIENT', 'MANAGER', 'SHIFT_INCHARGE'];
 
 interface StoreOption {
   id: string;
   name: string;
   code: string;
+  faceAttendanceEnabled?: boolean;
   client: { name: string; code: string; shortName: string };
   warehouseType: { name: string; code: string };
 }
@@ -49,7 +69,6 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   const [designation, setDesignation] = useState<Designation>(Designation.ASSOCIATE);
   const [grade, setGrade] = useState('');
   const [team, setTeam] = useState('');
-  const [cardNumber, setCardNumber] = useState('');
   const [mobileNumber, setMobileNumber] = useState('');
 
   // App login fields (PA/SI/Store Manager only)
@@ -61,6 +80,14 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
   // (mobile also shows live, as soon as something is typed).
   const [showErrors, setShowErrors] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
+
+  // Face ID capture (descriptors only — saved after the employee record exists)
+  const [faceSamples, setFaceSamples] = useState<number[][]>([]);
+  const [faceConsent, setFaceConsent] = useState(false);
+  const [faceOutcome, setFaceOutcome] = useState<
+    { state: 'ENROLLED' } | { state: 'FAILED'; error: string } | { state: 'SKIPPED' } | null
+  >(null);
+  const [retryingFace, setRetryingFace] = useState(false);
 
   // Enrollment mode
   const [enrollmentMode, setEnrollmentMode] = useState<'DIRECT_UPLOAD' | 'REMOTE_LINK'>('DIRECT_UPLOAD');
@@ -117,6 +144,18 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
     designation === Designation.SHIFT_INCHARGE ||
     designation === Designation.STORE_MANAGER;
 
+  const selectedStore = stores.find((x) => x.id === storeId);
+  const canEnrollFace = !!role && FACE_ENROLL_ROLES.includes(role);
+  const storeFaceOn = !!selectedStore?.faceAttendanceEnabled;
+  const faceAvailable = canEnrollFace && storeFaceOn;
+  const faceReady = faceAvailable && faceSamples.length >= ENROLL_MIN_SAMPLES && faceConsent;
+
+  // A different store may have face attendance off, and samples are per person — start clean.
+  useEffect(() => {
+    setFaceSamples([]);
+    setFaceConsent(false);
+  }, [storeId]);
+
   const mobileNormalized = normalizeMobile(mobileNumber);
   const errors = {
     name: !name.trim() ? 'Enter the employee\'s full name.' : '',
@@ -166,7 +205,6 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
         designation,
         grade: grade || undefined,
         team: team || undefined,
-        cardNumber: cardNumber || undefined,
         mobileNumber,
         createAppLogin: isAppRoleDesignation ? createAppLogin : false,
         email: isAppRoleDesignation && createAppLogin ? email : undefined,
@@ -178,6 +216,15 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
       if (!res.ok) {
         toast.error(res.error || 'Onboarding failed');
         return;
+      }
+
+      // The employee exists now, so the captured face can be saved against them.
+      // Onboarding itself has already succeeded — a face problem never undoes it.
+      if (faceReady) {
+        const faceRes = await enrollFace(res.employeeId!, faceSamples, faceConsent);
+        setFaceOutcome(faceRes.ok ? { state: 'ENROLLED' } : { state: 'FAILED', error: faceRes.error });
+      } else {
+        setFaceOutcome({ state: 'SKIPPED' });
       }
 
       setOnboardResult({
@@ -193,6 +240,18 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
       toast.error(err.message || 'Unexpected error occurred');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const retryFaceEnrol = async () => {
+    if (!onboardResult) return;
+    setRetryingFace(true);
+    try {
+      const r = await enrollFace(onboardResult.employeeId, faceSamples, faceConsent);
+      setFaceOutcome(r.ok ? { state: 'ENROLLED' } : { state: 'FAILED', error: r.error });
+      if (r.ok) toast.success('Face ID saved.');
+    } finally {
+      setRetryingFace(false);
     }
   };
 
@@ -235,7 +294,7 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
         <ol className="flex items-center mt-4" aria-label="Onboarding progress">
           {[
             { num: 1, label: 'Basic Details' },
-            { num: 2, label: 'Biometrics & Card' },
+            { num: 2, label: 'Face ID & Biometrics' },
             { num: 3, label: 'Review & Submit' },
             { num: 4, label: 'Confirmation' },
           ].map((st, idx, arr) => {
@@ -529,30 +588,57 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
           </CardContent>
           <CardFooter className="flex justify-end gap-2">
             <Button onClick={handleStep1Next} size="lg">
-              Next: Biometrics & Card &rarr;
+              Next: Face ID &rarr;
             </Button>
           </CardFooter>
         </Card>
       )}
 
-      {/* STEP 2: BIOMETRICS & CARD */}
+      {/* STEP 2: FACE ID & BIOMETRICS */}
       {step === 2 && (
         <Card className="shadow-sm">
           <CardHeader>
-            <CardTitle>Step 2: Biometric & Smart Card Enrollment</CardTitle>
+            <CardTitle>Step 2: Face ID & Biometric Enrollment</CardTitle>
             <CardDescription>
-              Specify card number or choose enrollment method for SmartOffice biometric scanners.
+              Capture the associate's face for phone attendance, and choose how they enrol on the SmartOffice scanners.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="space-y-2">
-              <Label htmlFor="cardNumber">Smart Card / RFID Number (Optional)</Label>
-              <Input
-                id="cardNumber"
-                placeholder="e.g. 10048592"
-                value={cardNumber}
-                onChange={(e) => setCardNumber(e.target.value)}
-              />
+            {/* Face ID capture */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="flex items-center gap-2">
+                  <ScanFace className="w-4 h-4 text-primary" /> Face ID (Optional)
+                </Label>
+                {faceAvailable && (
+                  <Badge variant={faceReady ? 'default' : 'secondary'}>
+                    {faceReady ? 'Ready to save' : 'Not captured'}
+                  </Badge>
+                )}
+              </div>
+              {!canEnrollFace ? (
+                <p className="text-sm text-gray-600 rounded-lg border bg-gray-50 p-3 dark:bg-gray-900 dark:text-gray-400">
+                  Your role can't enrol faces. A Manager, Shift Incharge, Client or Admin can add this person's Face ID later from Face Attendance &rarr; Enroll.
+                </p>
+              ) : !storeFaceOn ? (
+                <p className="text-sm text-gray-600 rounded-lg border bg-gray-50 p-3 dark:bg-gray-900 dark:text-gray-400">
+                  Face attendance is switched off for {selectedStore?.name ?? 'this store'}, so Face ID can't be saved yet. An Admin or Client can switch it on in Stores &amp; Brands — you can enrol this person afterwards from Face Attendance &rarr; Enroll.
+                </p>
+              ) : (
+                <FaceCaptureStep
+                  samples={faceSamples}
+                  onSamplesChange={setFaceSamples}
+                  consent={faceConsent}
+                  onConsentChange={setFaceConsent}
+                />
+              )}
+              {faceAvailable && !faceReady && faceSamples.length > 0 && (
+                <p className="text-xs text-amber-600">
+                  {faceSamples.length < ENROLL_MIN_SAMPLES
+                    ? `Capture at least ${ENROLL_MIN_SAMPLES} samples to save Face ID, or continue to skip it.`
+                    : 'Tick the consent box to save Face ID, or continue to skip it.'}
+                </p>
+              )}
             </div>
 
             <div className="space-y-3">
@@ -656,8 +742,14 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                 <span>{formatMobile(normalizeMobile(mobileNumber)) || '-'}</span>
               </div>
               <div>
-                <span className="text-gray-500 block text-xs">Card Number</span>
-                <span>{cardNumber || 'None'}</span>
+                <span className="text-gray-500 block text-xs">Face ID</span>
+                <span>
+                  {faceReady
+                    ? `Captured (${faceSamples.length} samples)`
+                    : faceAvailable
+                      ? 'Not captured'
+                      : 'Not available for this store/role'}
+                </span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Enrollment Mode</span>
@@ -739,6 +831,33 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
               )}
             </div>
 
+            {/* Face ID result */}
+            {faceOutcome && faceOutcome.state !== 'SKIPPED' && (
+              <div
+                className={`p-4 rounded-lg border space-y-2 ${
+                  faceOutcome.state === 'ENROLLED'
+                    ? 'bg-white dark:bg-slate-900 border-emerald-200'
+                    : 'bg-amber-50 dark:bg-amber-950/20 border-amber-200'
+                }`}
+              >
+                <div className="flex items-center gap-2 font-medium text-sm">
+                  <ScanFace className="w-4 h-4" />
+                  {faceOutcome.state === 'ENROLLED' ? 'Face ID saved' : 'Face ID was not saved'}
+                </div>
+                {faceOutcome.state === 'FAILED' && (
+                  <>
+                    <p className="text-xs text-amber-800 dark:text-amber-300">
+                      {faceOutcome.error} The employee was still onboarded.
+                    </p>
+                    <Button size="sm" variant="outline" onClick={retryFaceEnrol} disabled={retryingFace}>
+                      {retryingFace ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : null}
+                      Try saving again
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
+
             {/* Sync Command Badge */}
             <div className="p-4 rounded-lg bg-white dark:bg-slate-900 border space-y-2">
               <div className="flex items-center justify-between">
@@ -804,7 +923,9 @@ export function OnboardingWizard({ role }: OnboardingWizardProps = {}) {
                 // Keep store / designation / grade / team — people are usually onboarded in batches.
                 setStep(1);
                 setName('');
-                setCardNumber('');
+                setFaceSamples([]);
+                setFaceConsent(false);
+                setFaceOutcome(null);
                 setMobileNumber('');
                 setDateOfBirth('');
                 setCreateAppLogin(false);
