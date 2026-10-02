@@ -48,6 +48,8 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
   ATTENDANCE_DEADLINE_STORE_OVERRIDE_SET: { label: 'Store deadline override set', category: 'Attendance', severity: 'notice', adminOnly: true },
   ATTENDANCE_DEADLINE_STORE_OVERRIDE_CLEARED: { label: 'Store deadline override cleared', category: 'Attendance', severity: 'notice', adminOnly: true },
 
+  REPORT_DOWNLOADED: { label: 'Attendance report downloaded', category: 'Attendance', severity: 'info' },
+
   FACE_ENROLLED: { label: 'Face data enrolled', category: 'Attendance', severity: 'notice' },
   FACE_DATA_DELETED: { label: 'Face data deleted', category: 'Attendance', severity: 'notice' },
 

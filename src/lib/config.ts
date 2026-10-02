@@ -85,9 +85,24 @@ export const SYSTEM_DEFAULT_DEADLINE_DAY: number =
  * daily OT figure. SmartOffice/AttendanceLog has no OT field of its own —
  * this is a stated assumption, not a synced value. Adjust if your actual
  * shift length differs (or varies by store — flag if you need per-store).
+ *
+ * Reports (src/lib/reports/rules.ts) use the same value as the length of the
+ * shift counted for someone who checked in but never checked out. Reports
+ * never estimate overtime from it.
  */
 export const STANDARD_SHIFT_HOURS: number =
-  Number(process.env.ATTENDANCE_STANDARD_SHIFT_HOURS) || 8;
+  Number(process.env.ATTENDANCE_STANDARD_SHIFT_HOURS) || 9;
+
+/**
+ * Stores run several shifts at different times, including overnight, with no fixed
+ * start or end. Reports therefore group punches into SHIFTS rather than calendar days:
+ * a shift starts at a person's first unassigned punch and takes in every punch within
+ * this many hours of it. It must be longer than the longest real shift (9h + overtime)
+ * and shorter than the gap between two consecutive shift starts (16h when someone
+ * rotates from a 06:00 to a 22:00 shift). The shift counts on the day it STARTED.
+ */
+export const SHIFT_WINDOW_HOURS: number =
+  Number(process.env.ATTENDANCE_SHIFT_WINDOW_HOURS) || 14;
 
 /**
  * Tolerance (hours) within which a manually-uploaded daily OT figure is

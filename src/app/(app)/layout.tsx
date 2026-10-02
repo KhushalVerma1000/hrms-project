@@ -17,6 +17,7 @@ export default async function AppLayout({
   const userRole = session.user.role;
   const canViewAttendance = can(session, 'attendance:view', {});
   const canManualAttendance = can(session, 'attendance:manualEntry', { storeId: session.user.storeId });
+  const canViewReports = can(session, 'reports:view', {});
   // Face attendance is an opt-in module: only show it if at least one store in
   // the user's scope has it switched on.
   let canFaceAttendance = false;
@@ -46,6 +47,7 @@ export default async function AppLayout({
     { href: '/dashboard', label: 'Dashboard', icon: '📊' },
     ...(canViewAttendance ? [{ href: '/attendance', label: 'Attendance Logs', icon: '🕒' }] : []),
     ...(canManualAttendance ? [{ href: '/attendance/manual', label: 'Manual Attendance', icon: '📝' }] : []),
+    ...(canViewReports ? [{ href: '/reports', label: 'Reports & Analytics', icon: '📈' }] : []),
     ...(canFaceAttendance ? [{ href: '/face-attendance', label: 'Face Attendance', icon: '📸' }] : []),
     ...(canCsvUpload ? [{ href: '/attendance/upload', label: 'Attendance Upload', icon: '📤' }] : []),
     ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),

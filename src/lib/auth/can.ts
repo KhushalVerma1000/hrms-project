@@ -12,6 +12,7 @@ export type Action =
   | 'employee:hardDelete'
   | 'employee:view'
   | 'attendance:view'
+  | 'reports:view'
   | 'attendance:manualEntry'
   | 'attendance:facePunch'
   | 'attendance:faceEnroll'
@@ -120,6 +121,18 @@ export function can(
         case 'CLIENT': return inClient(ctx.clientId);
         case 'MANAGER': return inStore(ctx.storeId);
         // PA/SI: no access to attendance
+        default: return false;
+      }
+
+    // Attendance reports (view + download). Office roles: Admin sees everything, Client sees their
+    // own client's stores. Among ground (store-level) staff ONLY the Manager can see reports, and
+    // only their own store — Shift Incharge and Process Associate are deliberately excluded for now.
+    // To open it up later, add `case 'SHIFT_INCHARGE'` next to MANAGER below.
+    case 'reports:view':
+      switch (role) {
+        case 'ADMIN': return true;
+        case 'CLIENT': return inClient(ctx.clientId);
+        case 'MANAGER': return inStore(ctx.storeId);
         default: return false;
       }
 
