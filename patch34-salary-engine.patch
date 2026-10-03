@@ -1,0 +1,1864 @@
+
+diff --git a/package.json b/package.json
+index 7e1070f..a573f2e 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,7 @@
+     "db:generate": "prisma generate",
+     "db:studio": "prisma studio",
+     "type-check": "tsc --noEmit",
++    "test:payroll": "tsx --test src/lib/payroll/engine.test.ts",
+     "postinstall": "node scripts/copy-face-models.mjs"
+   },
+   "dependencies": {
+@@ -42,6 +43,7 @@
+     "clsx": "^2.1.1",
+     "date-fns": "^4.1.0",
+     "date-fns-tz": "^3.2.0",
++    "exceljs": "^4.4.0",
+     "lucide-react": "^0.460.0",
+     "nanoid": "^5.0.8",
+     "next": "^15.0.0",
+@@ -68,6 +70,7 @@
+     "tailwindcss-animate": "^1.0.7",
+     "ts-node": "^10.9.2",
+     "tsconfig-paths": "^4.2.0",
++    "tsx": "^4.19.0",
+     "typescript": "^5.9.3"
+   },
+   "prisma": {
+diff --git a/prisma/migrations/20261002100000_payroll_engine/migration.sql b/prisma/migrations/20261002100000_payroll_engine/migration.sql
+new file mode 100644
+index 0000000..991856a
+--- /dev/null
++++ b/prisma/migrations/20261002100000_payroll_engine/migration.sql
+@@ -0,0 +1,91 @@
++-- Salary engine: payroll identity fields, per-client config, salary slabs, assignments, runs.
++ALTER TABLE "Employee" ADD COLUMN "fatherName" TEXT;
++ALTER TABLE "Employee" ADD COLUMN "uan" TEXT;
++ALTER TABLE "Employee" ADD COLUMN "esicNumber" TEXT;
++
++CREATE TYPE "PayrollRunStatus" AS ENUM ('DRAFT', 'FINALIZED');
++
++CREATE TABLE "ClientPayrollConfig" (
++    "clientId" TEXT NOT NULL,
++    "pfEmployeePct" DOUBLE PRECISION NOT NULL DEFAULT 12,
++    "pfEmployerPct" DOUBLE PRECISION NOT NULL DEFAULT 12,
++    "pfAdminPct" DOUBLE PRECISION NOT NULL DEFAULT 1,
++    "pfWageCeiling" INTEGER DEFAULT 15000,
++    "esicEmployeePct" DOUBLE PRECISION NOT NULL DEFAULT 0.75,
++    "esicEmployerPct" DOUBLE PRECISION NOT NULL DEFAULT 3.25,
++    "esicGrossLimit" INTEGER NOT NULL DEFAULT 21000,
++    "esicBase" TEXT NOT NULL DEFAULT 'BASIC',
++    "insurance" INTEGER NOT NULL DEFAULT 0,
++    "pt" INTEGER NOT NULL DEFAULT 0,
++    "lwf" INTEGER NOT NULL DEFAULT 0,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++    CONSTRAINT "ClientPayrollConfig_pkey" PRIMARY KEY ("clientId")
++);
++
++CREATE TABLE "SalarySlab" (
++    "id" TEXT NOT NULL,
++    "clientId" TEXT NOT NULL,
++    "designation" "Designation" NOT NULL,
++    "name" TEXT NOT NULL,
++    "basic" INTEGER NOT NULL,
++    "hra" INTEGER NOT NULL,
++    "specialAllowance" INTEGER NOT NULL DEFAULT 0,
++    "travellingAllowance" INTEGER NOT NULL DEFAULT 0,
++    "otDayRate" INTEGER,
++    "otHourRate" INTEGER,
++    "bonusDayRate" INTEGER,
++    "isDefault" BOOLEAN NOT NULL DEFAULT false,
++    "isActive" BOOLEAN NOT NULL DEFAULT true,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++    CONSTRAINT "SalarySlab_pkey" PRIMARY KEY ("id")
++);
++CREATE UNIQUE INDEX "SalarySlab_clientId_designation_name_key" ON "SalarySlab"("clientId", "designation", "name");
++CREATE INDEX "SalarySlab_clientId_designation_idx" ON "SalarySlab"("clientId", "designation");
++
++CREATE TABLE "EmployeeSalaryAssignment" (
++    "id" TEXT NOT NULL,
++    "employeeId" TEXT NOT NULL,
++    "slabId" TEXT NOT NULL,
++    "assignedByUserId" TEXT NOT NULL,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++    CONSTRAINT "EmployeeSalaryAssignment_pkey" PRIMARY KEY ("id")
++);
++CREATE UNIQUE INDEX "EmployeeSalaryAssignment_employeeId_key" ON "EmployeeSalaryAssignment"("employeeId");
++
++CREATE TABLE "PayrollRun" (
++    "id" TEXT NOT NULL,
++    "clientId" TEXT NOT NULL,
++    "periodYear" INTEGER NOT NULL,
++    "periodMonth" INTEGER NOT NULL,
++    "status" "PayrollRunStatus" NOT NULL DEFAULT 'DRAFT',
++    "configSnapshot" JSONB NOT NULL,
++    "createdByUserId" TEXT NOT NULL,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "finalizedByUserId" TEXT,
++    "finalizedAt" TIMESTAMP(3),
++    CONSTRAINT "PayrollRun_pkey" PRIMARY KEY ("id")
++);
++CREATE UNIQUE INDEX "PayrollRun_clientId_periodYear_periodMonth_key" ON "PayrollRun"("clientId", "periodYear", "periodMonth");
++
++CREATE TABLE "PayrollLine" (
++    "id" TEXT NOT NULL,
++    "runId" TEXT NOT NULL,
++    "employeeId" TEXT NOT NULL,
++    "identity" JSONB NOT NULL,
++    "inputs" JSONB NOT NULL,
++    "result" JSONB,
++    "warnings" TEXT[],
++    "gross" INTEGER NOT NULL DEFAULT 0,
++    "netTakeHome" INTEGER NOT NULL DEFAULT 0,
++    CONSTRAINT "PayrollLine_pkey" PRIMARY KEY ("id")
++);
++CREATE UNIQUE INDEX "PayrollLine_runId_employeeId_key" ON "PayrollLine"("runId", "employeeId");
++
++ALTER TABLE "ClientPayrollConfig" ADD CONSTRAINT "ClientPayrollConfig_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "Client"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++ALTER TABLE "SalarySlab" ADD CONSTRAINT "SalarySlab_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "Client"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++ALTER TABLE "EmployeeSalaryAssignment" ADD CONSTRAINT "EmployeeSalaryAssignment_employeeId_fkey" FOREIGN KEY ("employeeId") REFERENCES "Employee"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++ALTER TABLE "EmployeeSalaryAssignment" ADD CONSTRAINT "EmployeeSalaryAssignment_slabId_fkey" FOREIGN KEY ("slabId") REFERENCES "SalarySlab"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++ALTER TABLE "PayrollRun" ADD CONSTRAINT "PayrollRun_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "Client"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++ALTER TABLE "PayrollLine" ADD CONSTRAINT "PayrollLine_runId_fkey" FOREIGN KEY ("runId") REFERENCES "PayrollRun"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++ALTER TABLE "PayrollLine" ADD CONSTRAINT "PayrollLine_employeeId_fkey" FOREIGN KEY ("employeeId") REFERENCES "Employee"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+diff --git a/prisma/migrations/20261002110000_employee_bank_details/migration.sql b/prisma/migrations/20261002110000_employee_bank_details/migration.sql
+new file mode 100644
+index 0000000..f7a6d2c
+--- /dev/null
++++ b/prisma/migrations/20261002110000_employee_bank_details/migration.sql
+@@ -0,0 +1,3 @@
++-- Bank details for bulk NEFT payout sheets.
++ALTER TABLE "Employee" ADD COLUMN "bankAccountNumber" TEXT;
++ALTER TABLE "Employee" ADD COLUMN "ifscCode" TEXT;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index d96e6c8..d698ca9 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -204,6 +204,9 @@ model Client {
+   stores    Store[]
+   users     User[]
+   deadlinePolicies AttendanceDeadlinePolicy[]
++  payrollConfig    ClientPayrollConfig?
++  salarySlabs      SalarySlab[]
++  payrollRuns      PayrollRun[]
+   createdAt DateTime @default(now())
+ }
+ 
+@@ -383,6 +386,21 @@ model Employee {
+   dateOfRelieving    DateTime?
+   cardNumber         String?
+ 
++  /// Payroll identity (shown on the salary payout sheet). Admin-edited from /payroll/setup.
++  fatherName  String?
++  /// PF Universal Account Number.
++  uan         String?
++  /// ESIC insurance number.
++  esicNumber  String?
++  /// Salary account for bulk NEFT payout sheets (admin-edited from /payroll/setup).
++  bankAccountNumber String?
++  /// 11-character IFSC, upper-case.
++  ifscCode          String?
++
++  /// This person's own salary slab. Absent → the client's default slab for their designation (if any).
++  salaryAssignment EmployeeSalaryAssignment?
++  payrollLines     PayrollLine[]
++
+   /// Mobile number, digits only WITH country code (e.g. "919876543210") so it
+   /// drops straight into a wa.me link. Normalised by normalizeMobile() in
+   /// src/lib/whatsapp.ts. Null for legacy employees imported without one.
+@@ -776,3 +794,120 @@ model FaceTemplate {
+ 
+   @@index([employeeId])
+ }
++
++
++// ─────────────────────────────────────────────────────────────────────────────
++// PAYROLL (admin-only for now). Calculation lives in src/lib/payroll/engine.ts.
++// Money is whole rupees, matching the payout sheet.
++// ─────────────────────────────────────────────────────────────────────────────
++
++enum PayrollRunStatus {
++  DRAFT      /// Editable; attendance can be re-pulled.
++  FINALIZED  /// Locked. Later slab / config edits never change it.
++}
++
++/// Statutory + policy settings for one client's payroll. Percentages are plain numbers (12 = 12 %).
++model ClientPayrollConfig {
++  clientId String @id
++  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
++
++  pfEmployeePct   Float @default(12)
++  pfEmployerPct   Float @default(12)
++  pfAdminPct      Float @default(1)
++  /// PF is calculated on min(basic, ceiling). Null = no ceiling.
++  pfWageCeiling   Int?  @default(15000)
++  esicEmployeePct Float @default(0.75)
++  esicEmployerPct Float @default(3.25)
++  esicGrossLimit  Int   @default(21000)
++  /// "BASIC" (as the client's sheet is labelled) or "GROSS" (statutory wage base).
++  /// Unused since the wage base became fixed (basic + special allowance); kept so the column and old drafts stay valid.
++  esicBase        String @default("BASIC")
++  insurance       Int   @default(0)
++  pt              Int   @default(0)
++  lwf             Int   @default(0)
++
++  updatedAt DateTime @updatedAt
++}
++
++/// A named pay structure for one client + designation. Monthly fixed amounts.
++/// Associates share one default slab client-wide; other designations are assigned per employee.
++model SalarySlab {
++  id          String      @id @default(cuid())
++  clientId    String
++  client      Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
++  designation Designation
++  name        String
++
++  basic               Int
++  hra                 Int
++  specialAllowance    Int @default(0)
++  travellingAllowance Int @default(0)
++  otDayRate           Int?
++  otHourRate          Int?
++  bonusDayRate        Int?
++
++  /// Used for every employee of this client + designation with no personal assignment.
++  /// At most one default per client + designation (enforced in the server action).
++  isDefault Boolean @default(false)
++  isActive  Boolean @default(true)
++
++  assignments EmployeeSalaryAssignment[]
++
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  @@unique([clientId, designation, name])
++  @@index([clientId, designation])
++}
++
++model EmployeeSalaryAssignment {
++  id         String     @id @default(cuid())
++  employeeId String     @unique
++  employee   Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
++  slabId     String
++  slab       SalarySlab @relation(fields: [slabId], references: [id])
++  assignedByUserId String
++  updatedAt  DateTime   @updatedAt
++}
++
++model PayrollRun {
++  id          String           @id @default(cuid())
++  clientId    String
++  client      Client           @relation(fields: [clientId], references: [id])
++  periodYear  Int
++  periodMonth Int
++  status      PayrollRunStatus @default(DRAFT)
++
++  /// Client payroll settings in force when the run was generated / last refreshed.
++  configSnapshot Json
++
++  createdByUserId   String
++  createdAt         DateTime  @default(now())
++  finalizedByUserId String?
++  finalizedAt       DateTime?
++
++  lines PayrollLine[]
++
++  @@unique([clientId, periodYear, periodMonth])
++}
++
++model PayrollLine {
++  id         String     @id @default(cuid())
++  runId      String
++  run        PayrollRun @relation(fields: [runId], references: [id], onDelete: Cascade)
++  employeeId String
++  employee   Employee   @relation(fields: [employeeId], references: [id])
++
++  /// Who they were at generation time (store, e-code, name, father, UAN, ESIC, designation, status).
++  identity Json
++  /// Slab used (null if none), attendance counts, manual inputs and overrides.
++  inputs   Json
++  /// engine.ts PayrollResult, or null when the person has no slab.
++  result   Json?
++  warnings String[]
++
++  gross        Int @default(0)
++  netTakeHome  Int @default(0)
++
++  @@unique([runId, employeeId])
++}
+diff --git a/src/app/(app)/layout.tsx b/src/app/(app)/layout.tsx
+index a6c1c42..3928072 100644
+--- a/src/app/(app)/layout.tsx
++++ b/src/app/(app)/layout.tsx
+@@ -41,6 +41,7 @@ export default async function AppLayout({
+   const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
+   const canViewSyncIssues = can(session, 'syncIssues:view', {});
+   const canViewAuditLog = can(session, 'auditLog:view', {});
++  const canManagePayroll = can(session, 'payroll:manage', {});
+   const canReviewForms = can(session, 'formSubmissions:manage', {});
+ 
+   const navItems: NavItem[] = [
+@@ -48,6 +49,7 @@ export default async function AppLayout({
+     ...(canViewAttendance ? [{ href: '/attendance', label: 'Attendance Logs', icon: '🕒' }] : []),
+     ...(canManualAttendance ? [{ href: '/attendance/manual', label: 'Manual Attendance', icon: '📝' }] : []),
+     ...(canViewReports ? [{ href: '/reports', label: 'Reports & Analytics', icon: '📈' }] : []),
++    ...(canManagePayroll ? [{ href: '/payroll', label: 'Salary & Payroll', icon: '💰' }] : []),
+     ...(canFaceAttendance ? [{ href: '/face-attendance', label: 'Face Attendance', icon: '📸' }] : []),
+     ...(canCsvUpload ? [{ href: '/attendance/upload', label: 'Attendance Upload', icon: '📤' }] : []),
+     ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),
+diff --git a/src/app/(app)/payroll/_ui.tsx b/src/app/(app)/payroll/_ui.tsx
+new file mode 100644
+index 0000000..a94931c
+--- /dev/null
++++ b/src/app/(app)/payroll/_ui.tsx
+@@ -0,0 +1,37 @@
++import type { ReactNode } from 'react';
++
++export const inputCls =
++  'h-9 w-full rounded-md border border-slate-300 bg-white px-2 text-sm dark:border-slate-700 dark:bg-slate-900';
++export const btnCls =
++  'inline-flex h-9 items-center justify-center rounded-md bg-primary px-3 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50';
++export const btnGhostCls =
++  'inline-flex h-9 items-center justify-center rounded-md border border-slate-300 px-3 text-sm font-medium hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800';
++export const btnDangerCls =
++  'inline-flex h-9 items-center justify-center rounded-md border border-red-300 px-3 text-sm font-medium text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400';
++export const cardCls = 'rounded-xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950';
++
++export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
++  return (
++    <label className="flex flex-col gap-1 text-xs font-medium text-slate-600 dark:text-slate-400">
++      {label}
++      {children}
++      {hint ? <span className="font-normal text-slate-500">{hint}</span> : null}
++    </label>
++  );
++}
++
++export function Notice({ error, ok }: { error?: string; ok?: string }) {
++  if (!error && !ok) return null;
++  return (
++    <div
++      className={`rounded-md border p-3 text-sm ${
++        error ? 'border-red-300 bg-red-50 text-red-800 dark:bg-red-950 dark:text-red-200' : 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200'
++      }`}
++    >
++      {error ?? ok}
++    </div>
++  );
++}
++
++export const rupees = (n: number | null | undefined) => (n == null ? '—' : n.toLocaleString('en-IN'));
++export const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v);
+diff --git a/src/app/(app)/payroll/actions.ts b/src/app/(app)/payroll/actions.ts
+new file mode 100644
+index 0000000..fd88bf7
+--- /dev/null
++++ b/src/app/(app)/payroll/actions.ts
+@@ -0,0 +1,288 @@
++'use server';
++
++import { revalidatePath } from 'next/cache';
++import { redirect } from 'next/navigation';
++import { Designation, Prisma } from '@prisma/client';
++import { auth } from '@/auth';
++import { prisma } from '@/lib/prisma';
++import { can } from '@/lib/auth/can';
++import { writeAuditLog } from '@/lib/smartoffice/audit';
++import { todayKey } from '@/lib/reports/data';
++import { PayrollError, computeLine, generateRun, lineWarnings, ymOf, daysInMonthOf, type LineInputs, type ManualInputs } from '@/lib/payroll/service';
++import type { PayrollConfig } from '@/lib/payroll/engine';
++
++/** Every payroll action starts here. Never rely on hidden buttons. */
++async function requireAdmin() {
++  const session = await auth();
++  if (!session?.user || !can(session, 'payroll:manage', {})) throw new Error('Payroll is restricted to administrators.');
++  return session;
++}
++
++function back(path: string, kind: 'error' | 'ok', msg: string): never {
++  const sep = path.includes('?') ? '&' : '?';
++  redirect(`${path}${sep}${kind}=${encodeURIComponent(msg)}`);
++}
++
++const str = (f: FormData, k: string) => String(f.get(k) ?? '').trim();
++function int(f: FormData, k: string, opts: { min?: number; max?: number; optional?: boolean } = {}): number | null {
++  const raw = str(f, k);
++  if (raw === '') {
++    if (opts.optional) return null;
++    throw new PayrollError(`${k} is required.`);
++  }
++  const n = Number(raw);
++  if (!Number.isInteger(n) || n < (opts.min ?? 0) || n > (opts.max ?? 10_000_000)) throw new PayrollError(`${k} must be a whole number${opts.min != null ? ` ≥ ${opts.min}` : ''}.`);
++  return n;
++}
++function num(f: FormData, k: string, min: number, max: number, optional = false): number | null {
++  const raw = str(f, k);
++  if (raw === '' && optional) return null;
++  const n = Number(raw);
++  if (raw === '' || !Number.isFinite(n) || n < min || n > max) throw new PayrollError(`${k} must be between ${min} and ${max}.`);
++  return n;
++}
++
++async function guard<T>(path: string, fn: () => Promise<T>): Promise<T> {
++  try {
++    return await fn();
++  } catch (e) {
++    if (e instanceof PayrollError) back(path, 'error', e.message);
++    throw e; // includes Next's redirect signal
++  }
++}
++
++// ── Compliance settings (per client) ─────────────────────────────────────────
++
++export async function saveConfigAction(formData: FormData) {
++  const session = await requireAdmin();
++  const clientId = str(formData, 'clientId');
++  const path = `/payroll/setup?clientId=${clientId}`;
++  await guard(path, async () => {
++    const data = {
++      pfEmployeePct: num(formData, 'pfEmployeePct', 0, 100)!,
++      pfEmployerPct: num(formData, 'pfEmployerPct', 0, 100)!,
++      pfAdminPct: num(formData, 'pfAdminPct', 0, 100)!,
++      pfWageCeiling: int(formData, 'pfWageCeiling', { optional: true }),
++      esicEmployeePct: num(formData, 'esicEmployeePct', 0, 100)!,
++      esicEmployerPct: num(formData, 'esicEmployerPct', 0, 100)!,
++      esicGrossLimit: int(formData, 'esicGrossLimit')!,
++      insurance: int(formData, 'insurance')!,
++      pt: int(formData, 'pt')!,
++      lwf: int(formData, 'lwf')!,
++    };
++    if (!(await prisma.client.findUnique({ where: { id: clientId }, select: { id: true } }))) throw new PayrollError('Unknown client.');
++    await prisma.clientPayrollConfig.upsert({ where: { clientId }, create: { clientId, ...data }, update: data });
++    await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_CONFIG_UPDATE', targetType: 'Client', targetId: clientId, metadata: data });
++  });
++  revalidatePath('/payroll/setup');
++  back(path, 'ok', 'Payroll settings saved. Existing drafts pick them up on their next refresh; finalized runs are unchanged.');
++}
++
++// ── Salary slabs ─────────────────────────────────────────────────────────────
++
++export async function saveSlabAction(formData: FormData) {
++  const session = await requireAdmin();
++  const clientId = str(formData, 'clientId');
++  const path = `/payroll/setup?clientId=${clientId}`;
++  await guard(path, async () => {
++    const designation = str(formData, 'designation') as Designation;
++    if (!Object.values(Designation).includes(designation)) throw new PayrollError('Pick a designation.');
++    const name = str(formData, 'name');
++    if (!name) throw new PayrollError('Give the slab a name.');
++    const data = {
++      designation, name,
++      basic: int(formData, 'basic')!,
++      hra: int(formData, 'hra')!,
++      specialAllowance: int(formData, 'specialAllowance', { optional: true }) ?? 0,
++      travellingAllowance: int(formData, 'travellingAllowance', { optional: true }) ?? 0,
++      otDayRate: int(formData, 'otDayRate', { optional: true }),
++      otHourRate: int(formData, 'otHourRate', { optional: true }),
++      bonusDayRate: int(formData, 'bonusDayRate', { optional: true }),
++      isDefault: formData.get('isDefault') === 'on',
++    };
++    if (data.basic <= 0) throw new PayrollError('Basic must be more than 0.');
++    const id = str(formData, 'id');
++
++    const saved = await prisma.$transaction(async (tx) => {
++      if (id) {
++        const cur = await tx.salarySlab.findUnique({ where: { id } });
++        if (!cur || cur.clientId !== clientId) throw new PayrollError('Slab not found.');
++        if (cur.designation !== designation) {
++          const inUse = await tx.employeeSalaryAssignment.count({ where: { slabId: id } });
++          if (inUse > 0) throw new PayrollError('This slab is assigned to employees — create a new slab instead of changing its designation.');
++        }
++      }
++      if (data.isDefault) {
++        await tx.salarySlab.updateMany({ where: { clientId, designation, isDefault: true, NOT: id ? { id } : undefined }, data: { isDefault: false } });
++      }
++      try {
++        return id
++          ? await tx.salarySlab.update({ where: { id }, data: { ...data, isActive: true } })
++          : await tx.salarySlab.create({ data: { clientId, ...data } });
++      } catch (e) {
++        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') throw new PayrollError('A slab with that name already exists for this designation.');
++        throw e;
++      }
++    });
++    await writeAuditLog({ userId: session.user.id, action: 'SALARY_SLAB_SAVE', targetType: 'SalarySlab', targetId: saved.id, metadata: { clientId, ...data } });
++  });
++  revalidatePath('/payroll/setup');
++  back(path, 'ok', 'Slab saved. It applies to drafts on their next refresh; finalized runs are unchanged.');
++}
++
++export async function archiveSlabAction(formData: FormData) {
++  const session = await requireAdmin();
++  const id = str(formData, 'id');
++  const slab = await prisma.salarySlab.findUnique({ where: { id } });
++  if (!slab) throw new Error('Slab not found.');
++  const path = `/payroll/setup?clientId=${slab.clientId}`;
++  await prisma.salarySlab.update({ where: { id }, data: { isActive: false, isDefault: false } });
++  await writeAuditLog({ userId: session.user.id, action: 'SALARY_SLAB_ARCHIVE', targetType: 'SalarySlab', targetId: id, metadata: { name: slab.name } });
++  revalidatePath('/payroll/setup');
++  back(path, 'ok', 'Slab archived. Employees assigned to it will show "No slab" until reassigned.');
++}
++
++// ── Employee ↔ slab, and payroll identity ────────────────────────────────────
++
++export async function assignSlabAction(formData: FormData) {
++  const session = await requireAdmin();
++  const employeeId = str(formData, 'employeeId');
++  const slabId = str(formData, 'slabId');
++  const returnTo = str(formData, 'returnTo');
++  const emp = await prisma.employee.findUnique({ where: { id: employeeId }, include: { store: { select: { clientId: true } } } });
++  if (!emp) throw new Error('Employee not found.');
++  const path = returnTo.startsWith('/payroll/setup') ? returnTo : `/payroll/setup?clientId=${emp.store.clientId}`;
++  await guard(path, async () => {
++    if (!slabId) {
++      await prisma.employeeSalaryAssignment.deleteMany({ where: { employeeId } });
++    } else {
++      const slab = await prisma.salarySlab.findUnique({ where: { id: slabId } });
++      if (!slab || !slab.isActive || slab.clientId !== emp.store.clientId) throw new PayrollError('That slab belongs to a different client or is archived.');
++      if (slab.designation !== emp.designation) throw new PayrollError(`That slab is for ${slab.designation.replace(/_/g, ' ')}, but ${emp.name} is ${emp.designation.replace(/_/g, ' ')}.`);
++      await prisma.employeeSalaryAssignment.upsert({
++        where: { employeeId }, create: { employeeId, slabId, assignedByUserId: session.user.id }, update: { slabId, assignedByUserId: session.user.id },
++      });
++    }
++    await writeAuditLog({ userId: session.user.id, action: 'SALARY_ASSIGN', targetType: 'Employee', targetId: employeeId, metadata: { slabId: slabId || null } });
++  });
++  revalidatePath('/payroll/setup');
++  back(path, 'ok', `${emp.name}: ${slabId ? 'slab assigned' : 'personal slab removed (client default applies)'}.`);
++}
++
++export async function saveEmployeeIdsAction(formData: FormData) {
++  const session = await requireAdmin();
++  const employeeId = str(formData, 'employeeId');
++  const returnTo = str(formData, 'returnTo');
++  const emp = await prisma.employee.findUnique({ where: { id: employeeId }, include: { store: { select: { clientId: true } } } });
++  if (!emp) throw new Error('Employee not found.');
++  const path = returnTo.startsWith('/payroll/setup') ? returnTo : `/payroll/setup?clientId=${emp.store.clientId}`;
++  await guard(path, async () => {
++    const digits = (k: string) => str(formData, k).replace(/\s+/g, '');
++    const uan = digits('uan');
++    const esic = digits('esicNumber');
++    if (uan && !/^\d{12}$/.test(uan)) throw new PayrollError('UAN must be 12 digits.');
++    if (esic && !/^(\d{10}|\d{17})$/.test(esic)) throw new PayrollError('ESIC number must be 10 or 17 digits.');
++    const account = digits('bankAccountNumber');
++    const ifsc = digits('ifscCode').toUpperCase();
++    if (account && !/^\d{9,18}$/.test(account)) throw new PayrollError('Bank account number must be 9–18 digits.');
++    if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) throw new PayrollError('IFSC must be 11 characters, e.g. SBIN0001234.');
++    if (!!account !== !!ifsc) throw new PayrollError('Enter both the bank account number and the IFSC, or leave both blank.');
++    await prisma.employee.update({
++      where: { id: employeeId },
++      data: {
++        fatherName: str(formData, 'fatherName') || null, uan: uan || null, esicNumber: esic || null,
++        bankAccountNumber: account || null, ifscCode: ifsc || null,
++      },
++    });
++    await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_IDS_UPDATE', targetType: 'Employee', targetId: employeeId, metadata: {} });
++  });
++  revalidatePath('/payroll/setup');
++  back(path, 'ok', `${emp.name}: payroll details saved.`);
++}
++
++// ── Payroll runs ─────────────────────────────────────────────────────────────
++
++export async function generateRunAction(formData: FormData) {
++  const session = await requireAdmin();
++  const clientId = str(formData, 'clientId');
++  const ym = str(formData, 'month'); // YYYY-MM
++  const m = /^(\d{4})-(\d{2})$/.exec(ym);
++  const returnTo = str(formData, 'returnTo') || '/payroll';
++  if (!m || !clientId) back(returnTo, 'error', 'Pick a client and a month.');
++  const year = Number(m![1]);
++  const month = Number(m![2]);
++  if (month < 1 || month > 12 || year < 2020) back(returnTo, 'error', 'Invalid month.');
++
++  const out = await guard(returnTo, () => generateRun(session, clientId, year, month));
++  await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_RUN_GENERATE', targetType: 'PayrollRun', targetId: out.runId, metadata: { clientId, ym, lines: out.lines } });
++  revalidatePath('/payroll');
++  const note = out.monthOver ? '' : ' This month is not over yet — days after today are not counted; refresh again after month-end.';
++  back(`/payroll/runs/${out.runId}`, 'ok', `Attendance pulled for ${out.lines} employees.${note}`);
++}
++
++export async function saveLineAction(formData: FormData) {
++  const session = await requireAdmin();
++  const lineId = str(formData, 'lineId');
++  const line = await prisma.payrollLine.findUnique({ where: { id: lineId }, include: { run: true } });
++  if (!line) throw new Error('Line not found.');
++  const path = `/payroll/runs/${line.runId}`;
++  if (line.run.status !== 'DRAFT') back(path, 'error', 'This run is finalized and locked.');
++  await guard(path, async () => {
++    const days = daysInMonthOf(line.run.periodYear, line.run.periodMonth);
++    const manual: ManualInputs = {
++      bonusDays: num(formData, 'bonusDays', 0, days)!,
++      otFullDays: num(formData, 'otFullDays', 0, days)!,
++      otHours: num(formData, 'otHours', 0, 744, true),
++      pt: int(formData, 'pt', { optional: true }),
++      lwf: int(formData, 'lwf', { optional: true }),
++      insurance: int(formData, 'insurance', { optional: true }),
++    };
++    const inputs = { ...(line.inputs as unknown as LineInputs), manual };
++    const config = line.run.configSnapshot as unknown as PayrollConfig;
++    const { result, gross, net } = computeLine(inputs, config);
++    await prisma.payrollLine.update({
++      where: { id: lineId },
++      data: {
++        inputs: inputs as unknown as Prisma.InputJsonObject,
++        result: result ? (result as unknown as Prisma.InputJsonObject) : Prisma.JsonNull,
++        warnings: lineWarnings(inputs), gross, netTakeHome: net,
++      },
++    });
++    await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_LINE_EDIT', targetType: 'PayrollLine', targetId: lineId, metadata: { manual } });
++  });
++  revalidatePath(path);
++  back(path, 'ok', 'Line updated.');
++}
++
++export async function finalizeRunAction(formData: FormData) {
++  const session = await requireAdmin();
++  const runId = str(formData, 'runId');
++  const path = `/payroll/runs/${runId}`;
++  await guard(path, async () => {
++    const run = await prisma.payrollRun.findUnique({ where: { id: runId }, include: { lines: { select: { result: true, warnings: true } } } });
++    if (!run) throw new PayrollError('Run not found.');
++    if (run.status === 'FINALIZED') throw new PayrollError('Already finalized.');
++    const last = `${ymOf(run.periodYear, run.periodMonth)}-${String(daysInMonthOf(run.periodYear, run.periodMonth)).padStart(2, '0')}`;
++    if (last >= todayKey()) throw new PayrollError('The month is not over yet — finalize after its last day.');
++    const noSlab = run.lines.filter((l) => l.result == null).length;
++    if (noSlab > 0 && str(formData, 'confirmNoSlab') !== 'on') {
++      throw new PayrollError(`${noSlab} employee(s) have no slab and would be paid 0. Tick "finalize anyway" to confirm, or assign slabs and refresh.`);
++    }
++    await prisma.payrollRun.update({ where: { id: runId }, data: { status: 'FINALIZED', finalizedAt: new Date(), finalizedByUserId: session.user.id } });
++    await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_RUN_FINALIZE', targetType: 'PayrollRun', targetId: runId, metadata: { lines: run.lines.length, withoutSlab: noSlab } });
++  });
++  revalidatePath(path);
++  back(path, 'ok', 'Run finalized and locked.');
++}
++
++export async function deleteDraftRunAction(formData: FormData) {
++  const session = await requireAdmin();
++  const runId = str(formData, 'runId');
++  const run = await prisma.payrollRun.findUnique({ where: { id: runId } });
++  if (!run) back('/payroll', 'error', 'Run not found.');
++  if (run!.status !== 'DRAFT') back(`/payroll/runs/${runId}`, 'error', 'Finalized runs cannot be deleted.');
++  await prisma.payrollRun.delete({ where: { id: runId } });
++  await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_RUN_DELETE', targetType: 'PayrollRun', targetId: runId, metadata: { clientId: run!.clientId, year: run!.periodYear, month: run!.periodMonth } });
++  revalidatePath('/payroll');
++  back('/payroll', 'ok', 'Draft deleted.');
++}
+diff --git a/src/app/(app)/payroll/page.tsx b/src/app/(app)/payroll/page.tsx
+new file mode 100644
+index 0000000..da78234
+--- /dev/null
++++ b/src/app/(app)/payroll/page.tsx
+@@ -0,0 +1,89 @@
++import Link from 'next/link';
++import { redirect } from 'next/navigation';
++import { auth } from '@/auth';
++import { can } from '@/lib/auth/can';
++import { prisma } from '@/lib/prisma';
++import { monthLabel } from '@/lib/reports/period';
++import { ymOf } from '@/lib/payroll/service';
++import { generateRunAction } from './actions';
++import { Field, Notice, btnCls, btnGhostCls, cardCls, inputCls, one, rupees } from './_ui';
++
++export const metadata = { title: 'Salary & Payroll | HRMS Platform' };
++export const dynamic = 'force-dynamic';
++
++export default async function PayrollHome({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
++  const session = await auth();
++  if (!session?.user) redirect('/login');
++  if (!can(session, 'payroll:manage', {})) redirect('/dashboard');
++  const sp = await searchParams;
++
++  const [clients, runs] = await Promise.all([
++    prisma.client.findMany({ orderBy: { name: 'asc' }, select: { id: true, name: true } }),
++    prisma.payrollRun.findMany({
++      orderBy: [{ periodYear: 'desc' }, { periodMonth: 'desc' }, { createdAt: 'desc' }],
++      take: 60,
++      include: { client: { select: { name: true } }, lines: { select: { gross: true, netTakeHome: true, result: true } } },
++    }),
++  ]);
++  const now = new Date();
++  const lastMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
++  const defaultMonth = ymOf(lastMonth.getUTCFullYear(), lastMonth.getUTCMonth() + 1);
++
++  return (
++    <div className="container mx-auto space-y-6 px-4 py-6">
++      <div className="flex flex-wrap items-end justify-between gap-3">
++        <div>
++          <h1 className="text-2xl font-bold tracking-tight">Salary &amp; Payroll</h1>
++          <p className="text-sm text-muted-foreground">Salary slabs, PF/ESIC calculation and monthly payout sheets. Administrators only.</p>
++        </div>
++        <Link href="/payroll/setup" className={btnGhostCls}>Slabs &amp; compliance settings</Link>
++      </div>
++
++      <Notice error={one(sp.error)} ok={one(sp.ok)} />
++
++      <form action={generateRunAction} className={`${cardCls} grid gap-3 sm:grid-cols-4 sm:items-end`}>
++        <Field label="Client">
++          <select name="clientId" required className={inputCls} defaultValue="">
++            <option value="" disabled>Select client…</option>
++            {clients.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
++          </select>
++        </Field>
++        <Field label="Month" hint="Draft is created, or refreshed if it already exists.">
++          <input type="month" name="month" required defaultValue={defaultMonth} className={inputCls} />
++        </Field>
++        <button type="submit" className={btnCls}>Create / refresh draft</button>
++      </form>
++
++      <div className={`${cardCls} overflow-x-auto p-0`}>
++        <table className="w-full text-sm">
++          <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500 dark:bg-slate-900">
++            <tr>
++              <th className="p-3">Month</th><th className="p-3">Client</th><th className="p-3">Status</th>
++              <th className="p-3 text-right">Employees</th><th className="p-3 text-right">Gross</th><th className="p-3 text-right">Net payout</th><th className="p-3" />
++            </tr>
++          </thead>
++          <tbody>
++            {runs.length === 0 && <tr><td colSpan={7} className="p-6 text-center text-slate-500">No payroll runs yet.</td></tr>}
++            {runs.map((r) => {
++              const missing = r.lines.filter((l) => l.result == null).length;
++              return (
++                <tr key={r.id} className="border-t border-slate-100 dark:border-slate-800">
++                  <td className="p-3 font-medium">{monthLabel(ymOf(r.periodYear, r.periodMonth))}</td>
++                  <td className="p-3">{r.client.name}</td>
++                  <td className="p-3">
++                    <span className={`rounded-full px-2 py-0.5 text-xs ${r.status === 'FINALIZED' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>{r.status === 'FINALIZED' ? 'Finalized' : 'Draft'}</span>
++                    {missing > 0 && <span className="ml-2 text-xs text-red-600">{missing} without slab</span>}
++                  </td>
++                  <td className="p-3 text-right">{r.lines.length}</td>
++                  <td className="p-3 text-right">₹{rupees(r.lines.reduce((s, l) => s + l.gross, 0))}</td>
++                  <td className="p-3 text-right">₹{rupees(r.lines.reduce((s, l) => s + l.netTakeHome, 0))}</td>
++                  <td className="p-3 text-right"><Link href={`/payroll/runs/${r.id}`} className="text-primary hover:underline">Open</Link></td>
++                </tr>
++              );
++            })}
++          </tbody>
++        </table>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/app/(app)/payroll/runs/[id]/download/route.ts b/src/app/(app)/payroll/runs/[id]/download/route.ts
+new file mode 100644
+index 0000000..854b6b9
+--- /dev/null
++++ b/src/app/(app)/payroll/runs/[id]/download/route.ts
+@@ -0,0 +1,46 @@
++import { NextResponse } from 'next/server';
++import { auth } from '@/auth';
++import { can } from '@/lib/auth/can';
++import { prisma } from '@/lib/prisma';
++import { writeAuditLog } from '@/lib/smartoffice/audit';
++import { monthLabel } from '@/lib/reports/period';
++import type { PayrollConfig, PayrollResult } from '@/lib/payroll/engine';
++import { ymOf, type LineIdentity, type LineInputs } from '@/lib/payroll/service';
++import { buildPayoutWorkbook } from '@/lib/payroll/xlsx';
++
++export const dynamic = 'force-dynamic';
++export const maxDuration = 60;
++
++/** GET /payroll/runs/:id/download — the payout sheet as .xlsx. Admin only; every download is audit-logged. */
++export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
++  const session = await auth();
++  if (!session?.user) return NextResponse.json({ error: 'Sign in to download.' }, { status: 401 });
++  if (!can(session, 'payroll:manage', {})) return NextResponse.json({ error: 'Payroll is restricted to administrators.' }, { status: 403 });
++
++  const { id } = await params;
++  const run = await prisma.payrollRun.findUnique({ where: { id }, include: { client: { select: { name: true } }, lines: true } });
++  if (!run) return NextResponse.json({ error: 'Run not found.' }, { status: 404 });
++
++  const ym = ymOf(run.periodYear, run.periodMonth);
++  const title = `${run.client.name} — salary & compliance sheet — ${monthLabel(ym)}${run.status === 'DRAFT' ? ' (DRAFT)' : ''}`;
++  const buf = await buildPayoutWorkbook(
++    run.lines.map((l) => ({
++      identity: l.identity as unknown as LineIdentity,
++      inputs: l.inputs as unknown as LineInputs,
++      result: l.result as unknown as PayrollResult | null,
++    })),
++    run.configSnapshot as unknown as PayrollConfig,
++    title,
++  );
++
++  await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_SHEET_DOWNLOAD', targetType: 'PayrollRun', targetId: id, metadata: { ym, status: run.status } });
++
++  const safe = run.client.name.replace(/[^A-Za-z0-9]+/g, '_');
++  return new NextResponse(new Uint8Array(buf), {
++    headers: {
++      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
++      'Content-Disposition': `attachment; filename="Payroll_${safe}_${ym}${run.status === 'DRAFT' ? '_DRAFT' : ''}.xlsx"`,
++      'Cache-Control': 'no-store',
++    },
++  });
++}
+diff --git a/src/app/(app)/payroll/runs/[id]/page.tsx b/src/app/(app)/payroll/runs/[id]/page.tsx
+new file mode 100644
+index 0000000..a2f6e42
+--- /dev/null
++++ b/src/app/(app)/payroll/runs/[id]/page.tsx
+@@ -0,0 +1,149 @@
++import Link from 'next/link';
++import { notFound, redirect } from 'next/navigation';
++import { auth } from '@/auth';
++import { can } from '@/lib/auth/can';
++import { prisma } from '@/lib/prisma';
++import { monthLabel } from '@/lib/reports/period';
++import { ymOf, type LineIdentity, type LineInputs } from '@/lib/payroll/service';
++import type { PayrollResult } from '@/lib/payroll/engine';
++import { deleteDraftRunAction, finalizeRunAction, generateRunAction, saveLineAction } from '../../actions';
++import { Notice, btnCls, btnDangerCls, btnGhostCls, cardCls, one, rupees } from '../../_ui';
++
++export const dynamic = 'force-dynamic';
++
++const small = 'h-8 w-16 rounded border border-slate-300 bg-white px-1 text-right text-xs dark:border-slate-700 dark:bg-slate-900';
++
++export default async function PayrollRunPage({
++  params, searchParams,
++}: { params: Promise<{ id: string }>; searchParams: Promise<Record<string, string | string[] | undefined>> }) {
++  const session = await auth();
++  if (!session?.user) redirect('/login');
++  if (!can(session, 'payroll:manage', {})) redirect('/dashboard');
++  const { id } = await params;
++  const sp = await searchParams;
++
++  const run = await prisma.payrollRun.findUnique({
++    where: { id },
++    include: { client: { select: { name: true } }, lines: true },
++  });
++  if (!run) notFound();
++
++  const draft = run.status === 'DRAFT';
++  const ym = ymOf(run.periodYear, run.periodMonth);
++  const lines = run.lines
++    .map((l) => ({
++      id: l.id, warnings: l.warnings,
++      identity: l.identity as unknown as LineIdentity,
++      inputs: l.inputs as unknown as LineInputs,
++      result: l.result as unknown as PayrollResult | null,
++    }))
++    .sort((a, b) => a.identity.storeName.localeCompare(b.identity.storeName) || a.identity.staffCode.localeCompare(b.identity.staffCode));
++
++  const sum = (f: (r: PayrollResult) => number) => lines.reduce((s, l) => s + (l.result ? f(l.result) : 0), 0);
++  const noSlab = lines.filter((l) => !l.result).length;
++  const warned = lines.filter((l) => l.warnings.length > 0 && l.result).length;
++  const cards: [string, string][] = [
++    ['Employees', String(lines.length)],
++    ['Gross', `₹${rupees(sum((r) => r.gross))}`],
++    ['Net payout', `₹${rupees(sum((r) => r.netTakeHome))}`],
++    ['Employer cost (CTC)', `₹${rupees(sum((r) => r.fixedCtc))}`],
++    ['Total PF', `₹${rupees(sum((r) => r.totalPf))}`],
++    ['Total ESIC', `₹${rupees(sum((r) => r.totalEsic))}`],
++  ];
++
++  return (
++    <div className="container mx-auto space-y-5 px-4 py-6">
++      <div className="flex flex-wrap items-end justify-between gap-3">
++        <div>
++          <Link href="/payroll" className="text-sm text-primary hover:underline">← All runs</Link>
++          <h1 className="text-2xl font-bold tracking-tight">{run.client.name} — {monthLabel(ym)}</h1>
++          <p className="text-sm text-muted-foreground">
++            {draft ? 'Draft — attendance can be re-pulled and inputs edited.' : `Finalized ${run.finalizedAt ? run.finalizedAt.toLocaleDateString('en-IN') : ''} — locked.`}
++          </p>
++        </div>
++        <div className="flex flex-wrap gap-2">
++          <a href={`/payroll/runs/${run.id}/download`} className={btnCls}>Download payout sheet (Excel)</a>
++          {draft && (
++            <form action={generateRunAction}>
++              <input type="hidden" name="clientId" value={run.clientId} /><input type="hidden" name="month" value={ym} /><input type="hidden" name="returnTo" value={`/payroll/runs/${run.id}`} />
++              <button className={btnGhostCls} type="submit">Re-pull attendance &amp; slabs</button>
++            </form>
++          )}
++        </div>
++      </div>
++
++      <Notice error={one(sp.error)} ok={one(sp.ok)} />
++
++      <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
++        {cards.map(([k, v]) => (
++          <div key={k} className={cardCls}><div className="text-xs text-slate-500">{k}</div><div className="text-lg font-semibold">{v}</div></div>
++        ))}
++      </div>
++      {(noSlab > 0 || warned > 0) && (
++        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
++          {noSlab > 0 && <div><b>{noSlab}</b> employee(s) have no salary slab and are paid 0 — assign slabs in <Link className="underline" href={`/payroll/setup?clientId=${run.clientId}`}>Payroll setup</Link>, then re-pull.</div>}
++          {warned > 0 && <div><b>{warned}</b> employee(s) have attendance warnings (hover the ⚠ on their row).</div>}
++        </div>
++      )}
++
++      <div className={`${cardCls} overflow-x-auto p-0`}>
++        <table className="w-full text-xs">
++          <thead className="bg-slate-50 text-left uppercase text-slate-500 dark:bg-slate-900">
++            <tr>
++              <th className="p-2">Employee</th><th className="p-2">Slab</th>
++              <th className="p-2 text-right">Pres.</th><th className="p-2 text-right">WO</th><th className="p-2 text-right">Half</th><th className="p-2 text-right">Abs.</th><th className="p-2 text-right">Paid days</th>
++              {draft && (<><th className="p-2">Bonus d.</th><th className="p-2">OT d.</th><th className="p-2">OT hrs</th><th className="p-2">PT</th><th className="p-2">LWF</th><th className="p-2" /></>)}
++              <th className="p-2 text-right">Gross</th><th className="p-2 text-right">Incl. bonus</th><th className="p-2 text-right">PF+ESIC (emp.)</th><th className="p-2 text-right">Net</th>
++            </tr>
++          </thead>
++          <tbody>
++            {lines.map((l) => {
++              const a = l.inputs.attendance;
++              const m = l.inputs.manual;
++              const r = l.result;
++              const form = `line-${l.id}`;
++              return (
++                <tr key={l.id} className={`border-t border-slate-100 dark:border-slate-800 ${r ? '' : 'bg-red-50 dark:bg-red-950'}`}>
++                  <td className="p-2">
++                    <div className="font-medium">{l.identity.name} {l.warnings.length > 0 && <span title={l.warnings.join('\n')} className="cursor-help">⚠</span>}</div>
++                    <div className="text-slate-500">{l.identity.staffCode} · {l.identity.storeName} · {l.identity.designation.replace(/_/g, ' ')}</div>
++                  </td>
++                  <td className="p-2">{l.inputs.slab ? `${l.inputs.slab.name}${l.inputs.slab.source === 'DEFAULT' ? ' (default)' : ''}` : <span className="text-red-600">No slab</span>}</td>
++                  <td className="p-2 text-right">{a.presentDays}</td><td className="p-2 text-right">{a.weekOffDays}</td><td className="p-2 text-right">{a.halfDays}</td><td className="p-2 text-right">{a.absentDays}</td>
++                  <td className="p-2 text-right">{r?.salariedDays ?? '—'}</td>
++                  {draft && (
++                    <>
++                      <td className="p-2"><input form={form} name="bonusDays" type="number" step="0.5" min="0" defaultValue={m.bonusDays} className={small} /></td>
++                      <td className="p-2"><input form={form} name="otFullDays" type="number" step="0.5" min="0" defaultValue={m.otFullDays} className={small} /></td>
++                      <td className="p-2"><input form={form} name="otHours" type="number" step="0.25" min="0" defaultValue={m.otHours ?? ''} placeholder={String(a.otHours)} className={small} /></td>
++                      <td className="p-2"><input form={form} name="pt" type="number" min="0" defaultValue={m.pt ?? ''} placeholder="auto" className={small} /><input form={form} name="insurance" type="hidden" value={m.insurance ?? ''} /></td>
++                      <td className="p-2"><input form={form} name="lwf" type="number" min="0" defaultValue={m.lwf ?? ''} placeholder="auto" className={small} /></td>
++                      <td className="p-2">
++                        <form id={form} action={saveLineAction}><input type="hidden" name="lineId" value={l.id} /><button className={btnGhostCls} type="submit">Save</button></form>
++                      </td>
++                    </>
++                  )}
++                  <td className="p-2 text-right">{rupees(r?.gross)}</td><td className="p-2 text-right">{rupees(r?.bonusPay)}</td>
++                  <td className="p-2 text-right">{r ? rupees(r.pfEmployee + r.esicEmployee) : '—'}</td>
++                  <td className="p-2 text-right font-semibold">{rupees(r?.netTakeHome)}</td>
++                </tr>
++              );
++            })}
++          </tbody>
++        </table>
++      </div>
++
++      {draft && (
++        <div className={`${cardCls} flex flex-wrap items-end justify-between gap-4`}>
++          <form action={finalizeRunAction} className="flex flex-wrap items-center gap-3">
++            <input type="hidden" name="runId" value={run.id} />
++            {noSlab > 0 && <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="confirmNoSlab" /> Finalize anyway ({noSlab} without slab are paid 0)</label>}
++            <button className={btnCls} type="submit">Finalize &amp; lock this month</button>
++            <span className="text-xs text-slate-500">Only possible after the month&apos;s last day. A finalized run never changes, even if slabs or rates are edited later.</span>
++          </form>
++          <form action={deleteDraftRunAction}><input type="hidden" name="runId" value={run.id} /><button className={btnDangerCls} type="submit">Delete draft</button></form>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/src/app/(app)/payroll/setup/page.tsx b/src/app/(app)/payroll/setup/page.tsx
+new file mode 100644
+index 0000000..8b5d67b
+--- /dev/null
++++ b/src/app/(app)/payroll/setup/page.tsx
+@@ -0,0 +1,231 @@
++import Link from 'next/link';
++import { redirect } from 'next/navigation';
++import { Designation } from '@prisma/client';
++import { auth } from '@/auth';
++import { can } from '@/lib/auth/can';
++import { prisma } from '@/lib/prisma';
++import { configFromRow } from '@/lib/payroll/service';
++import {
++  archiveSlabAction, assignSlabAction, saveConfigAction, saveEmployeeIdsAction, saveSlabAction,
++} from '../actions';
++import { Field, Notice, btnCls, btnDangerCls, btnGhostCls, cardCls, inputCls, one, rupees } from '../_ui';
++
++export const metadata = { title: 'Payroll setup | HRMS Platform' };
++export const dynamic = 'force-dynamic';
++
++const DESIGNATIONS = Object.values(Designation);
++const label = (d: string) => d.replace(/_/g, ' ');
++const EMP_LIMIT = 300;
++
++export default async function PayrollSetup({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
++  const session = await auth();
++  if (!session?.user) redirect('/login');
++  if (!can(session, 'payroll:manage', {})) redirect('/dashboard');
++  const sp = await searchParams;
++
++  const clients = await prisma.client.findMany({ orderBy: { name: 'asc' }, select: { id: true, name: true } });
++  const clientId = one(sp.clientId) ?? '';
++  const client = clients.find((c) => c.id === clientId);
++  const msg = <Notice error={one(sp.error)} ok={one(sp.ok)} />;
++
++  const header = (
++    <div className="flex flex-wrap items-end justify-between gap-3">
++      <div>
++        <h1 className="text-2xl font-bold tracking-tight">Payroll setup</h1>
++        <p className="text-sm text-muted-foreground">Compliance rates, salary slabs and who gets which slab — per client.</p>
++      </div>
++      <Link href="/payroll" className={btnGhostCls}>← Payroll runs</Link>
++    </div>
++  );
++
++  const picker = (
++    <form className={`${cardCls} flex flex-wrap items-end gap-3`}>
++      <Field label="Client">
++        <select name="clientId" defaultValue={clientId} className={inputCls}>
++          <option value="">Select client…</option>
++          {clients.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
++        </select>
++      </Field>
++      <button className={btnCls} type="submit">Open</button>
++    </form>
++  );
++
++  if (!client) {
++    return <div className="container mx-auto space-y-6 px-4 py-6">{header}{msg}{picker}</div>;
++  }
++
++  const desigFilter = one(sp.designation) && DESIGNATIONS.includes(one(sp.designation) as Designation) ? (one(sp.designation) as Designation) : undefined;
++  const q = (one(sp.q) ?? '').trim();
++  const editId = one(sp.edit);
++
++  const [cfgRow, slabs, employees, empTotal] = await Promise.all([
++    prisma.clientPayrollConfig.findUnique({ where: { clientId } }),
++    prisma.salarySlab.findMany({ where: { clientId, isActive: true }, orderBy: [{ designation: 'asc' }, { name: 'asc' }], include: { _count: { select: { assignments: true } } } }),
++    prisma.employee.findMany({
++      where: {
++        store: { clientId }, status: 'ACTIVE', ...(desigFilter ? { designation: desigFilter } : {}),
++        ...(q ? { OR: [{ name: { contains: q, mode: 'insensitive' } }, { staffCode: { contains: q } }] } : {}),
++      },
++      include: { store: { select: { name: true } }, salaryAssignment: true },
++      orderBy: [{ store: { name: 'asc' } }, { name: 'asc' }],
++      take: EMP_LIMIT,
++    }),
++    prisma.employee.count({ where: { store: { clientId }, status: 'ACTIVE', ...(desigFilter ? { designation: desigFilter } : {}), ...(q ? { OR: [{ name: { contains: q, mode: 'insensitive' } }, { staffCode: { contains: q } }] } : {}) } }),
++  ]);
++  const cfg = configFromRow(cfgRow);
++  const editing = editId ? slabs.find((s) => s.id === editId) : undefined;
++  const defaultBy = new Map(slabs.filter((s) => s.isDefault).map((s) => [s.designation, s]));
++  const slabById = new Map(slabs.map((s) => [s.id, s]));
++  const here = `/payroll/setup?clientId=${clientId}${desigFilter ? `&designation=${desigFilter}` : ''}${q ? `&q=${encodeURIComponent(q)}` : ''}`;
++
++  return (
++    <div className="container mx-auto space-y-6 px-4 py-6">
++      {header}
++      {msg}
++      {picker}
++      <h2 className="text-lg font-semibold">{client.name}</h2>
++
++      {/* ── Compliance settings ── */}
++      <form action={saveConfigAction} className={`${cardCls} space-y-4`}>
++        <input type="hidden" name="clientId" value={clientId} />
++        <div>
++          <h3 className="font-semibold">Compliance settings</h3>
++          <p className="text-xs text-slate-500">Percentages are plain numbers (12 = 12 %). PF and ESIC are worked out on prorated basic + special allowance only — never on overtime, bonus, HRA or travelling allowance. Check these with your compliance advisor — they decide every employee&apos;s PF and ESIC.</p>
++        </div>
++        <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
++          <Field label="PF – employee %"><input name="pfEmployeePct" type="number" step="0.01" defaultValue={cfg.pfEmployeePct} className={inputCls} /></Field>
++          <Field label="PF – employer %"><input name="pfEmployerPct" type="number" step="0.01" defaultValue={cfg.pfEmployerPct} className={inputCls} /></Field>
++          <Field label="PF admin charges %"><input name="pfAdminPct" type="number" step="0.01" defaultValue={cfg.pfAdminPct} className={inputCls} /></Field>
++          <Field label="PF wage ceiling ₹" hint="Blank = PF on full basic"><input name="pfWageCeiling" type="number" defaultValue={cfg.pfWageCeiling ?? ''} className={inputCls} /></Field>
++          <Field label="ESIC – employee %"><input name="esicEmployeePct" type="number" step="0.01" defaultValue={cfg.esicEmployeePct} className={inputCls} /></Field>
++          <Field label="ESIC – employer %"><input name="esicEmployerPct" type="number" step="0.01" defaultValue={cfg.esicEmployerPct} className={inputCls} /></Field>
++          <Field label="ESIC applies if basic + special ≤ ₹"><input name="esicGrossLimit" type="number" defaultValue={cfg.esicGrossLimit} className={inputCls} /></Field>
++          <Field label="PF & ESIC calculated on"><div className="flex h-9 items-center text-sm font-medium">Basic + special allowance</div></Field>
++          <Field label="Insurance ₹/month"><input name="insurance" type="number" defaultValue={cfg.insurance} className={inputCls} /></Field>
++          <Field label="Professional tax ₹/month"><input name="pt" type="number" defaultValue={cfg.pt} className={inputCls} /></Field>
++          <Field label="LWF ₹/month"><input name="lwf" type="number" defaultValue={cfg.lwf} className={inputCls} /></Field>
++        </div>
++        <button className={btnCls} type="submit">Save settings</button>
++      </form>
++
++      {/* ── Slabs ── */}
++      <div className={`${cardCls} space-y-4`}>
++        <div>
++          <h3 className="font-semibold">Salary slabs</h3>
++          <p className="text-xs text-slate-500">Monthly fixed amounts. Mark one slab per designation as the <b>client default</b> (use it for Associates: everyone gets it). Other designations are assigned person by person below.</p>
++        </div>
++        <div className="overflow-x-auto">
++          <table className="w-full text-sm">
++            <thead className="text-left text-xs uppercase text-slate-500">
++              <tr><th className="p-2">Designation</th><th className="p-2">Slab</th><th className="p-2 text-right">Basic</th><th className="p-2 text-right">HRA</th><th className="p-2 text-right">Special</th><th className="p-2 text-right">Travel</th><th className="p-2">OT day / hr</th><th className="p-2">Bonus day</th><th className="p-2">Used by</th><th className="p-2" /></tr>
++            </thead>
++            <tbody>
++              {slabs.length === 0 && <tr><td colSpan={10} className="p-4 text-center text-slate-500">No slabs yet — add one below.</td></tr>}
++              {slabs.map((s) => (
++                <tr key={s.id} className="border-t border-slate-100 dark:border-slate-800">
++                  <td className="p-2">{label(s.designation)}</td>
++                  <td className="p-2 font-medium">{s.name}{s.isDefault && <span className="ml-2 rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800">client default</span>}</td>
++                  <td className="p-2 text-right">{rupees(s.basic)}</td><td className="p-2 text-right">{rupees(s.hra)}</td>
++                  <td className="p-2 text-right">{rupees(s.specialAllowance)}</td><td className="p-2 text-right">{rupees(s.travellingAllowance)}</td>
++                  <td className="p-2">{s.otDayRate ?? 'auto'} / {s.otHourRate ?? 'auto'}</td><td className="p-2">{s.bonusDayRate ?? 'auto'}</td>
++                  <td className="p-2">{s.isDefault ? 'all unassigned' : `${s._count.assignments} assigned`}</td>
++                  <td className="flex gap-2 p-2">
++                    <Link href={`/payroll/setup?clientId=${clientId}&edit=${s.id}#slab-form`} className={btnGhostCls}>Edit</Link>
++                    <form action={archiveSlabAction}><input type="hidden" name="id" value={s.id} /><button className={btnDangerCls} type="submit">Archive</button></form>
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++
++        <form id="slab-form" action={saveSlabAction} key={editing?.id ?? 'new'} className="space-y-3 border-t border-slate-100 pt-4 dark:border-slate-800">
++          <input type="hidden" name="clientId" value={clientId} />
++          <input type="hidden" name="id" value={editing?.id ?? ''} />
++          <h4 className="text-sm font-semibold">{editing ? `Edit slab: ${editing.name}` : 'Add a slab'}</h4>
++          <div className="grid gap-3 sm:grid-cols-4 lg:grid-cols-8">
++            <Field label="Designation">
++              <select name="designation" required defaultValue={editing?.designation ?? 'ASSOCIATE'} className={inputCls}>
++                {DESIGNATIONS.map((d) => <option key={d} value={d}>{label(d)}</option>)}
++              </select>
++            </Field>
++            <Field label="Slab name"><input name="name" required defaultValue={editing?.name ?? ''} placeholder="e.g. Manager – A" className={inputCls} /></Field>
++            <Field label="Basic ₹"><input name="basic" type="number" required defaultValue={editing?.basic ?? ''} className={inputCls} /></Field>
++            <Field label="HRA ₹"><input name="hra" type="number" required defaultValue={editing?.hra ?? 0} className={inputCls} /></Field>
++            <Field label="Special allowance ₹"><input name="specialAllowance" type="number" defaultValue={editing?.specialAllowance ?? 0} className={inputCls} /></Field>
++            <Field label="Travelling allowance ₹"><input name="travellingAllowance" type="number" defaultValue={editing?.travellingAllowance ?? 0} className={inputCls} /></Field>
++            <Field label="OT ₹/day" hint="Blank = auto"><input name="otDayRate" type="number" defaultValue={editing?.otDayRate ?? ''} className={inputCls} /></Field>
++            <Field label="OT ₹/hour" hint="Blank = auto"><input name="otHourRate" type="number" defaultValue={editing?.otHourRate ?? ''} className={inputCls} /></Field>
++            <Field label="Bonus ₹/day" hint="Blank = auto"><input name="bonusDayRate" type="number" defaultValue={editing?.bonusDayRate ?? ''} className={inputCls} /></Field>
++          </div>
++          <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="isDefault" defaultChecked={editing?.isDefault ?? false} /> Client default for this designation (everyone of this designation without a personal slab)</label>
++          <div className="flex gap-2">
++            <button className={btnCls} type="submit">{editing ? 'Save changes' : 'Add slab'}</button>
++            {editing && <Link href={`/payroll/setup?clientId=${clientId}`} className={btnGhostCls}>Cancel</Link>}
++          </div>
++        </form>
++      </div>
++
++      {/* ── Employees ── */}
++      <div className={`${cardCls} space-y-4`}>
++        <div>
++          <h3 className="font-semibold">Employee pay assignments &amp; payroll IDs</h3>
++          <p className="text-xs text-slate-500">Assign a personal slab to Store Managers, Shift Incharges, Process/Quality Associates and Housekeeping. Anyone without one gets their designation&apos;s client default. Showing {employees.length} of {empTotal} active employees.</p>
++        </div>
++        <form className="flex flex-wrap items-end gap-3">
++          <input type="hidden" name="clientId" value={clientId} />
++          <Field label="Designation">
++            <select name="designation" defaultValue={desigFilter ?? ''} className={inputCls}>
++              <option value="">All</option>
++              {DESIGNATIONS.map((d) => <option key={d} value={d}>{label(d)}</option>)}
++            </select>
++          </Field>
++          <Field label="Name or e-code"><input name="q" defaultValue={q} className={inputCls} /></Field>
++          <button className={btnGhostCls} type="submit">Filter</button>
++        </form>
++        <div className="overflow-x-auto">
++          <table className="w-full text-sm">
++            <thead className="text-left text-xs uppercase text-slate-500">
++              <tr><th className="p-2">Employee</th><th className="p-2">Designation</th><th className="p-2">Pay slab</th><th className="p-2">Father name / UAN / ESIC no. / bank a/c / IFSC</th></tr>
++            </thead>
++            <tbody>
++              {employees.map((e) => {
++                const assigned = e.salaryAssignment ? slabById.get(e.salaryAssignment.slabId) : undefined;
++                const fallback = defaultBy.get(e.designation);
++                const options = slabs.filter((s) => s.designation === e.designation);
++                return (
++                  <tr key={e.id} className="border-t border-slate-100 align-top dark:border-slate-800">
++                    <td className="p-2"><div className="font-medium">{e.name}</div><div className="text-xs text-slate-500">{e.staffCode} · {e.store.name}</div></td>
++                    <td className="p-2">{label(e.designation)}</td>
++                    <td className="p-2">
++                      <form action={assignSlabAction} className="flex items-center gap-2">
++                        <input type="hidden" name="employeeId" value={e.id} /><input type="hidden" name="returnTo" value={here} />
++                        <select name="slabId" defaultValue={assigned?.id ?? ''} className={`${inputCls} min-w-40`}>
++                          <option value="">{fallback ? `Client default (${fallback.name})` : 'No slab'}</option>
++                          {options.map((s) => <option key={s.id} value={s.id}>{s.name} — ₹{rupees(s.basic + s.hra + s.specialAllowance + s.travellingAllowance)}</option>)}
++                        </select>
++                        <button className={btnGhostCls} type="submit">Set</button>
++                      </form>
++                      {!assigned && !fallback && <div className="mt-1 text-xs text-red-600">Not paid until a slab exists</div>}
++                    </td>
++                    <td className="p-2">
++                      <form action={saveEmployeeIdsAction} className="flex flex-wrap items-center gap-2">
++                        <input type="hidden" name="employeeId" value={e.id} /><input type="hidden" name="returnTo" value={here} />
++                        <input name="fatherName" defaultValue={e.fatherName ?? ''} placeholder="Father name" className={`${inputCls} w-36`} />
++                        <input name="uan" defaultValue={e.uan ?? ''} placeholder="UAN (12)" inputMode="numeric" className={`${inputCls} w-32`} />
++                        <input name="esicNumber" defaultValue={e.esicNumber ?? ''} placeholder="ESIC no." inputMode="numeric" className={`${inputCls} w-32`} />
++                        <input name="bankAccountNumber" defaultValue={e.bankAccountNumber ?? ''} placeholder="Bank a/c no." inputMode="numeric" autoComplete="off" className={`${inputCls} w-40`} />
++                        <input name="ifscCode" defaultValue={e.ifscCode ?? ''} placeholder="IFSC" maxLength={11} autoComplete="off" className={`${inputCls} w-28 uppercase`} />
++                        <button className={btnGhostCls} type="submit">Save</button>
++                      </form>
++                    </td>
++                  </tr>
++                );
++              })}
++            </tbody>
++          </table>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/lib/audit/catalog.ts b/src/lib/audit/catalog.ts
+index 437158d..3d93abf 100644
+--- a/src/lib/audit/catalog.ts
++++ b/src/lib/audit/catalog.ts
+@@ -2,7 +2,7 @@
+ // Adding a new writeAuditLog({ action }) call? Add it here too, or it shows
+ // up as a generic "system" event.
+ 
+-export type AuditCategory = 'Employees' | 'Stores & Clients' | 'Devices' | 'Attendance' | 'Users' | 'System';
++export type AuditCategory = 'Employees' | 'Stores & Clients' | 'Devices' | 'Attendance' | 'Users' | 'Payroll' | 'System';
+ export type AuditSeverity = 'info' | 'notice' | 'critical';
+ 
+ interface ActionMeta {
+@@ -24,6 +24,17 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
+   FORM_SUBMISSION_DISMISSED: { label: 'Unmatched form submission dismissed', category: 'System', severity: 'info', adminOnly: true },
+   FORM_REMINDER_SENT: { label: 'Onboarding form reminder sent', category: 'Employees', severity: 'info' },
+ 
++  PAYROLL_CONFIG_UPDATE: { label: 'Payroll settings updated', category: 'Payroll', severity: 'notice', adminOnly: true },
++  SALARY_SLAB_SAVE: { label: 'Salary slab saved', category: 'Payroll', severity: 'notice', adminOnly: true },
++  SALARY_SLAB_ARCHIVE: { label: 'Salary slab archived', category: 'Payroll', severity: 'notice', adminOnly: true },
++  SALARY_ASSIGN: { label: 'Salary slab assigned to employee', category: 'Payroll', severity: 'notice', adminOnly: true },
++  PAYROLL_IDS_UPDATE: { label: 'Employee payroll IDs updated', category: 'Payroll', severity: 'info', adminOnly: true },
++  PAYROLL_RUN_GENERATE: { label: 'Payroll run generated / refreshed', category: 'Payroll', severity: 'notice', adminOnly: true },
++  PAYROLL_LINE_EDIT: { label: 'Payroll line edited', category: 'Payroll', severity: 'info', adminOnly: true },
++  PAYROLL_RUN_FINALIZE: { label: 'Payroll run finalized', category: 'Payroll', severity: 'critical', adminOnly: true },
++  PAYROLL_RUN_DELETE: { label: 'Draft payroll run deleted', category: 'Payroll', severity: 'notice', adminOnly: true },
++  PAYROLL_SHEET_DOWNLOAD: { label: 'Payroll sheet downloaded', category: 'Payroll', severity: 'info', adminOnly: true },
++
+   CLIENT_CREATE: { label: 'Client created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
+   CLIENT_GOOGLE_FORM_UPDATE: { label: 'Onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
+   STORE_GOOGLE_FORM_UPDATE: { label: 'Store onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
+@@ -82,7 +93,7 @@ export function criticalActions(): string[] {
+   return Object.entries(AUDIT_ACTIONS).filter(([, m]) => m.severity === 'critical').map(([k]) => k);
+ }
+ 
+-export const AUDIT_CATEGORIES: AuditCategory[] = ['Employees', 'Stores & Clients', 'Devices', 'Attendance', 'Users', 'System'];
++export const AUDIT_CATEGORIES: AuditCategory[] = ['Employees', 'Stores & Clients', 'Devices', 'Attendance', 'Users', 'Payroll', 'System'];
+ 
+ /** One-line human summary of an audit row's metadata. Never dumps raw JSON. */
+ export function summarizeMetadata(action: string, raw: unknown): string {
+diff --git a/src/lib/auth/can.ts b/src/lib/auth/can.ts
+index c978d7a..e4d3a31 100644
+--- a/src/lib/auth/can.ts
++++ b/src/lib/auth/can.ts
+@@ -34,7 +34,8 @@ export type Action =
+   | 'formTracking:remind'
+   | 'formSubmissions:manage'
+   | 'onboardingForm:editClient'
+-  | 'onboardingForm:editStore';
++  | 'onboardingForm:editStore'
++  | 'payroll:manage';
+ 
+ /**
+  * Roles allowed to change onboarding Google Form links. Admin only for now.
+@@ -124,6 +125,11 @@ export function can(
+         default: return false;
+       }
+ 
++    // Salary engine: slabs, assignments, payroll runs and payout sheets. Admin only for now.
++    // To open it to CLIENT later, add `case 'CLIENT': return inClient(ctx.clientId);`.
++    case 'payroll:manage':
++      return role === 'ADMIN';
++
+     // Attendance reports (view + download). Office roles: Admin sees everything, Client sees their
+     // own client's stores. Among ground (store-level) staff ONLY the Manager can see reports, and
+     // only their own store — Shift Incharge and Process Associate are deliberately excluded for now.
+diff --git a/src/lib/payroll/attendance.ts b/src/lib/payroll/attendance.ts
+new file mode 100644
+index 0000000..4a88a50
+--- /dev/null
++++ b/src/lib/payroll/attendance.ts
+@@ -0,0 +1,63 @@
++import type { DayRecord, MonthlyOt } from '@/lib/reports/types';
++
++/** What the attendance data says about one employee for one payroll month. */
++export interface AttendanceSummary {
++  presentDays: number;
++  /** Week-offs + paid holidays. */
++  weekOffDays: number;
++  halfDays: number;
++  /** Absent, on leave, no punch, not recorded — all unpaid (see warnings). */
++  absentDays: number;
++  /** Recorded OT (monthly payroll total wins over summed daily entries — same rule as the reports). */
++  otHours: number;
++  noPunchDays: number;
++  notRecordedDays: number;
++  autoClosedShifts: number;
++  /** Days that have a record at all; < days in month means part of the month has no data. */
++  recordedDays: number;
++}
++
++const blank = (): AttendanceSummary => ({
++  presentDays: 0, weekOffDays: 0, halfDays: 0, absentDays: 0, otHours: 0,
++  noPunchDays: 0, notRecordedDays: 0, autoClosedShifts: 0, recordedDays: 0,
++});
++
++/**
++ * ASSUMPTION (policy, easy to change here): PRESENT, HALF_DAY, WEEK_OFF and HOLIDAY are paid;
++ * ABSENT, ON_LEAVE, NO_PUNCH and NOT_RECORDED are unpaid. NO_PUNCH / NOT_RECORDED are surfaced
++ * as warnings on the payroll line so a person is never silently docked pay for missing data.
++ */
++export function summariseAttendance(
++  records: DayRecord[],
++  monthlyOt: MonthlyOt,
++  yearMonth: string,
++): Map<string, AttendanceSummary> {
++  const byEmployee = new Map<string, AttendanceSummary>();
++  const dailyOt = new Map<string, number>();
++
++  for (const r of records) {
++    if (r.date.slice(0, 7) !== yearMonth) continue;
++    const s = byEmployee.get(r.employeeId) ?? blank();
++    s.recordedDays += 1;
++    switch (r.status) {
++      case 'PRESENT': s.presentDays += 1; break;
++      case 'HALF_DAY': s.halfDays += 1; break;
++      case 'WEEK_OFF':
++      case 'HOLIDAY': s.weekOffDays += 1; break;
++      case 'NO_PUNCH': s.noPunchDays += 1; s.absentDays += 1; break;
++      case 'NOT_RECORDED': s.notRecordedDays += 1; s.absentDays += 1; break;
++      default: s.absentDays += 1; // ABSENT, ON_LEAVE
++    }
++    if (r.notes.includes('NO_CHECKOUT')) s.autoClosedShifts += 1;
++    dailyOt.set(r.employeeId, (dailyOt.get(r.employeeId) ?? 0) + (r.otHours || 0));
++    byEmployee.set(r.employeeId, s);
++  }
++
++  for (const [employeeId, s] of byEmployee) {
++    const monthly = monthlyOt.get(`${employeeId}|${yearMonth}`);
++    s.otHours = monthly ?? dailyOt.get(employeeId) ?? 0;
++  }
++  return byEmployee;
++}
++
++export const emptyAttendance = blank;
+diff --git a/src/lib/payroll/engine.test.ts b/src/lib/payroll/engine.test.ts
+new file mode 100644
+index 0000000..e17b5f4
+--- /dev/null
++++ b/src/lib/payroll/engine.test.ts
+@@ -0,0 +1,85 @@
++// Run with: npm run test:payroll
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++import { calculatePayroll, DEFAULT_PAYROLL_CONFIG, type SlabAmounts } from './engine';
++
++const slab: SlabAmounts = {
++  basic: 15000, hra: 3568, specialAllowance: 0, travellingAllowance: 0,
++  otDayRate: null, otHourRate: null, bonusDayRate: 537,
++};
++const att = { presentDays: 27, weekOffDays: 4, halfDays: 0, absentDays: 0, otFullDays: 0, otHours: 0, bonusDays: 1 };
++
++test('reproduces the client sample payout row (bonus pay inside gross; CTC and net unchanged)', () => {
++  const r = calculatePayroll(slab, DEFAULT_PAYROLL_CONFIG, att, { daysInMonth: 31, shiftHours: 9 });
++  assert.equal(r.salariedDays, 31);
++  assert.equal(r.basic, 15000);
++  assert.equal(r.hra, 3568);
++  assert.equal(r.bonusPay, 537);
++  assert.equal(r.gross, 19105); // bonus pay (537) is part of gross
++  assert.equal(r.salariedDays, 31);
++  assert.equal(r.pfEmployer, 1800);
++  assert.equal(r.esicEmployer, 488);
++  assert.equal(r.pfAdmin, 150);
++  assert.equal(r.totalEmployer, 2438);
++  assert.equal(r.fixedCtc, 21543);
++  assert.equal(r.pfEmployee, 1800);
++  assert.equal(r.esicEmployee, 113);
++  assert.equal(r.totalDeduction, 1913);
++  assert.equal(r.netTakeHome, 17192);
++  assert.equal(r.totalPf, 3750);
++  assert.equal(r.totalEsic, 601);
++});
++
++test('prorates basic and HRA by salaried days', () => {
++  const r = calculatePayroll(slab, DEFAULT_PAYROLL_CONFIG, { ...att, presentDays: 12, weekOffDays: 3, bonusDays: 0 }, { daysInMonth: 30, shiftHours: 9 });
++  assert.equal(r.salariedDays, 15);
++  assert.equal(r.basic, 7500);
++  assert.equal(r.hra, 1784);
++});
++
++test('ESIC stops above the wage limit; PF stays capped at the ceiling', () => {
++  const rich: SlabAmounts = { ...slab, basic: 20000, hra: 5000, specialAllowance: 1500 }; // wages 21,500 > 21,000
++  const r = calculatePayroll(rich, DEFAULT_PAYROLL_CONFIG, { ...att, bonusDays: 0 }, { daysInMonth: 31, shiftHours: 9 });
++  assert.equal(r.esicApplicable, false);
++  assert.equal(r.esicEmployee + r.esicEmployer, 0);
++  assert.equal(r.pfEmployee, 1800);
++});
++
++test('a person with no paid days gets no flat charges', () => {
++  const cfg = { ...DEFAULT_PAYROLL_CONFIG, pt: 200, insurance: 50 };
++  const r = calculatePayroll(slab, cfg, { ...att, presentDays: 0, weekOffDays: 0, bonusDays: 0 }, { daysInMonth: 31, shiftHours: 9 });
++  assert.equal(r.netTakeHome, 0);
++  assert.equal(r.pt, 0);
++});
++
++test('PF and ESIC use prorated basic + special allowance only; OT, bonus, HRA and travel are out', () => {
++  const s: SlabAmounts = { basic: 10000, hra: 4000, specialAllowance: 2000, travellingAllowance: 1500, otDayRate: 700, otHourRate: 80, bonusDayRate: 600 };
++  const a = { presentDays: 26, weekOffDays: 4, halfDays: 0, absentDays: 0, otFullDays: 2, otHours: 5, bonusDays: 2 };
++  const r = calculatePayroll(s, DEFAULT_PAYROLL_CONFIG, a, { daysInMonth: 30, shiftHours: 9 });
++  assert.equal(r.overtime, 1800);       // 2×700 + 5×80
++  assert.equal(r.bonusPay, 1200);       // 2×600
++  assert.equal(r.gross, 10000 + 4000 + 2000 + 1500 + 1800 + 1200);
++  assert.equal(r.pfEmployee, 1440);     // 12 % × 12,000
++  assert.equal(r.pfEmployer, 1440);
++  assert.equal(r.pfAdmin, 120);         // 1 % × 12,000
++  assert.equal(r.esicEmployee, 90);     // 0.75 % × 12,000
++  assert.equal(r.esicEmployer, 390);    // 3.25 % × 12,000
++});
++
++test('PF wage is capped at the ceiling after adding special allowance', () => {
++  const s: SlabAmounts = { basic: 14000, hra: 0, specialAllowance: 3000, travellingAllowance: 0, otDayRate: null, otHourRate: null, bonusDayRate: null };
++  const r = calculatePayroll(s, DEFAULT_PAYROLL_CONFIG, { ...att, bonusDays: 0 }, { daysInMonth: 31, shiftHours: 9 });
++  assert.equal(r.pfEmployee, 1800);     // 12 % × 15,000 ceiling, not × 17,000
++  assert.equal(r.esicApplicable, true); // 17,000 ≤ 21,000
++  assert.equal(r.esicEmployee, 128);    // 0.75 % × 17,000 = 127.5
++});
++
++test('ESIC eligibility is tested on basic + special allowance, not on gross, OT or bonus', () => {
++  const s: SlabAmounts = { basic: 15000, hra: 6000, specialAllowance: 0, travellingAllowance: 0, otDayRate: 900, otHourRate: null, bonusDayRate: 900 };
++  const r = calculatePayroll(s, DEFAULT_PAYROLL_CONFIG, { ...att, otFullDays: 3, bonusDays: 2 }, { daysInMonth: 31, shiftHours: 9 });
++  assert.ok(r.gross > 21000);           // 21,000 fixed + overtime + bonus
++  assert.equal(r.esicApplicable, true); // wages are only 15,000
++  assert.equal(r.esicEmployer, 488);
++  const above: SlabAmounts = { ...s, basic: 20000, specialAllowance: 1500 };
++  assert.equal(calculatePayroll(above, DEFAULT_PAYROLL_CONFIG, att, { daysInMonth: 31, shiftHours: 9 }).esicApplicable, false);
++});
+diff --git a/src/lib/payroll/engine.ts b/src/lib/payroll/engine.ts
+new file mode 100644
+index 0000000..9fcd51a
+--- /dev/null
++++ b/src/lib/payroll/engine.ts
+@@ -0,0 +1,172 @@
++/**
++ * Salary engine — pure functions, no database, no framework.
++ *
++ * Money is whole rupees (the payout sheet works in whole rupees). Every figure is
++ * rounded half-up at the point it is produced, exactly as the payout sheet shows it,
++ * so the sheet's own columns always add up.
++ *
++ * Column logic was reverse-engineered from the client's sample payout row (bonus pay is part of
++ * gross by the client's later instruction) and is
++ * pinned by engine.test.ts. Anything that is a policy choice rather than something
++ * the sample proves is marked ASSUMPTION and lives in ClientPayrollConfig / SalarySlab
++ * so it can be changed without touching this file.
++ */
++
++/** One slab: the fixed MONTHLY amounts for a person (or for all of a client's Associates). */
++export interface SlabAmounts {
++  basic: number;
++  hra: number;
++  specialAllowance: number;
++  travellingAllowance: number;
++  /** Rupees per overtime full day. null → ASSUMPTION: full-month fixed gross ÷ days in month. */
++  otDayRate: number | null;
++  /** Rupees per overtime hour. null → ASSUMPTION: otDayRate ÷ shiftHours. */
++  otHourRate: number | null;
++  /** Rupees per bonus day. null → ASSUMPTION: same as the OT day rate. */
++  bonusDayRate: number | null;
++}
++
++/** Statutory + policy settings for one client. Percentages are plain numbers (12 = 12 %). */
++export interface PayrollConfig {
++  pfEmployeePct: number;      // 12
++  pfEmployerPct: number;      // 12 (EPF 3.67 + EPS 8.33)
++  pfAdminPct: number;         // 1  (0.5 EPFO admin + 0.5 EDLI) — the sample's 150 on 15,000
++  /** PF is calculated on min(basic + special allowance, ceiling). null = no ceiling. */
++  pfWageCeiling: number | null;
++  esicEmployeePct: number;    // 0.75
++  esicEmployerPct: number;    // 3.25
++  /**
++   * ESIC applies only while the month's ESIC wages (prorated basic + special allowance) are at or
++   * below this. (Field keeps its original name so older saved settings and drafts still load.)
++   */
++  esicGrossLimit: number;     // 21000
++  insurance: number;          // fixed rupees per month (employer)
++  pt: number;                 // professional tax, rupees per month (employee)
++  lwf: number;                // labour welfare fund, rupees per month (employee)
++}
++
++export interface AttendanceInput {
++  presentDays: number;
++  /** Week-offs and paid holidays — both are paid days. */
++  weekOffDays: number;
++  halfDays: number;
++  absentDays: number;
++  otFullDays: number;
++  otHours: number;
++  bonusDays: number;
++}
++
++export interface CalcContext {
++  daysInMonth: number;
++  /** Standard shift length, used to turn the OT day rate into an hourly rate. */
++  shiftHours: number;
++}
++
++export interface PayrollResult {
++  salariedDays: number;
++  /** Full-month fixed amounts (sheet: "employee salary", "employee HRA"). */
++  fullBasic: number;
++  fullHra: number;
++  /** Prorated by salariedDays ÷ daysInMonth. */
++  basic: number;
++  hra: number;
++  specialAllowance: number;
++  travellingAllowance: number;
++  overtime: number;
++  bonusPay: number;
++  /** basic + hra + special + travelling + overtime + bonusPay. */
++  gross: number;
++  pfEmployer: number;
++  esicEmployer: number;
++  pfAdmin: number;
++  insurance: number;
++  totalEmployer: number;
++  /** gross + totalEmployer (bonus pay is already inside gross). */
++  fixedCtc: number;
++  pfEmployee: number;
++  esicEmployee: number;
++  pt: number;
++  lwf: number;
++  totalDeduction: number;
++  /** gross − totalDeduction. */
++  netTakeHome: number;
++  /** employee + employer + admin charges. */
++  totalPf: number;
++  /** employee + employer. */
++  totalEsic: number;
++  esicApplicable: boolean;
++}
++
++/** Round half-up to a whole rupee (the epsilon absorbs float noise like 487.49999999999994). */
++export const roundRupee = (n: number): number => Math.floor(n + 0.5 + 1e-9);
++
++export function calculatePayroll(
++  slab: SlabAmounts,
++  config: PayrollConfig,
++  att: AttendanceInput,
++  ctx: CalcContext,
++): PayrollResult {
++  const dim = ctx.daysInMonth;
++
++  // ASSUMPTION: a paid day is present, week-off/holiday, or half a day per half-day.
++  // Capped at the month so a data glitch can never pay more than the full fixed salary.
++  const salariedDays = Math.min(dim, att.presentDays + att.weekOffDays + att.halfDays * 0.5);
++  const ratio = dim > 0 ? salariedDays / dim : 0;
++  const prorate = (monthly: number) => roundRupee(monthly * ratio);
++
++  const basic = prorate(slab.basic);
++  const hra = prorate(slab.hra);
++  const specialAllowance = prorate(slab.specialAllowance);
++  const travellingAllowance = prorate(slab.travellingAllowance);
++
++  const fullGross = slab.basic + slab.hra + slab.specialAllowance + slab.travellingAllowance;
++  const otDayRate = slab.otDayRate ?? roundRupee(fullGross / dim);
++  const otHourRate = slab.otHourRate ?? roundRupee(otDayRate / ctx.shiftHours);
++  const bonusDayRate = slab.bonusDayRate ?? otDayRate;
++
++  const overtime = roundRupee(att.otFullDays * otDayRate + att.otHours * otHourRate);
++  const bonusPay = roundRupee(att.bonusDays * bonusDayRate);
++
++  const gross = basic + hra + specialAllowance + travellingAllowance + overtime + bonusPay;
++
++  // PF and ESIC wages = prorated basic + special allowance, nothing else. Overtime and bonus pay
++  // are part of gross (what the person is paid) but are never in these wages; HRA and the
++  // travelling allowance are excluded too. ASSUMPTION: no 50 % add-back is applied (client's call).
++  const statutoryWage = basic + specialAllowance;
++  const pfWage = config.pfWageCeiling == null ? statutoryWage : Math.min(statutoryWage, config.pfWageCeiling);
++  const pfEmployee = roundRupee((pfWage * config.pfEmployeePct) / 100);
++  const pfEmployer = roundRupee((pfWage * config.pfEmployerPct) / 100);
++  const pfAdmin = roundRupee((pfWage * config.pfAdminPct) / 100);
++
++  const esicApplicable = statutoryWage > 0 && statutoryWage <= config.esicGrossLimit;
++  const esicWage = statutoryWage;
++  const esicEmployee = esicApplicable ? roundRupee((esicWage * config.esicEmployeePct) / 100) : 0;
++  const esicEmployer = esicApplicable ? roundRupee((esicWage * config.esicEmployerPct) / 100) : 0;
++
++  // Nothing payable → no flat charges either.
++  const worked = salariedDays > 0;
++  const insurance = worked ? config.insurance : 0;
++  const pt = worked ? config.pt : 0;
++  const lwf = worked ? config.lwf : 0;
++
++  const totalEmployer = pfEmployer + esicEmployer + pfAdmin + insurance;
++  const fixedCtc = gross + totalEmployer;
++  const totalDeduction = pfEmployee + esicEmployee + pt + lwf;
++  const netTakeHome = gross - totalDeduction;
++
++  return {
++    salariedDays, fullBasic: slab.basic, fullHra: slab.hra,
++    basic, hra, specialAllowance, travellingAllowance, overtime, bonusPay, gross,
++    pfEmployer, esicEmployer, pfAdmin, insurance, totalEmployer, fixedCtc,
++    pfEmployee, esicEmployee, pt, lwf, totalDeduction, netTakeHome,
++    totalPf: pfEmployee + pfEmployer + pfAdmin,
++    totalEsic: esicEmployee + esicEmployer,
++    esicApplicable,
++  };
++}
++
++export const DEFAULT_PAYROLL_CONFIG: PayrollConfig = {
++  pfEmployeePct: 12, pfEmployerPct: 12, pfAdminPct: 1, pfWageCeiling: 15000,
++  esicEmployeePct: 0.75, esicEmployerPct: 3.25, esicGrossLimit: 21000,
++  insurance: 0, pt: 0, lwf: 0,
++};
+diff --git a/src/lib/payroll/service.ts b/src/lib/payroll/service.ts
+new file mode 100644
+index 0000000..df0287d
+--- /dev/null
++++ b/src/lib/payroll/service.ts
+@@ -0,0 +1,176 @@
++import type { Session } from 'next-auth';
++import { Prisma } from '@prisma/client';
++import { prisma } from '@/lib/prisma';
++import { STANDARD_SHIFT_HOURS } from '@/lib/config';
++import { loadReport, todayKey } from '@/lib/reports/data';
++import {
++  calculatePayroll, DEFAULT_PAYROLL_CONFIG,
++  type PayrollConfig, type PayrollResult, type SlabAmounts,
++} from './engine';
++import { emptyAttendance, summariseAttendance, type AttendanceSummary } from './attendance';
++
++export const daysInMonthOf = (year: number, month: number) => new Date(Date.UTC(year, month, 0)).getUTCDate();
++export const ymOf = (year: number, month: number) => `${year}-${String(month).padStart(2, '0')}`;
++
++type ConfigRow = Prisma.ClientPayrollConfigGetPayload<object>;
++
++export function configFromRow(row: ConfigRow | null): PayrollConfig {
++  if (!row) return { ...DEFAULT_PAYROLL_CONFIG };
++  return {
++    pfEmployeePct: row.pfEmployeePct, pfEmployerPct: row.pfEmployerPct, pfAdminPct: row.pfAdminPct,
++    pfWageCeiling: row.pfWageCeiling,
++    esicEmployeePct: row.esicEmployeePct, esicEmployerPct: row.esicEmployerPct,
++    esicGrossLimit: row.esicGrossLimit,
++    insurance: row.insurance, pt: row.pt, lwf: row.lwf,
++  };
++}
++
++export async function getClientConfig(clientId: string): Promise<PayrollConfig> {
++  return configFromRow(await prisma.clientPayrollConfig.findUnique({ where: { clientId } }));
++}
++
++/** Values an admin can edit on a draft line. null = use the attendance / client default. */
++export interface ManualInputs {
++  bonusDays: number;
++  otFullDays: number;
++  otHours: number | null;
++  pt: number | null;
++  lwf: number | null;
++  insurance: number | null;
++}
++export const NO_MANUAL: ManualInputs = { bonusDays: 0, otFullDays: 0, otHours: null, pt: null, lwf: null, insurance: null };
++
++export interface LineInputs {
++  daysInMonth: number;
++  slab: (SlabAmounts & { id: string; name: string; source: 'ASSIGNED' | 'DEFAULT' }) | null;
++  attendance: AttendanceSummary;
++  manual: ManualInputs;
++}
++
++export interface LineIdentity {
++  storeName: string;
++  staffCode: string;
++  name: string;
++  fatherName: string | null;
++  uan: string | null;
++  esicNumber: string | null;
++  designation: string;
++  status: string;
++}
++
++/** The single place a line's numbers are produced — used on generate and on every edit. */
++export function computeLine(inputs: LineInputs, config: PayrollConfig): { result: PayrollResult | null; gross: number; net: number } {
++  if (!inputs.slab) return { result: null, gross: 0, net: 0 };
++  const { attendance: a, manual: m } = inputs;
++  const cfg: PayrollConfig = {
++    ...config,
++    pt: m.pt ?? config.pt, lwf: m.lwf ?? config.lwf, insurance: m.insurance ?? config.insurance,
++  };
++  const result = calculatePayroll(
++    inputs.slab,
++    cfg,
++    {
++      presentDays: a.presentDays, weekOffDays: a.weekOffDays, halfDays: a.halfDays, absentDays: a.absentDays,
++      otFullDays: m.otFullDays, otHours: m.otHours ?? a.otHours, bonusDays: m.bonusDays,
++    },
++    { daysInMonth: inputs.daysInMonth, shiftHours: STANDARD_SHIFT_HOURS },
++  );
++  return { result, gross: result.gross, net: result.netTakeHome };
++}
++
++export function lineWarnings(inputs: LineInputs): string[] {
++  const w: string[] = [];
++  const a = inputs.attendance;
++  if (!inputs.slab) w.push('No salary slab — not paid until one is assigned.');
++  if (a.noPunchDays > 0) w.push(`${a.noPunchDays} day(s) with no punch counted as unpaid — review.`);
++  if (a.notRecordedDays > 0) w.push(`${a.notRecordedDays} day(s) with no attendance entered counted as unpaid — review.`);
++  if (a.recordedDays < inputs.daysInMonth) w.push(`Attendance exists for ${a.recordedDays} of ${inputs.daysInMonth} days.`);
++  if (a.autoClosedShifts > 0) w.push(`${a.autoClosedShifts} shift(s) had no check-out and were counted as a full shift.`);
++  const paid = a.presentDays + a.weekOffDays + a.halfDays * 0.5;
++  if (paid > inputs.daysInMonth) w.push('Paid days exceed the days in the month — capped.');
++  return w;
++}
++
++export class PayrollError extends Error {}
++
++/**
++ * Creates or refreshes the DRAFT run for a client + month: re-pulls attendance and slabs, keeps
++ * every manual input an admin already entered, and never touches a FINALIZED run.
++ */
++export async function generateRun(session: Session, clientId: string, year: number, month: number) {
++  const existing = await prisma.payrollRun.findUnique({
++    where: { clientId_periodYear_periodMonth: { clientId, periodYear: year, periodMonth: month } },
++    include: { lines: { select: { employeeId: true, inputs: true } } },
++  });
++  if (existing?.status === 'FINALIZED') throw new PayrollError('This month is finalized and locked.');
++
++  const config = await getClientConfig(clientId);
++  const today = todayKey();
++  const ym = ymOf(year, month);
++  const dim = daysInMonthOf(year, month);
++
++  const data = await loadReport(
++    session,
++    { period: { type: 'month', year, month, quarter: 1, basis: 'fy' }, clientId },
++    today,
++  );
++  const attendance = summariseAttendance(data.records, data.monthlyOt, ym);
++
++  const [employees, defaultSlabs] = await Promise.all([
++    prisma.employee.findMany({
++      where: { store: { clientId }, OR: [{ status: 'ACTIVE' }, { id: { in: [...attendance.keys()] } }] },
++      include: { store: { select: { name: true } }, salaryAssignment: { include: { slab: true } } },
++      orderBy: [{ store: { name: 'asc' } }, { staffCode: 'asc' }],
++    }),
++    prisma.salarySlab.findMany({ where: { clientId, isDefault: true, isActive: true } }),
++  ]);
++  const defaultByDesignation = new Map(defaultSlabs.map((s) => [s.designation, s]));
++  const previous = new Map(existing?.lines.map((l) => [l.employeeId, (l.inputs as unknown as LineInputs).manual]) ?? []);
++
++  const slabOf = (s: { id: string; name: string } & SlabAmounts, source: 'ASSIGNED' | 'DEFAULT') => ({
++    id: s.id, name: s.name, source,
++    basic: s.basic, hra: s.hra, specialAllowance: s.specialAllowance, travellingAllowance: s.travellingAllowance,
++    otDayRate: s.otDayRate, otHourRate: s.otHourRate, bonusDayRate: s.bonusDayRate,
++  });
++
++  const run = existing
++    ? await prisma.payrollRun.update({ where: { id: existing.id }, data: { configSnapshot: config as unknown as Prisma.InputJsonObject } })
++    : await prisma.payrollRun.create({
++        data: {
++          clientId, periodYear: year, periodMonth: month,
++          configSnapshot: config as unknown as Prisma.InputJsonObject, createdByUserId: session.user.id,
++        },
++      });
++
++  const ops: Prisma.PrismaPromise<unknown>[] = [];
++  for (const e of employees) {
++    const assigned = e.salaryAssignment?.slab;
++    const fallback = defaultByDesignation.get(e.designation);
++    const slab = assigned && assigned.isActive ? slabOf(assigned, 'ASSIGNED') : fallback ? slabOf(fallback, 'DEFAULT') : null;
++    const inputs: LineInputs = {
++      daysInMonth: dim, slab,
++      attendance: attendance.get(e.id) ?? emptyAttendance(),
++      manual: previous.get(e.id) ?? { ...NO_MANUAL },
++    };
++    const { result, gross, net } = computeLine(inputs, config);
++    const identity: LineIdentity = {
++      storeName: e.store.name, staffCode: e.staffCode, name: e.name, fatherName: e.fatherName,
++      uan: e.uan, esicNumber: e.esicNumber, designation: e.designation, status: e.status,
++    };
++    const row = {
++      identity: identity as unknown as Prisma.InputJsonObject,
++      inputs: inputs as unknown as Prisma.InputJsonObject,
++      result: (result ?? undefined) as unknown as Prisma.InputJsonObject | undefined,
++      warnings: lineWarnings(inputs), gross, netTakeHome: net,
++    };
++    ops.push(prisma.payrollLine.upsert({
++      where: { runId_employeeId: { runId: run.id, employeeId: e.id } },
++      create: { runId: run.id, employeeId: e.id, ...row },
++      update: { ...row, result: result ? (result as unknown as Prisma.InputJsonObject) : Prisma.JsonNull },
++    }));
++  }
++  ops.push(prisma.payrollLine.deleteMany({ where: { runId: run.id, employeeId: { notIn: employees.map((e) => e.id) } } }));
++  await prisma.$transaction(ops);
++
++  return { runId: run.id, lines: employees.length, monthOver: data.period.to < today };
++}
+diff --git a/src/lib/payroll/xlsx.ts b/src/lib/payroll/xlsx.ts
+new file mode 100644
+index 0000000..a5340fe
+--- /dev/null
++++ b/src/lib/payroll/xlsx.ts
+@@ -0,0 +1,84 @@
++import ExcelJS from 'exceljs';
++import type { PayrollConfig, PayrollResult } from './engine';
++import type { LineIdentity, LineInputs } from './service';
++
++export interface SheetLine {
++  identity: LineIdentity;
++  inputs: LineInputs;
++  result: PayrollResult | null;
++}
++
++const pct = (n: number) => String(Number(n.toFixed(4)));
++
++/** The payout sheet's headers, in the client's order and wording (typos included, on purpose). */
++export function payoutHeaders(c: PayrollConfig): string[] {
++  return [
++    'store', 'Sno.', 'store series', 'Ecode', 'Employee name', 'Father Name', 'UAN', 'ESIC', 'Designation', 'STATUS',
++    'present full day', 'WEEK OFF', 'half day', 'Absent', 'Overtime full days', 'overtime (hours)', 'Bonus days',
++    'Total salaried days', 'Column 1', 'Basic', 'HRA', 'employee salary', 'employee HRA', 'Special Allowance',
++    'Travelling Allowance', 'overtime', 'Bonus pay', 'Gross', 'PF Emplyr', `ESI ${pct(c.esicEmployerPct)}% of BASIC`,
++    'PF Admin Charges', 'INSURANCE', 'TOTAL Employer', 'Fixed CTC', `PF ${pct(c.pfEmployeePct)}% of BASIC`,
++    `ESI ${pct(c.esicEmployeePct)}% BASIC`, 'PT', 'LWF', 'TOTAL DIDUCTION', 'NET TAKE HOME', 'total pf', 'total esic',
++  ];
++}
++
++const TEXT_COLS = new Set([4, 7, 8]); // Ecode, UAN, ESIC — long digit strings must never become 1.2E+13
++
++export async function buildPayoutWorkbook(lines: SheetLine[], config: PayrollConfig, title: string): Promise<Buffer> {
++  const wb = new ExcelJS.Workbook();
++  const ws = wb.addWorksheet('Payout', { views: [{ state: 'frozen', xSplit: 5, ySplit: 2 }] });
++  const headers = payoutHeaders(config);
++
++  ws.addRow([title]);
++  ws.getRow(1).font = { bold: true, size: 13 };
++  const head = ws.addRow(headers);
++  head.font = { bold: true };
++  head.alignment = { wrapText: true, vertical: 'middle', horizontal: 'center' };
++  head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
++  head.height = 32;
++
++  const sorted = [...lines].sort(
++    (a, b) => a.identity.storeName.localeCompare(b.identity.storeName) || a.identity.staffCode.localeCompare(b.identity.staffCode),
++  );
++  const perStore = new Map<string, number>();
++  const sums = new Array<number>(headers.length).fill(0);
++
++  sorted.forEach((l, i) => {
++    const { identity: id, inputs: inp, result: r } = l;
++    const series = (perStore.get(id.storeName) ?? 0) + 1;
++    perStore.set(id.storeName, series);
++    const a = inp.attendance;
++    const m = inp.manual;
++    const label = id.designation.replace(/_/g, ' ');
++    const status = id.status.charAt(0) + id.status.slice(1).toLowerCase();
++
++    const row: (string | number | null)[] = [
++      id.storeName, i + 1, series, id.staffCode, id.name, id.fatherName ?? '', id.uan ?? '', id.esicNumber ?? '', label, status,
++      a.presentDays, a.weekOffDays, a.halfDays, a.absentDays, m.otFullDays, m.otHours ?? a.otHours, m.bonusDays,
++      r?.salariedDays ?? null, null,
++      r?.basic ?? null, r?.hra ?? null, r?.fullBasic ?? null, r?.fullHra ?? null, r?.specialAllowance ?? null,
++      r?.travellingAllowance ?? null, r?.overtime ?? null, r?.bonusPay ?? null, r?.gross ?? null,
++      r?.pfEmployer ?? null, r?.esicEmployer ?? null, r?.pfAdmin ?? null, r?.insurance ?? null, r?.totalEmployer ?? null,
++      r?.fixedCtc ?? null, r?.pfEmployee ?? null, r?.esicEmployee ?? null, r?.pt ?? null, r?.lwf ?? null,
++      r?.totalDeduction ?? null, r?.netTakeHome ?? null, r?.totalPf ?? null, r?.totalEsic ?? null,
++    ];
++    const xr = ws.addRow(row);
++    row.forEach((v, idx) => {
++      const col = idx + 1;
++      if (TEXT_COLS.has(col)) { xr.getCell(col).value = String(v ?? ''); xr.getCell(col).numFmt = '@'; }
++      // Sums: everything from "present full day" onward, except the unused "Column 1".
++      if (col >= 11 && col !== 19 && typeof v === 'number') sums[idx] += v;
++    });
++    if (!r) xr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEE2E2' } };
++  });
++
++  const total = ws.addRow(headers.map((_, idx) => (idx === 0 ? 'TOTAL' : idx >= 10 && idx !== 18 ? sums[idx] : null)));
++  total.font = { bold: true };
++  total.border = { top: { style: 'thin' } };
++
++  const widths: Record<number, number> = { 1: 18, 2: 6, 3: 8, 4: 18, 5: 24, 6: 24, 7: 15, 8: 15, 9: 18 };
++  for (let c = 1; c <= headers.length; c++) ws.getColumn(c).width = widths[c] ?? 13;
++  ws.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: headers.length } };
++
++  return Buffer.from(await wb.xlsx.writeBuffer());
++}

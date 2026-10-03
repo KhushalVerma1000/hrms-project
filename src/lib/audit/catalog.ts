@@ -2,7 +2,7 @@
 // Adding a new writeAuditLog({ action }) call? Add it here too, or it shows
 // up as a generic "system" event.
 
-export type AuditCategory = 'Employees' | 'Stores & Clients' | 'Devices' | 'Attendance' | 'Users' | 'System';
+export type AuditCategory = 'Employees' | 'Stores & Clients' | 'Devices' | 'Attendance' | 'Users' | 'Payroll' | 'System';
 export type AuditSeverity = 'info' | 'notice' | 'critical';
 
 interface ActionMeta {
@@ -23,6 +23,17 @@ export const AUDIT_ACTIONS: Record<string, ActionMeta> = {
   FORM_SUBMISSION_ASSIGNED: { label: 'Unmatched form submission linked to employee', category: 'Employees', severity: 'notice' },
   FORM_SUBMISSION_DISMISSED: { label: 'Unmatched form submission dismissed', category: 'System', severity: 'info', adminOnly: true },
   FORM_REMINDER_SENT: { label: 'Onboarding form reminder sent', category: 'Employees', severity: 'info' },
+
+  PAYROLL_CONFIG_UPDATE: { label: 'Payroll settings updated', category: 'Payroll', severity: 'notice', adminOnly: true },
+  SALARY_SLAB_SAVE: { label: 'Salary slab saved', category: 'Payroll', severity: 'notice', adminOnly: true },
+  SALARY_SLAB_ARCHIVE: { label: 'Salary slab archived', category: 'Payroll', severity: 'notice', adminOnly: true },
+  SALARY_ASSIGN: { label: 'Salary slab assigned to employee', category: 'Payroll', severity: 'notice', adminOnly: true },
+  PAYROLL_IDS_UPDATE: { label: 'Employee payroll IDs updated', category: 'Payroll', severity: 'info', adminOnly: true },
+  PAYROLL_RUN_GENERATE: { label: 'Payroll run generated / refreshed', category: 'Payroll', severity: 'notice', adminOnly: true },
+  PAYROLL_LINE_EDIT: { label: 'Payroll line edited', category: 'Payroll', severity: 'info', adminOnly: true },
+  PAYROLL_RUN_FINALIZE: { label: 'Payroll run finalized', category: 'Payroll', severity: 'critical', adminOnly: true },
+  PAYROLL_RUN_DELETE: { label: 'Draft payroll run deleted', category: 'Payroll', severity: 'notice', adminOnly: true },
+  PAYROLL_SHEET_DOWNLOAD: { label: 'Payroll sheet downloaded', category: 'Payroll', severity: 'info', adminOnly: true },
 
   CLIENT_CREATE: { label: 'Client created', category: 'Stores & Clients', severity: 'notice', adminOnly: true },
   CLIENT_GOOGLE_FORM_UPDATE: { label: 'Onboarding form link updated', category: 'Stores & Clients', severity: 'info' },
@@ -82,7 +93,7 @@ export function criticalActions(): string[] {
   return Object.entries(AUDIT_ACTIONS).filter(([, m]) => m.severity === 'critical').map(([k]) => k);
 }
 
-export const AUDIT_CATEGORIES: AuditCategory[] = ['Employees', 'Stores & Clients', 'Devices', 'Attendance', 'Users', 'System'];
+export const AUDIT_CATEGORIES: AuditCategory[] = ['Employees', 'Stores & Clients', 'Devices', 'Attendance', 'Users', 'Payroll', 'System'];
 
 /** One-line human summary of an audit row's metadata. Never dumps raw JSON. */
 export function summarizeMetadata(action: string, raw: unknown): string {

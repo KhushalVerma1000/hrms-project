@@ -34,7 +34,8 @@ export type Action =
   | 'formTracking:remind'
   | 'formSubmissions:manage'
   | 'onboardingForm:editClient'
-  | 'onboardingForm:editStore';
+  | 'onboardingForm:editStore'
+  | 'payroll:manage';
 
 /**
  * Roles allowed to change onboarding Google Form links. Admin only for now.
@@ -123,6 +124,11 @@ export function can(
         // PA/SI: no access to attendance
         default: return false;
       }
+
+    // Salary engine: slabs, assignments, payroll runs and payout sheets. Admin only for now.
+    // To open it to CLIENT later, add `case 'CLIENT': return inClient(ctx.clientId);`.
+    case 'payroll:manage':
+      return role === 'ADMIN';
 
     // Attendance reports (view + download). Office roles: Admin sees everything, Client sees their
     // own client's stores. Among ground (store-level) staff ONLY the Manager can see reports, and

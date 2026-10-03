@@ -1,0 +1,204 @@
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index e474a77..d698ca9 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -820,6 +820,7 @@ model ClientPayrollConfig {
+   esicEmployerPct Float @default(3.25)
+   esicGrossLimit  Int   @default(21000)
+   /// "BASIC" (as the client's sheet is labelled) or "GROSS" (statutory wage base).
++  /// Unused since the wage base became fixed (basic + special allowance); kept so the column and old drafts stay valid.
+   esicBase        String @default("BASIC")
+   insurance       Int   @default(0)
+   pt              Int   @default(0)
+diff --git a/src/app/(app)/payroll/actions.ts b/src/app/(app)/payroll/actions.ts
+index 44c80ae..fd88bf7 100644
+--- a/src/app/(app)/payroll/actions.ts
++++ b/src/app/(app)/payroll/actions.ts
+@@ -66,7 +66,6 @@ export async function saveConfigAction(formData: FormData) {
+       esicEmployeePct: num(formData, 'esicEmployeePct', 0, 100)!,
+       esicEmployerPct: num(formData, 'esicEmployerPct', 0, 100)!,
+       esicGrossLimit: int(formData, 'esicGrossLimit')!,
+-      esicBase: 'BASIC',
+       insurance: int(formData, 'insurance')!,
+       pt: int(formData, 'pt')!,
+       lwf: int(formData, 'lwf')!,
+diff --git a/src/app/(app)/payroll/setup/page.tsx b/src/app/(app)/payroll/setup/page.tsx
+index 531314c..8b5d67b 100644
+--- a/src/app/(app)/payroll/setup/page.tsx
++++ b/src/app/(app)/payroll/setup/page.tsx
+@@ -90,7 +90,7 @@ export default async function PayrollSetup({ searchParams }: { searchParams: Pro
+         <input type="hidden" name="clientId" value={clientId} />
+         <div>
+           <h3 className="font-semibold">Compliance settings</h3>
+-          <p className="text-xs text-slate-500">Percentages are plain numbers (12 = 12 %). Check these with your compliance advisor — they decide every employee&apos;s PF and ESIC.</p>
++          <p className="text-xs text-slate-500">Percentages are plain numbers (12 = 12 %). PF and ESIC are worked out on prorated basic + special allowance only — never on overtime, bonus, HRA or travelling allowance. Check these with your compliance advisor — they decide every employee&apos;s PF and ESIC.</p>
+         </div>
+         <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+           <Field label="PF – employee %"><input name="pfEmployeePct" type="number" step="0.01" defaultValue={cfg.pfEmployeePct} className={inputCls} /></Field>
+@@ -99,8 +99,8 @@ export default async function PayrollSetup({ searchParams }: { searchParams: Pro
+           <Field label="PF wage ceiling ₹" hint="Blank = PF on full basic"><input name="pfWageCeiling" type="number" defaultValue={cfg.pfWageCeiling ?? ''} className={inputCls} /></Field>
+           <Field label="ESIC – employee %"><input name="esicEmployeePct" type="number" step="0.01" defaultValue={cfg.esicEmployeePct} className={inputCls} /></Field>
+           <Field label="ESIC – employer %"><input name="esicEmployerPct" type="number" step="0.01" defaultValue={cfg.esicEmployerPct} className={inputCls} /></Field>
+-          <Field label="ESIC applies if gross (incl. bonus) ≤ ₹"><input name="esicGrossLimit" type="number" defaultValue={cfg.esicGrossLimit} className={inputCls} /></Field>
+-          <Field label="ESIC calculated on"><div className="flex h-9 items-center text-sm font-medium">Basic</div></Field>
++          <Field label="ESIC applies if basic + special ≤ ₹"><input name="esicGrossLimit" type="number" defaultValue={cfg.esicGrossLimit} className={inputCls} /></Field>
++          <Field label="PF & ESIC calculated on"><div className="flex h-9 items-center text-sm font-medium">Basic + special allowance</div></Field>
+           <Field label="Insurance ₹/month"><input name="insurance" type="number" defaultValue={cfg.insurance} className={inputCls} /></Field>
+           <Field label="Professional tax ₹/month"><input name="pt" type="number" defaultValue={cfg.pt} className={inputCls} /></Field>
+           <Field label="LWF ₹/month"><input name="lwf" type="number" defaultValue={cfg.lwf} className={inputCls} /></Field>
+diff --git a/src/lib/payroll/engine.test.ts b/src/lib/payroll/engine.test.ts
+index 5741258..e17b5f4 100644
+--- a/src/lib/payroll/engine.test.ts
++++ b/src/lib/payroll/engine.test.ts
+@@ -37,8 +37,8 @@ test('prorates basic and HRA by salaried days', () => {
+   assert.equal(r.hra, 1784);
+ });
+ 
+-test('ESIC stops above the gross limit; PF stays capped at the ceiling', () => {
+-  const rich: SlabAmounts = { ...slab, basic: 20000, hra: 5000 };
++test('ESIC stops above the wage limit; PF stays capped at the ceiling', () => {
++  const rich: SlabAmounts = { ...slab, basic: 20000, hra: 5000, specialAllowance: 1500 }; // wages 21,500 > 21,000
+   const r = calculatePayroll(rich, DEFAULT_PAYROLL_CONFIG, { ...att, bonusDays: 0 }, { daysInMonth: 31, shiftHours: 9 });
+   assert.equal(r.esicApplicable, false);
+   assert.equal(r.esicEmployee + r.esicEmployer, 0);
+@@ -51,3 +51,35 @@ test('a person with no paid days gets no flat charges', () => {
+   assert.equal(r.netTakeHome, 0);
+   assert.equal(r.pt, 0);
+ });
++
++test('PF and ESIC use prorated basic + special allowance only; OT, bonus, HRA and travel are out', () => {
++  const s: SlabAmounts = { basic: 10000, hra: 4000, specialAllowance: 2000, travellingAllowance: 1500, otDayRate: 700, otHourRate: 80, bonusDayRate: 600 };
++  const a = { presentDays: 26, weekOffDays: 4, halfDays: 0, absentDays: 0, otFullDays: 2, otHours: 5, bonusDays: 2 };
++  const r = calculatePayroll(s, DEFAULT_PAYROLL_CONFIG, a, { daysInMonth: 30, shiftHours: 9 });
++  assert.equal(r.overtime, 1800);       // 2×700 + 5×80
++  assert.equal(r.bonusPay, 1200);       // 2×600
++  assert.equal(r.gross, 10000 + 4000 + 2000 + 1500 + 1800 + 1200);
++  assert.equal(r.pfEmployee, 1440);     // 12 % × 12,000
++  assert.equal(r.pfEmployer, 1440);
++  assert.equal(r.pfAdmin, 120);         // 1 % × 12,000
++  assert.equal(r.esicEmployee, 90);     // 0.75 % × 12,000
++  assert.equal(r.esicEmployer, 390);    // 3.25 % × 12,000
++});
++
++test('PF wage is capped at the ceiling after adding special allowance', () => {
++  const s: SlabAmounts = { basic: 14000, hra: 0, specialAllowance: 3000, travellingAllowance: 0, otDayRate: null, otHourRate: null, bonusDayRate: null };
++  const r = calculatePayroll(s, DEFAULT_PAYROLL_CONFIG, { ...att, bonusDays: 0 }, { daysInMonth: 31, shiftHours: 9 });
++  assert.equal(r.pfEmployee, 1800);     // 12 % × 15,000 ceiling, not × 17,000
++  assert.equal(r.esicApplicable, true); // 17,000 ≤ 21,000
++  assert.equal(r.esicEmployee, 128);    // 0.75 % × 17,000 = 127.5
++});
++
++test('ESIC eligibility is tested on basic + special allowance, not on gross, OT or bonus', () => {
++  const s: SlabAmounts = { basic: 15000, hra: 6000, specialAllowance: 0, travellingAllowance: 0, otDayRate: 900, otHourRate: null, bonusDayRate: 900 };
++  const r = calculatePayroll(s, DEFAULT_PAYROLL_CONFIG, { ...att, otFullDays: 3, bonusDays: 2 }, { daysInMonth: 31, shiftHours: 9 });
++  assert.ok(r.gross > 21000);           // 21,000 fixed + overtime + bonus
++  assert.equal(r.esicApplicable, true); // wages are only 15,000
++  assert.equal(r.esicEmployer, 488);
++  const above: SlabAmounts = { ...s, basic: 20000, specialAllowance: 1500 };
++  assert.equal(calculatePayroll(above, DEFAULT_PAYROLL_CONFIG, att, { daysInMonth: 31, shiftHours: 9 }).esicApplicable, false);
++});
+diff --git a/src/lib/payroll/engine.ts b/src/lib/payroll/engine.ts
+index 23f7dfe..9fcd51a 100644
+--- a/src/lib/payroll/engine.ts
++++ b/src/lib/payroll/engine.ts
+@@ -12,8 +12,6 @@
+  * so it can be changed without touching this file.
+  */
+ 
+-export type EsicBase = 'BASIC' | 'GROSS';
+-
+ /** One slab: the fixed MONTHLY amounts for a person (or for all of a client's Associates). */
+ export interface SlabAmounts {
+   basic: number;
+@@ -33,14 +31,15 @@ export interface PayrollConfig {
+   pfEmployeePct: number;      // 12
+   pfEmployerPct: number;      // 12 (EPF 3.67 + EPS 8.33)
+   pfAdminPct: number;         // 1  (0.5 EPFO admin + 0.5 EDLI) — the sample's 150 on 15,000
+-  /** PF is calculated on min(basic, ceiling). null = no ceiling, PF on the full basic. */
++  /** PF is calculated on min(basic + special allowance, ceiling). null = no ceiling. */
+   pfWageCeiling: number | null;
+   esicEmployeePct: number;    // 0.75
+   esicEmployerPct: number;    // 3.25
+-  /** ESIC applies only while the month's gross is at or below this. */
++  /**
++   * ESIC applies only while the month's ESIC wages (prorated basic + special allowance) are at or
++   * below this. (Field keeps its original name so older saved settings and drafts still load.)
++   */
+   esicGrossLimit: number;     // 21000
+-  /** ESIC wage base. Under the current rules this is BASIC; the app always stores BASIC. */
+-  esicBase: EsicBase;
+   insurance: number;          // fixed rupees per month (employer)
+   pt: number;                 // professional tax, rupees per month (employee)
+   lwf: number;                // labour welfare fund, rupees per month (employee)
+@@ -130,13 +129,17 @@ export function calculatePayroll(
+ 
+   const gross = basic + hra + specialAllowance + travellingAllowance + overtime + bonusPay;
+ 
+-  const pfWage = config.pfWageCeiling == null ? basic : Math.min(basic, config.pfWageCeiling);
++  // PF and ESIC wages = prorated basic + special allowance, nothing else. Overtime and bonus pay
++  // are part of gross (what the person is paid) but are never in these wages; HRA and the
++  // travelling allowance are excluded too. ASSUMPTION: no 50 % add-back is applied (client's call).
++  const statutoryWage = basic + specialAllowance;
++  const pfWage = config.pfWageCeiling == null ? statutoryWage : Math.min(statutoryWage, config.pfWageCeiling);
+   const pfEmployee = roundRupee((pfWage * config.pfEmployeePct) / 100);
+   const pfEmployer = roundRupee((pfWage * config.pfEmployerPct) / 100);
+   const pfAdmin = roundRupee((pfWage * config.pfAdminPct) / 100);
+ 
+-  const esicApplicable = gross > 0 && gross <= config.esicGrossLimit;
+-  const esicWage = config.esicBase === 'BASIC' ? basic : gross;
++  const esicApplicable = statutoryWage > 0 && statutoryWage <= config.esicGrossLimit;
++  const esicWage = statutoryWage;
+   const esicEmployee = esicApplicable ? roundRupee((esicWage * config.esicEmployeePct) / 100) : 0;
+   const esicEmployer = esicApplicable ? roundRupee((esicWage * config.esicEmployerPct) / 100) : 0;
+ 
+@@ -164,6 +167,6 @@ export function calculatePayroll(
+ 
+ export const DEFAULT_PAYROLL_CONFIG: PayrollConfig = {
+   pfEmployeePct: 12, pfEmployerPct: 12, pfAdminPct: 1, pfWageCeiling: 15000,
+-  esicEmployeePct: 0.75, esicEmployerPct: 3.25, esicGrossLimit: 21000, esicBase: 'BASIC',
++  esicEmployeePct: 0.75, esicEmployerPct: 3.25, esicGrossLimit: 21000,
+   insurance: 0, pt: 0, lwf: 0,
+ };
+diff --git a/src/lib/payroll/service.ts b/src/lib/payroll/service.ts
+index b8a892b..df0287d 100644
+--- a/src/lib/payroll/service.ts
++++ b/src/lib/payroll/service.ts
+@@ -5,7 +5,7 @@ import { STANDARD_SHIFT_HOURS } from '@/lib/config';
+ import { loadReport, todayKey } from '@/lib/reports/data';
+ import {
+   calculatePayroll, DEFAULT_PAYROLL_CONFIG,
+-  type EsicBase, type PayrollConfig, type PayrollResult, type SlabAmounts,
++  type PayrollConfig, type PayrollResult, type SlabAmounts,
+ } from './engine';
+ import { emptyAttendance, summariseAttendance, type AttendanceSummary } from './attendance';
+ 
+@@ -20,7 +20,7 @@ export function configFromRow(row: ConfigRow | null): PayrollConfig {
+     pfEmployeePct: row.pfEmployeePct, pfEmployerPct: row.pfEmployerPct, pfAdminPct: row.pfAdminPct,
+     pfWageCeiling: row.pfWageCeiling,
+     esicEmployeePct: row.esicEmployeePct, esicEmployerPct: row.esicEmployerPct,
+-    esicGrossLimit: row.esicGrossLimit, esicBase: 'BASIC' as EsicBase, // ESIC is on basic under the current rules
++    esicGrossLimit: row.esicGrossLimit,
+     insurance: row.insurance, pt: row.pt, lwf: row.lwf,
+   };
+ }
+diff --git a/src/lib/payroll/xlsx.ts b/src/lib/payroll/xlsx.ts
+index 5717377..a5340fe 100644
+--- a/src/lib/payroll/xlsx.ts
++++ b/src/lib/payroll/xlsx.ts
+@@ -12,14 +12,13 @@ const pct = (n: number) => String(Number(n.toFixed(4)));
+ 
+ /** The payout sheet's headers, in the client's order and wording (typos included, on purpose). */
+ export function payoutHeaders(c: PayrollConfig): string[] {
+-  const base = c.esicBase;
+   return [
+     'store', 'Sno.', 'store series', 'Ecode', 'Employee name', 'Father Name', 'UAN', 'ESIC', 'Designation', 'STATUS',
+     'present full day', 'WEEK OFF', 'half day', 'Absent', 'Overtime full days', 'overtime (hours)', 'Bonus days',
+     'Total salaried days', 'Column 1', 'Basic', 'HRA', 'employee salary', 'employee HRA', 'Special Allowance',
+-    'Travelling Allowance', 'overtime', 'Bonus pay', 'Gross', 'PF Emplyr', `ESI ${pct(c.esicEmployerPct)}% of ${base}`,
++    'Travelling Allowance', 'overtime', 'Bonus pay', 'Gross', 'PF Emplyr', `ESI ${pct(c.esicEmployerPct)}% of BASIC`,
+     'PF Admin Charges', 'INSURANCE', 'TOTAL Employer', 'Fixed CTC', `PF ${pct(c.pfEmployeePct)}% of BASIC`,
+-    `ESI ${pct(c.esicEmployeePct)}% ${base}`, 'PT', 'LWF', 'TOTAL DIDUCTION', 'NET TAKE HOME', 'total pf', 'total esic',
++    `ESI ${pct(c.esicEmployeePct)}% BASIC`, 'PT', 'LWF', 'TOTAL DIDUCTION', 'NET TAKE HOME', 'total pf', 'total esic',
+   ];
+ }
+ 

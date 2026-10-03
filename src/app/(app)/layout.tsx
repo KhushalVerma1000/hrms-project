@@ -41,6 +41,7 @@ export default async function AppLayout({
   const canManageUsers = can(session, 'user:manage', { storeId: session.user.storeId, clientId: session.user.clientId });
   const canViewSyncIssues = can(session, 'syncIssues:view', {});
   const canViewAuditLog = can(session, 'auditLog:view', {});
+  const canManagePayroll = can(session, 'payroll:manage', {});
   const canReviewForms = can(session, 'formSubmissions:manage', {});
 
   const navItems: NavItem[] = [
@@ -48,6 +49,7 @@ export default async function AppLayout({
     ...(canViewAttendance ? [{ href: '/attendance', label: 'Attendance Logs', icon: '🕒' }] : []),
     ...(canManualAttendance ? [{ href: '/attendance/manual', label: 'Manual Attendance', icon: '📝' }] : []),
     ...(canViewReports ? [{ href: '/reports', label: 'Reports & Analytics', icon: '📈' }] : []),
+    ...(canManagePayroll ? [{ href: '/payroll', label: 'Salary & Payroll', icon: '💰' }] : []),
     ...(canFaceAttendance ? [{ href: '/face-attendance', label: 'Face Attendance', icon: '📸' }] : []),
     ...(canCsvUpload ? [{ href: '/attendance/upload', label: 'Attendance Upload', icon: '📤' }] : []),
     ...(canManageDeadlines ? [{ href: '/attendance/deadlines', label: 'Attendance Deadlines', icon: '⏰' }] : []),

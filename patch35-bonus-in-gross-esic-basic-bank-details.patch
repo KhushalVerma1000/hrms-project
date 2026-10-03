@@ -1,0 +1,210 @@
+diff --git a/prisma/migrations/20261002110000_employee_bank_details/migration.sql b/prisma/migrations/20261002110000_employee_bank_details/migration.sql
+new file mode 100644
+index 0000000..f7a6d2c
+--- /dev/null
++++ b/prisma/migrations/20261002110000_employee_bank_details/migration.sql
+@@ -0,0 +1,3 @@
++-- Bank details for bulk NEFT payout sheets.
++ALTER TABLE "Employee" ADD COLUMN "bankAccountNumber" TEXT;
++ALTER TABLE "Employee" ADD COLUMN "ifscCode" TEXT;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 2086642..e474a77 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -392,6 +392,10 @@ model Employee {
+   uan         String?
+   /// ESIC insurance number.
+   esicNumber  String?
++  /// Salary account for bulk NEFT payout sheets (admin-edited from /payroll/setup).
++  bankAccountNumber String?
++  /// 11-character IFSC, upper-case.
++  ifscCode          String?
+ 
+   /// This person's own salary slab. Absent → the client's default slab for their designation (if any).
+   salaryAssignment EmployeeSalaryAssignment?
+diff --git a/src/app/(app)/payroll/actions.ts b/src/app/(app)/payroll/actions.ts
+index 175e26d..44c80ae 100644
+--- a/src/app/(app)/payroll/actions.ts
++++ b/src/app/(app)/payroll/actions.ts
+@@ -66,7 +66,7 @@ export async function saveConfigAction(formData: FormData) {
+       esicEmployeePct: num(formData, 'esicEmployeePct', 0, 100)!,
+       esicEmployerPct: num(formData, 'esicEmployerPct', 0, 100)!,
+       esicGrossLimit: int(formData, 'esicGrossLimit')!,
+-      esicBase: str(formData, 'esicBase') === 'GROSS' ? 'GROSS' : 'BASIC',
++      esicBase: 'BASIC',
+       insurance: int(formData, 'insurance')!,
+       pt: int(formData, 'pt')!,
+       lwf: int(formData, 'lwf')!,
+@@ -183,9 +183,17 @@ export async function saveEmployeeIdsAction(formData: FormData) {
+     const esic = digits('esicNumber');
+     if (uan && !/^\d{12}$/.test(uan)) throw new PayrollError('UAN must be 12 digits.');
+     if (esic && !/^(\d{10}|\d{17})$/.test(esic)) throw new PayrollError('ESIC number must be 10 or 17 digits.');
++    const account = digits('bankAccountNumber');
++    const ifsc = digits('ifscCode').toUpperCase();
++    if (account && !/^\d{9,18}$/.test(account)) throw new PayrollError('Bank account number must be 9–18 digits.');
++    if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) throw new PayrollError('IFSC must be 11 characters, e.g. SBIN0001234.');
++    if (!!account !== !!ifsc) throw new PayrollError('Enter both the bank account number and the IFSC, or leave both blank.');
+     await prisma.employee.update({
+       where: { id: employeeId },
+-      data: { fatherName: str(formData, 'fatherName') || null, uan: uan || null, esicNumber: esic || null },
++      data: {
++        fatherName: str(formData, 'fatherName') || null, uan: uan || null, esicNumber: esic || null,
++        bankAccountNumber: account || null, ifscCode: ifsc || null,
++      },
+     });
+     await writeAuditLog({ userId: session.user.id, action: 'PAYROLL_IDS_UPDATE', targetType: 'Employee', targetId: employeeId, metadata: {} });
+   });
+diff --git a/src/app/(app)/payroll/runs/[id]/page.tsx b/src/app/(app)/payroll/runs/[id]/page.tsx
+index cf68e0d..a2f6e42 100644
+--- a/src/app/(app)/payroll/runs/[id]/page.tsx
++++ b/src/app/(app)/payroll/runs/[id]/page.tsx
+@@ -93,7 +93,7 @@ export default async function PayrollRunPage({
+               <th className="p-2">Employee</th><th className="p-2">Slab</th>
+               <th className="p-2 text-right">Pres.</th><th className="p-2 text-right">WO</th><th className="p-2 text-right">Half</th><th className="p-2 text-right">Abs.</th><th className="p-2 text-right">Paid days</th>
+               {draft && (<><th className="p-2">Bonus d.</th><th className="p-2">OT d.</th><th className="p-2">OT hrs</th><th className="p-2">PT</th><th className="p-2">LWF</th><th className="p-2" /></>)}
+-              <th className="p-2 text-right">Gross</th><th className="p-2 text-right">Bonus</th><th className="p-2 text-right">PF+ESIC (emp.)</th><th className="p-2 text-right">Net</th>
++              <th className="p-2 text-right">Gross</th><th className="p-2 text-right">Incl. bonus</th><th className="p-2 text-right">PF+ESIC (emp.)</th><th className="p-2 text-right">Net</th>
+             </tr>
+           </thead>
+           <tbody>
+diff --git a/src/app/(app)/payroll/setup/page.tsx b/src/app/(app)/payroll/setup/page.tsx
+index 7f9222c..531314c 100644
+--- a/src/app/(app)/payroll/setup/page.tsx
++++ b/src/app/(app)/payroll/setup/page.tsx
+@@ -99,13 +99,8 @@ export default async function PayrollSetup({ searchParams }: { searchParams: Pro
+           <Field label="PF wage ceiling ₹" hint="Blank = PF on full basic"><input name="pfWageCeiling" type="number" defaultValue={cfg.pfWageCeiling ?? ''} className={inputCls} /></Field>
+           <Field label="ESIC – employee %"><input name="esicEmployeePct" type="number" step="0.01" defaultValue={cfg.esicEmployeePct} className={inputCls} /></Field>
+           <Field label="ESIC – employer %"><input name="esicEmployerPct" type="number" step="0.01" defaultValue={cfg.esicEmployerPct} className={inputCls} /></Field>
+-          <Field label="ESIC applies if gross ≤ ₹"><input name="esicGrossLimit" type="number" defaultValue={cfg.esicGrossLimit} className={inputCls} /></Field>
+-          <Field label="ESIC calculated on">
+-            <select name="esicBase" defaultValue={cfg.esicBase} className={inputCls}>
+-              <option value="BASIC">Basic (as on your sheet)</option>
+-              <option value="GROSS">Gross wages (statutory)</option>
+-            </select>
+-          </Field>
++          <Field label="ESIC applies if gross (incl. bonus) ≤ ₹"><input name="esicGrossLimit" type="number" defaultValue={cfg.esicGrossLimit} className={inputCls} /></Field>
++          <Field label="ESIC calculated on"><div className="flex h-9 items-center text-sm font-medium">Basic</div></Field>
+           <Field label="Insurance ₹/month"><input name="insurance" type="number" defaultValue={cfg.insurance} className={inputCls} /></Field>
+           <Field label="Professional tax ₹/month"><input name="pt" type="number" defaultValue={cfg.pt} className={inputCls} /></Field>
+           <Field label="LWF ₹/month"><input name="lwf" type="number" defaultValue={cfg.lwf} className={inputCls} /></Field>
+@@ -191,7 +186,7 @@ export default async function PayrollSetup({ searchParams }: { searchParams: Pro
+         <div className="overflow-x-auto">
+           <table className="w-full text-sm">
+             <thead className="text-left text-xs uppercase text-slate-500">
+-              <tr><th className="p-2">Employee</th><th className="p-2">Designation</th><th className="p-2">Pay slab</th><th className="p-2">Father name / UAN / ESIC no.</th></tr>
++              <tr><th className="p-2">Employee</th><th className="p-2">Designation</th><th className="p-2">Pay slab</th><th className="p-2">Father name / UAN / ESIC no. / bank a/c / IFSC</th></tr>
+             </thead>
+             <tbody>
+               {employees.map((e) => {
+@@ -219,6 +214,8 @@ export default async function PayrollSetup({ searchParams }: { searchParams: Pro
+                         <input name="fatherName" defaultValue={e.fatherName ?? ''} placeholder="Father name" className={`${inputCls} w-36`} />
+                         <input name="uan" defaultValue={e.uan ?? ''} placeholder="UAN (12)" inputMode="numeric" className={`${inputCls} w-32`} />
+                         <input name="esicNumber" defaultValue={e.esicNumber ?? ''} placeholder="ESIC no." inputMode="numeric" className={`${inputCls} w-32`} />
++                        <input name="bankAccountNumber" defaultValue={e.bankAccountNumber ?? ''} placeholder="Bank a/c no." inputMode="numeric" autoComplete="off" className={`${inputCls} w-40`} />
++                        <input name="ifscCode" defaultValue={e.ifscCode ?? ''} placeholder="IFSC" maxLength={11} autoComplete="off" className={`${inputCls} w-28 uppercase`} />
+                         <button className={btnGhostCls} type="submit">Save</button>
+                       </form>
+                     </td>
+diff --git a/src/lib/payroll/engine.test.ts b/src/lib/payroll/engine.test.ts
+index 3b2b4b0..5741258 100644
+--- a/src/lib/payroll/engine.test.ts
++++ b/src/lib/payroll/engine.test.ts
+@@ -9,13 +9,14 @@ const slab: SlabAmounts = {
+ };
+ const att = { presentDays: 27, weekOffDays: 4, halfDays: 0, absentDays: 0, otFullDays: 0, otHours: 0, bonusDays: 1 };
+ 
+-test('reproduces the client sample payout row exactly', () => {
++test('reproduces the client sample payout row (bonus pay inside gross; CTC and net unchanged)', () => {
+   const r = calculatePayroll(slab, DEFAULT_PAYROLL_CONFIG, att, { daysInMonth: 31, shiftHours: 9 });
+   assert.equal(r.salariedDays, 31);
+   assert.equal(r.basic, 15000);
+   assert.equal(r.hra, 3568);
+   assert.equal(r.bonusPay, 537);
+-  assert.equal(r.gross, 18568);
++  assert.equal(r.gross, 19105); // bonus pay (537) is part of gross
++  assert.equal(r.salariedDays, 31);
+   assert.equal(r.pfEmployer, 1800);
+   assert.equal(r.esicEmployer, 488);
+   assert.equal(r.pfAdmin, 150);
+diff --git a/src/lib/payroll/engine.ts b/src/lib/payroll/engine.ts
+index 7a36d8b..23f7dfe 100644
+--- a/src/lib/payroll/engine.ts
++++ b/src/lib/payroll/engine.ts
+@@ -5,7 +5,8 @@
+  * rounded half-up at the point it is produced, exactly as the payout sheet shows it,
+  * so the sheet's own columns always add up.
+  *
+- * Column logic was reverse-engineered from the client's sample payout row and is
++ * Column logic was reverse-engineered from the client's sample payout row (bonus pay is part of
++ * gross by the client's later instruction) and is
+  * pinned by engine.test.ts. Anything that is a policy choice rather than something
+  * the sample proves is marked ASSUMPTION and lives in ClientPayrollConfig / SalarySlab
+  * so it can be changed without touching this file.
+@@ -38,7 +39,7 @@ export interface PayrollConfig {
+   esicEmployerPct: number;    // 3.25
+   /** ESIC applies only while the month's gross is at or below this. */
+   esicGrossLimit: number;     // 21000
+-  /** The sample sheet labels ESI as "% of BASIC"; the statute uses gross wages. Per-client. */
++  /** ESIC wage base. Under the current rules this is BASIC; the app always stores BASIC. */
+   esicBase: EsicBase;
+   insurance: number;          // fixed rupees per month (employer)
+   pt: number;                 // professional tax, rupees per month (employee)
+@@ -74,21 +75,21 @@ export interface PayrollResult {
+   travellingAllowance: number;
+   overtime: number;
+   bonusPay: number;
+-  /** basic + hra + special + travelling + overtime. Bonus pay is NOT in gross (sample row proves it). */
++  /** basic + hra + special + travelling + overtime + bonusPay. */
+   gross: number;
+   pfEmployer: number;
+   esicEmployer: number;
+   pfAdmin: number;
+   insurance: number;
+   totalEmployer: number;
+-  /** gross + bonusPay + totalEmployer. */
++  /** gross + totalEmployer (bonus pay is already inside gross). */
+   fixedCtc: number;
+   pfEmployee: number;
+   esicEmployee: number;
+   pt: number;
+   lwf: number;
+   totalDeduction: number;
+-  /** gross + bonusPay − totalDeduction. */
++  /** gross − totalDeduction. */
+   netTakeHome: number;
+   /** employee + employer + admin charges. */
+   totalPf: number;
+@@ -127,7 +128,7 @@ export function calculatePayroll(
+   const overtime = roundRupee(att.otFullDays * otDayRate + att.otHours * otHourRate);
+   const bonusPay = roundRupee(att.bonusDays * bonusDayRate);
+ 
+-  const gross = basic + hra + specialAllowance + travellingAllowance + overtime;
++  const gross = basic + hra + specialAllowance + travellingAllowance + overtime + bonusPay;
+ 
+   const pfWage = config.pfWageCeiling == null ? basic : Math.min(basic, config.pfWageCeiling);
+   const pfEmployee = roundRupee((pfWage * config.pfEmployeePct) / 100);
+@@ -146,9 +147,9 @@ export function calculatePayroll(
+   const lwf = worked ? config.lwf : 0;
+ 
+   const totalEmployer = pfEmployer + esicEmployer + pfAdmin + insurance;
+-  const fixedCtc = gross + bonusPay + totalEmployer;
++  const fixedCtc = gross + totalEmployer;
+   const totalDeduction = pfEmployee + esicEmployee + pt + lwf;
+-  const netTakeHome = gross + bonusPay - totalDeduction;
++  const netTakeHome = gross - totalDeduction;
+ 
+   return {
+     salariedDays, fullBasic: slab.basic, fullHra: slab.hra,
+diff --git a/src/lib/payroll/service.ts b/src/lib/payroll/service.ts
+index 4a473e2..b8a892b 100644
+--- a/src/lib/payroll/service.ts
++++ b/src/lib/payroll/service.ts
+@@ -20,7 +20,7 @@ export function configFromRow(row: ConfigRow | null): PayrollConfig {
+     pfEmployeePct: row.pfEmployeePct, pfEmployerPct: row.pfEmployerPct, pfAdminPct: row.pfAdminPct,
+     pfWageCeiling: row.pfWageCeiling,
+     esicEmployeePct: row.esicEmployeePct, esicEmployerPct: row.esicEmployerPct,
+-    esicGrossLimit: row.esicGrossLimit, esicBase: (row.esicBase === 'GROSS' ? 'GROSS' : 'BASIC') as EsicBase,
++    esicGrossLimit: row.esicGrossLimit, esicBase: 'BASIC' as EsicBase, // ESIC is on basic under the current rules
+     insurance: row.insurance, pt: row.pt, lwf: row.lwf,
+   };
+ }

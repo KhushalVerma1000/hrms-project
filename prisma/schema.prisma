@@ -204,6 +204,9 @@ model Client {
   stores    Store[]
   users     User[]
   deadlinePolicies AttendanceDeadlinePolicy[]
+  payrollConfig    ClientPayrollConfig?
+  salarySlabs      SalarySlab[]
+  payrollRuns      PayrollRun[]
   createdAt DateTime @default(now())
 }
 
@@ -382,6 +385,21 @@ model Employee {
   dateOfBirth        DateTime?
   dateOfRelieving    DateTime?
   cardNumber         String?
+
+  /// Payroll identity (shown on the salary payout sheet). Admin-edited from /payroll/setup.
+  fatherName  String?
+  /// PF Universal Account Number.
+  uan         String?
+  /// ESIC insurance number.
+  esicNumber  String?
+  /// Salary account for bulk NEFT payout sheets (admin-edited from /payroll/setup).
+  bankAccountNumber String?
+  /// 11-character IFSC, upper-case.
+  ifscCode          String?
+
+  /// This person's own salary slab. Absent → the client's default slab for their designation (if any).
+  salaryAssignment EmployeeSalaryAssignment?
+  payrollLines     PayrollLine[]
 
   /// Mobile number, digits only WITH country code (e.g. "919876543210") so it
   /// drops straight into a wa.me link. Normalised by normalizeMobile() in
@@ -775,4 +793,121 @@ model FaceTemplate {
   createdAt DateTime @default(now())
 
   @@index([employeeId])
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYROLL (admin-only for now). Calculation lives in src/lib/payroll/engine.ts.
+// Money is whole rupees, matching the payout sheet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum PayrollRunStatus {
+  DRAFT      /// Editable; attendance can be re-pulled.
+  FINALIZED  /// Locked. Later slab / config edits never change it.
+}
+
+/// Statutory + policy settings for one client's payroll. Percentages are plain numbers (12 = 12 %).
+model ClientPayrollConfig {
+  clientId String @id
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  pfEmployeePct   Float @default(12)
+  pfEmployerPct   Float @default(12)
+  pfAdminPct      Float @default(1)
+  /// PF is calculated on min(basic, ceiling). Null = no ceiling.
+  pfWageCeiling   Int?  @default(15000)
+  esicEmployeePct Float @default(0.75)
+  esicEmployerPct Float @default(3.25)
+  esicGrossLimit  Int   @default(21000)
+  /// "BASIC" (as the client's sheet is labelled) or "GROSS" (statutory wage base).
+  /// Unused since the wage base became fixed (basic + special allowance); kept so the column and old drafts stay valid.
+  esicBase        String @default("BASIC")
+  insurance       Int   @default(0)
+  pt              Int   @default(0)
+  lwf             Int   @default(0)
+
+  updatedAt DateTime @updatedAt
+}
+
+/// A named pay structure for one client + designation. Monthly fixed amounts.
+/// Associates share one default slab client-wide; other designations are assigned per employee.
+model SalarySlab {
+  id          String      @id @default(cuid())
+  clientId    String
+  client      Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  designation Designation
+  name        String
+
+  basic               Int
+  hra                 Int
+  specialAllowance    Int @default(0)
+  travellingAllowance Int @default(0)
+  otDayRate           Int?
+  otHourRate          Int?
+  bonusDayRate        Int?
+
+  /// Used for every employee of this client + designation with no personal assignment.
+  /// At most one default per client + designation (enforced in the server action).
+  isDefault Boolean @default(false)
+  isActive  Boolean @default(true)
+
+  assignments EmployeeSalaryAssignment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([clientId, designation, name])
+  @@index([clientId, designation])
+}
+
+model EmployeeSalaryAssignment {
+  id         String     @id @default(cuid())
+  employeeId String     @unique
+  employee   Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  slabId     String
+  slab       SalarySlab @relation(fields: [slabId], references: [id])
+  assignedByUserId String
+  updatedAt  DateTime   @updatedAt
+}
+
+model PayrollRun {
+  id          String           @id @default(cuid())
+  clientId    String
+  client      Client           @relation(fields: [clientId], references: [id])
+  periodYear  Int
+  periodMonth Int
+  status      PayrollRunStatus @default(DRAFT)
+
+  /// Client payroll settings in force when the run was generated / last refreshed.
+  configSnapshot Json
+
+  createdByUserId   String
+  createdAt         DateTime  @default(now())
+  finalizedByUserId String?
+  finalizedAt       DateTime?
+
+  lines PayrollLine[]
+
+  @@unique([clientId, periodYear, periodMonth])
+}
+
+model PayrollLine {
+  id         String     @id @default(cuid())
+  runId      String
+  run        PayrollRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  employeeId String
+  employee   Employee   @relation(fields: [employeeId], references: [id])
+
+  /// Who they were at generation time (store, e-code, name, father, UAN, ESIC, designation, status).
+  identity Json
+  /// Slab used (null if none), attendance counts, manual inputs and overrides.
+  inputs   Json
+  /// engine.ts PayrollResult, or null when the person has no slab.
+  result   Json?
+  warnings String[]
+
+  gross        Int @default(0)
+  netTakeHome  Int @default(0)
+
+  @@unique([runId, employeeId])
 }
